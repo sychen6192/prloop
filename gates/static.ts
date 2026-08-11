@@ -23,6 +23,7 @@ import {
   type Severity,
 } from "../config";
 import { splitLines } from "../ado/blobs";
+import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { parseJsonObject } from "../libs/json";
 import { log, logVerbose } from "../libs/log";
 import { commandExists, run } from "../libs/shell";
@@ -46,6 +47,10 @@ export interface StaticResult {
   // Changed files whose on-disk content is not the content under review, so no tool ran on
   // them. Reported, never analysed: their line numbers would not be this PR's line numbers.
   staleFiles: string[];
+  // Tool findings whose reported path could not be resolved to any changed file. Counted
+  // apart from the diff filter's `dropped`: "outside the changed region" and "path did not
+  // resolve" are different facts, and only the second points at a coordinate problem.
+  unresolved: number;
 }
 
 const EMPTY: StaticResult = {
@@ -55,11 +60,8 @@ const EMPTY: StaticResult = {
   ranTools: [],
   skipped: [],
   staleFiles: [],
+  unresolved: 0,
 };
-
-function stripLeadingSlash(p: string): string {
-  return p.replace(/^\/+/, "");
-}
 
 /**
  * Whether the file on disk is byte-for-byte the content under review.
@@ -86,29 +88,49 @@ export function matchesReviewedContent(absPath: string, rightLines: string[]): b
   return onDisk.every((l, i) => bare(l) === bare(rightLines[i] ?? ""));
 }
 
+/**
+ * Re-keys tool findings onto the diff's own paths, via the FileIndex (see CONTEXT.md).
+ *
+ * Not every tool reports a path rooted where the diff is: SpotBugs analyses bytecode and
+ * reports the source path relative to the SOURCE ROOT ("com/acme/Foo.java") while the diff
+ * says "src/main/java/com/acme/Foo.java", and a tool run in a Maven submodule reports
+ * relative to that module. Resolution happens here, once, at the point the foreign path
+ * enters the pipeline — every later lookup (diff filter, triage prompt, conversion) is an
+ * exact hit on the re-keyed path. The previous shape resolved by suffix here but pushed
+ * the finding with the tool's own string, which the exact-only lookups downstream then
+ * silently dropped.
+ */
+export function rekeyToolFindings(
+  findings: ToolFinding[],
+  // Workdir-relative directory the tool ran in ("" at the root); its output coordinates
+  // are relative to this, or to the tool's own idea of a source root.
+  prefix: string,
+  index: FileIndex,
+): { kept: ToolFinding[]; unresolved: ToolFinding[] } {
+  const kept: ToolFinding[] = [];
+  const unresolved: ToolFinding[] = [];
+  for (const f of findings) {
+    const r = index.resolveTool(prefix, f.file);
+    if (r.fd) kept.push({ ...f, file: r.fd.path });
+    else unresolved.push(f);
+  }
+  return { kept, unresolved };
+}
+
 /** reviewdog's `added` filter mode: keep only findings on lines this PR changed. */
 export function filterToChangedLines(
   findings: ToolFinding[],
   files: FileDiff[],
 ): { kept: ToolFinding[]; dropped: number } {
+  // Findings arrive re-keyed (rekeyToolFindings), so the lookup is exact; normalizePath on
+  // both sides only defends directly-constructed inputs, it is not a resolution tier.
   const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(stripLeadingSlash(f.path), f);
-
-  // Not every tool reports a path rooted where the diff is. SpotBugs analyses bytecode and
-  // reports the source path relative to the SOURCE ROOT ("com/acme/Foo.java"), while the
-  // diff calls the same file "src/main/java/com/acme/Foo.java". Exact match first; fall back
-  // to a suffix match, and only when it is unambiguous — two modules with the same package
-  // must not silently resolve to whichever came first.
-  const bySuffix = (want: string): FileDiff | undefined => {
-    const hits = files.filter((f) => stripLeadingSlash(f.path).endsWith(`/${want}`));
-    return hits.length === 1 ? hits[0] : undefined;
-  };
+  for (const f of files) byPath.set(normalizePath(f.path), f);
 
   const kept: ToolFinding[] = [];
   let dropped = 0;
   for (const f of findings) {
-    const want = stripLeadingSlash(f.file);
-    const fd = byPath.get(want) ?? bySuffix(want);
+    const fd = byPath.get(normalizePath(f.file));
     if (!fd) {
       dropped++;
       continue;
@@ -220,7 +242,8 @@ async function runTool(
   workdir: string,
   // Where the tool runs. Its own output is relative to this, not to the workdir.
   cwd: string,
-): Promise<{ findings: ToolFinding[]; skipped?: string }> {
+  index: FileIndex,
+): Promise<{ findings: ToolFinding[]; skipped?: string; unresolved: number }> {
   // Tool arguments and tool output both live in the project's coordinate system.
   const args = spec.args(files.map((f) => slash(path.relative(cwd, path.resolve(workdir, f)))));
   logVerbose(`static: ${spec.name} (in ${slash(path.relative(workdir, cwd)) || "."}) ${args.slice(0, 6).join(" ")}…`);
@@ -235,7 +258,7 @@ async function runTool(
 
   // Linters conventionally exit non-zero when they find something; that's not a failure.
   if (res.code !== 0 && !spec.allowNonZeroExit) {
-    return { findings: [], skipped: `exit code ${res.code}: ${res.stderr.slice(0, 200)}` };
+    return { findings: [], skipped: `exit code ${res.code}: ${res.stderr.slice(0, 200)}`, unresolved: 0 };
   }
 
   let raw: string;
@@ -248,29 +271,39 @@ async function runTool(
         skipped:
           `produced no ${spec.outputFile} in ${slash(path.relative(workdir, cwd)) || "."} ` +
           `(exit ${res.code})${res.stderr.trim() ? `: ${res.stderr.trim().slice(0, 160)}` : ""}`,
+        unresolved: 0,
       };
     }
     raw = fs.readFileSync(reportPath, "utf8");
   } else {
     raw = spec.readStderr ? res.stderr : res.stdout || res.stderr;
   }
-  // Parse against the tool's own cwd, then lift the paths back into workdir coordinates —
-  // filterToChangedLines matches against workdir-relative diff paths.
-  const prefix = slash(path.relative(workdir, cwd));
-  const parsed = parseToolOutput(raw, spec, cwd).map((f) =>
-    prefix ? { ...f, file: `${prefix}/${f.file}` } : f,
-  );
+  // Parse in the tool's own coordinate system, check the toolchain is usable, then re-key
+  // every finding onto the diff's paths — the one point where foreign tool paths enter.
+  const parsed = parseToolOutput(raw, spec, cwd);
 
   const broken = environmentFailure(spec, parsed, slash(path.relative(workdir, cwd)) || ".");
-  if (broken) return { findings: [], skipped: broken };
+  if (broken) return { findings: [], skipped: broken, unresolved: 0 };
+
+  const prefix = slash(path.relative(workdir, cwd));
+  const { kept, unresolved } = rekeyToolFindings(parsed, prefix, index);
+  if (unresolved.length > 0) {
+    logVerbose(
+      `  ${spec.name}: ${unresolved.length} findings did not resolve to any changed file ` +
+        `(e.g. ${unresolved[0]!.file})`,
+    );
+  }
 
   const ignored = new Set(profile.ignoreRules ?? []);
-  const findings = parsed.filter((f) => !ignored.has(f.ruleId));
-  return { findings };
+  const findings = kept.filter((f) => !ignored.has(f.ruleId));
+  return { findings, unresolved: unresolved.length };
 }
 
 export async function runStaticGate(
   files: FileDiff[],
+  // The FileIndex built at intake — tool-reported paths are resolved through it, once, at
+  // the point they enter (rekeyToolFindings).
+  index: FileIndex,
   // The iteration's source commit, quoted back in the stale-checkout message. Naming the
   // exact SHA is the only provider-neutral instruction available: Azure DevOps publishes
   // refs/pull/<id>/merge but no /head ref, and the merge ref is the wrong target anyway —
@@ -285,7 +318,9 @@ export async function runStaticGate(
     return { ...EMPTY, skippedReason: `PRR_WORKDIR does not exist: ${WORKDIR}` };
   }
 
-  const changedPaths = files.map((f) => stripLeadingSlash(f.path));
+  // Intake guarantees canonical paths on FileDiff (no leading slash, forward separators),
+  // so these are used as workdir-relative paths directly.
+  const changedPaths = files.map((f) => f.path);
   const profiles = selectProfiles(changedPaths);
   if (profiles.length === 0) {
     return { ...EMPTY, skippedReason: "No language profile matches the changed files" };
@@ -294,9 +329,10 @@ export async function runStaticGate(
   const all: ToolFinding[] = [];
   const ranTools: string[] = [];
   const skipped: Array<{ tool: string; reason: string }> = [];
+  let unresolved = 0;
 
   const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(stripLeadingSlash(f.path), f);
+  for (const f of files) byPath.set(f.path, f);
   const stale: string[] = [];
   let analysable = 0;
   // Files prloop never read (binary, or past the blob size limit). Counted apart from stale
@@ -354,6 +390,7 @@ export async function runStaticGate(
               spec: variants[0]!,
               findings: [] as ToolFinding[],
               skipped: `${[...new Set(variants.map((v) => v.bin))].join(" or ")} not found on PATH`,
+              unresolved: 0,
             }),
           ];
         }
@@ -365,12 +402,13 @@ export async function runStaticGate(
               spec,
               findings: [] as ToolFinding[],
               skipped: `no ${spec.requires} found above any changed file`,
+              unresolved: 0,
             }),
           ];
         }
         return projects.map(async (p) => ({
           spec,
-          ...(await runTool(spec, profile, p.files, WORKDIR, p.dir)),
+          ...(await runTool(spec, profile, p.files, WORKDIR, p.dir, index)),
         }));
       }),
     );
@@ -381,6 +419,7 @@ export async function runStaticGate(
       }
       ranTools.push(r.spec.name);
       all.push(...r.findings);
+      unresolved += r.unresolved;
     }
   }
 
@@ -420,7 +459,8 @@ export async function runStaticGate(
   log(
     `static: ran ${ranTools.length} tools → ${all.length} findings → ${kept.length} on changed lines` +
       ` (${facts.length} facts, ${needsTriage.length} to triage, ${suppressedCount} style), ` +
-      `${dropped} filtered out as outside the changed region`,
+      `${dropped} filtered out as outside the changed region` +
+      (unresolved > 0 ? `, ${unresolved} with paths that resolved to no changed file` : ""),
   );
   for (const s of skipped) logVerbose(`  skipped ${s.tool}: ${s.reason}`);
   if (stale.length > 0) {
@@ -435,7 +475,7 @@ export async function runStaticGate(
     logVerbose(`static: ${unreadable} files not analysed, prloop could not read them (binary or over the size limit)`);
   }
 
-  return { facts, needsTriage, suppressedCount, ranTools, skipped, staleFiles: stale };
+  return { facts, needsTriage, suppressedCount, ranTools, skipped, staleFiles: stale, unresolved };
 }
 
 /**
@@ -526,7 +566,7 @@ export async function triageAndConvert(
   }
 
   const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(f.path.replace(/^\/+/, ""), f);
+  for (const f of files) byPath.set(normalizePath(f.path), f);
 
   // Same exclusion rule the model findings get in aggregate: a category the config turned
   // off is off for tools too, and the drop is counted rather than silent.
@@ -535,8 +575,13 @@ export async function triageAndConvert(
 
   const findings: AnchoredFinding[] = [];
   for (const f of kept) {
-    const fd = byPath.get(f.file.replace(/^\/+/, ""));
-    if (!fd) continue;
+    const fd = byPath.get(normalizePath(f.file));
+    if (!fd) {
+      // Impossible by construction — findings were re-keyed onto diff paths at entry
+      // (rekeyToolFindings) — so a miss here is a coordinate bug worth hearing about.
+      logVerbose(`static: dropping ${f.tool} finding with unmatched path ${f.file} (should be re-keyed)`);
+      continue;
+    }
     const category = categoryForRule(f);
     if (excludedCats.has(category)) {
       excluded++;

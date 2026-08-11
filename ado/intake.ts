@@ -5,6 +5,7 @@ import { ADO_CONCURRENCY } from "../config";
 import { getBlob } from "./blobs";
 import { getIterationChanges, getPrInfo, listIterations } from "./iterations";
 import { buildHunks, diffLines } from "../libs/diff";
+import { FileIndex, normalizePath } from "../libs/fileindex";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { log, logVerbose } from "../libs/log";
 import type { ChangeEntry, FileDiff, Iteration, PrInfo, PrRef } from "../libs/types";
@@ -21,6 +22,8 @@ export interface ReviewContext {
   // Changed files we deliberately did not review (lockfiles, binaries, generated output).
   skipped: Array<{ path: string; reason: string }>;
   changeTrackingIds: Map<string, number>;
+  // Built once here; the single resolver for foreign path strings (see CONTEXT.md).
+  index: FileIndex;
 }
 
 async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> {
@@ -65,7 +68,13 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
   const iteration = iterations[iterations.length - 1]!;
   log(`PR !${ref.prId} "${pr.title}" ${pr.sourceBranch} → ${pr.targetBranch}, iteration ${iteration.id}`);
 
-  const entries = await getIterationChanges(ref, iteration.id, compareTo);
+  // ADO reports paths with a leading slash. Canonicalize once, at intake, so FileDiff.path
+  // (and every map keyed by it) carries one shape — no consumer re-strips.
+  const entries = (await getIterationChanges(ref, iteration.id, compareTo)).map((e) => ({
+    ...e,
+    path: normalizePath(e.path),
+    originalPath: e.originalPath === undefined ? undefined : normalizePath(e.originalPath),
+  }));
   const skipped: Array<{ path: string; reason: string }> = [];
   const changeTrackingIds = new Map<string, number>();
   const targets: ChangeEntry[] = [];
@@ -113,5 +122,15 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
     }
   }
 
-  return { ref, pr, iterations, iteration, compareTo, files, skipped, changeTrackingIds };
+  return {
+    ref,
+    pr,
+    iterations,
+    iteration,
+    compareTo,
+    files,
+    skipped,
+    changeTrackingIds,
+    index: new FileIndex(files),
+  };
 }

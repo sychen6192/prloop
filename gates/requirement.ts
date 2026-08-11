@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { MAX_INLINE_REQ_COMMENTS, REQ_MODEL } from "../config";
 import { getLinkedRequirements } from "../ado/workitems";
 import { anchorFinding } from "../anchoring/locate";
+import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { parseJsonObject } from "../libs/json";
 import { log } from "../libs/log";
 import type {
@@ -157,7 +158,7 @@ export function unmetCriteria(result: RequirementResult): CriterionCheck[] {
  */
 export function toRequirementFindings(
   result: RequirementResult,
-  files: FileDiff[],
+  index: FileIndex,
 ): AnchoredFinding[] {
   const candidates: RawFinding[] = [];
 
@@ -192,16 +193,18 @@ export function toRequirementFindings(
 
   const out: AnchoredFinding[] = [];
   for (const f of candidates) {
-    const res = anchorFinding(f, files);
+    const res = anchorFinding(f, index);
     if (!res.anchor) continue; // fail closed: it still shows up in the summary table
+    const file = res.file?.path ?? normalizePath(f.file);
     out.push({
       ...f,
-      file: res.file?.path ?? f.file,
+      file,
       sources: ["requirement"],
       fingerprint: createHash("sha1")
-        // Normalised like the code-axis fingerprint (aggregate.ts): the model's path
-        // spelling must not change the identity of the same finding between runs.
-        .update(`req ${f.file.replace(/^\/+/, "").toLowerCase()} ${f.quote.replace(/\s+/g, " ").trim()}`)
+        // Hashes the RESOLVED path, like the code-axis fingerprint (aggregate.ts): the
+        // model's path spelling must not change the identity of the same finding between
+        // runs.
+        .update(`req ${file.toLowerCase()} ${f.quote.replace(/\s+/g, " ").trim()}`)
         .digest("hex")
         .slice(0, 12),
       anchor: res.anchor,

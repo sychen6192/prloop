@@ -2,7 +2,8 @@
 // line, so it gets the most coverage here — these assertions are the regression net for the
 // class of bug that motivated the whole project.
 import { splitLines } from "../ado/blobs";
-import { anchorFinding, resolveFile } from "../anchoring/locate";
+import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
+import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
 import { buildHunks, diffLines, renderUnifiedDiff } from "../libs/diff";
 import { parseJsonObject } from "../libs/json";
@@ -13,7 +14,7 @@ import { globToRegExp, loadRules, selectRules } from "../libs/rules";
 import { finalize } from "../gates/aggregate";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
 import { parseVerdict as parseVerdictForTest } from "../gates/skeptic";
-import { environmentFailure, filterToChangedLines, matchesReviewedContent, projectDirsFor } from "../gates/static";
+import { environmentFailure, filterToChangedLines, matchesReviewedContent, projectDirsFor, rekeyToolFindings } from "../gates/static";
 import { renderFindingComment } from "../publish/format";
 import { parseToolOutput } from "../profiles/parsers";
 import { selectProfiles, filesForProfile, PROFILES } from "../profiles";
@@ -32,6 +33,7 @@ import type { PrRef } from "../libs/types";
 import type { ToolSpec } from "../profiles/types";
 import type { AnchoredFinding, FileDiff, RawFinding } from "../libs/types";
 import { SEEDED_FILES, EXPECTED_ANCHORS } from "../fixtures/seeded-pr";
+import { buildTriagePrompt } from "../prompts/triage";
 import { load, sourcePaths } from "../libs/tls";
 import { Semaphore } from "../libs/limit";
 import { describeBadCompletion, isTransientModelError } from "../models/runner";
@@ -72,6 +74,11 @@ function section(t: string) {
 }
 
 // --- blob line splitting ---
+// The production anchorFinding takes a FileIndex; fixtures here carry bare FileDiff
+// arrays, so this wrapper builds the index at the call site.
+const anchorFinding = (finding: RawFinding, files: FileDiff[]) =>
+  anchorWithIndex(finding, new FileIndex(files));
+
 section("blob line splitting (CRLF / BOM / trailing newline)");
 eq("LF three lines", splitLines(Buffer.from("a\nb\nc")), ["a", "b", "c"]);
 eq("trailing newline makes no ghost line", splitLines(Buffer.from("a\nb\n")), ["a", "b"]);
@@ -268,14 +275,15 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
 }
 {
   const f = mkFile("/src/deep/nested/app.ts", ["x();"], [1]);
-  check("path suffix match", resolveFile("deep/nested/app.ts", [f])?.path === "/src/deep/nested/app.ts");
-  check("basename match", resolveFile("app.ts", [f])?.path === "/src/deep/nested/app.ts");
-  check("missing file returns undefined", resolveFile("nope.ts", [f]) === undefined);
+  const idx = new FileIndex([f]);
+  check("path suffix match", idx.resolve("deep/nested/app.ts").fd?.path === "/src/deep/nested/app.ts");
+  check("basename match", idx.resolve("app.ts").fd?.path === "/src/deep/nested/app.ts");
+  eq("missing file reports not-found", idx.resolve("nope.ts").failure, "not-found");
 }
 {
   const a = mkFile("/src/a.ts", ["x();"], [1]);
   const b = mkFile("/lib/a.ts", ["x();"], [1]);
-  check("same-name files are ambiguous, no guessing", resolveFile("a.ts", [a, b]) === undefined);
+  eq("same-name files are ambiguous, no guessing", new FileIndex([a, b]).resolve("a.ts").failure, "ambiguous");
 }
 {
   // The scenario that motivated the whole project: an identical line exists both in
@@ -751,19 +759,32 @@ const spec = (format: string): ToolSpec =>
 }
 {
   // SpotBugs reports paths relative to the source root; the diff calls the same file
-  // src/main/java/... . Without resolution every finding is dropped as "not in the diff".
-  const fd = mkFile("/svc/src/main/java/com/acme/Svc.java", ["a();", "b();"], [2]);
+  // src/main/java/... . Resolution happens once, at entry (rekeyToolFindings): the finding
+  // is re-keyed onto the diff's own path, so the diff filter and every later lookup hit
+  // exactly instead of silently missing.
+  const fd = mkFile("svc/src/main/java/com/acme/Svc.java", ["a();", "b();"], [2]);
   const finding = {
     tool: "spotbugs", tier: "triage" as const, ruleId: "NP", message: "m",
     file: "com/acme/Svc.java", line: 2, severity: "high" as const,
   };
-  eq("a source-root-relative path resolves by suffix", filterToChangedLines([finding], [fd]).kept.length, 1);
+  const rekeyed = rekeyToolFindings([finding], "", new FileIndex([fd]));
+  eq("a source-root-relative path resolves by suffix", rekeyed.kept.length, 1);
+  eq("...and is re-keyed onto the diff's own path", rekeyed.kept[0]?.file, "svc/src/main/java/com/acme/Svc.java");
+  eq("...so the diff filter hits exactly", filterToChangedLines(rekeyed.kept, [fd]).kept.length, 1);
+
+  // The Maven-submodule composition: the tool ran in svc/, so the blindly-prefixed path
+  // "svc/com/acme/Svc.java" matches nothing — but the raw path still resolves by suffix.
+  // The previous shape (prefix first, then suffix on the prefixed string) could never
+  // match this case.
+  const sub = rekeyToolFindings([finding], "svc", new FileIndex([fd]));
+  eq("a submodule-prefixed source-root path still resolves", sub.kept.length, 1);
+  eq("...onto the diff path", sub.kept[0]?.file, "svc/src/main/java/com/acme/Svc.java");
 
   // ...but only when unambiguous. Two modules sharing a package must not silently pick one.
-  const twin = mkFile("/api/src/main/java/com/acme/Svc.java", ["a();", "b();"], [2]);
-  const amb = filterToChangedLines([finding], [fd, twin]);
+  const twin = mkFile("api/src/main/java/com/acme/Svc.java", ["a();", "b();"], [2]);
+  const amb = rekeyToolFindings([finding], "", new FileIndex([fd, twin]));
   eq("an ambiguous suffix is dropped, not guessed", amb.kept.length, 0);
-  eq("...and counted as dropped", amb.dropped, 1);
+  eq("...and counted as unresolved, not merely dropped", amb.unresolved.length, 1);
 }
 {
   // PMD's xml renderer speaks the checkstyle dialect but names its attributes beginline and
@@ -823,6 +844,52 @@ section("diff filtering of static findings");
 
   const other = filterToChangedLines([{ ...mk(2), file: "other/z.py" }], [f]);
   eq("files outside the diff are always dropped", other.kept.length, 0);
+}
+
+section("FileIndex: one resolver for foreign paths");
+{
+  const f = mkFile("src/App.ts", ["x();"], [1]);
+  const g = mkFile("src/lib/util.ts", ["y();"], [1]);
+  const idx = new FileIndex([f, g]);
+  eq("exact", idx.resolve("src/App.ts").fd?.path, "src/App.ts");
+  eq("leading slash and backslashes normalize away", idx.resolve("\\src\\App.ts").fd?.path, "src/App.ts");
+  eq("case-insensitive unique", idx.resolve("src/app.ts").fd?.path, "src/App.ts");
+  eq("suffix", idx.resolve("lib/util.ts").fd?.path, "src/lib/util.ts");
+  eq("basename", idx.resolve("util.ts").fd?.path, "src/lib/util.ts");
+  check("ambiguity detail names the tier", (() => {
+    const two = new FileIndex([mkFile("a/x.ts", ["a();"], [1]), mkFile("b/x.ts", ["b();"], [1])]);
+    const r = two.resolve("x.ts");
+    return r.failure === "ambiguous" && r.detail.includes("2 changed files");
+  })());
+  eq("normalizePath is the one owner of the canonical rule", normalizePath("\\a\\b.ts"), "a/b.ts");
+}
+{
+  // A renamed file cited by its old path.
+  const f = { ...mkFile("src/new-name.ts", ["x();"], [1]), originalPath: "src/old-name.ts" };
+  eq("originalPath tier", new FileIndex([f]).resolve("src/old-name.ts").fd?.path, "src/new-name.ts");
+}
+{
+  // resolveTool: the prefixed exact hit wins when the tool's coordinates line up.
+  const a = mkFile("svc/src/Main.java", ["a();"], [1]);
+  eq("prefixed exact hit", new FileIndex([a]).resolveTool("svc", "src/Main.java").fd?.path, "svc/src/Main.java");
+}
+{
+  // Regression: a re-keyed tool finding reaches the triage prompt with real content.
+  // Before the FileIndex, the suffix-resolved finding kept the tool's own path string and
+  // the prompt's exact-only lookup fell back to "(no matching file content found)" — the
+  // triage model judged with no code in front of it.
+  const fd = mkFile("svc/src/main/java/com/acme/Svc.java", ["a();", "b();"], [2]);
+  const rekeyed = rekeyToolFindings(
+    [{ tool: "spotbugs", tier: "triage" as const, ruleId: "NP", message: "m", file: "com/acme/Svc.java", line: 2, severity: "high" as const }],
+    "svc",
+    new FileIndex([fd]),
+  );
+  const items = rekeyed.kept.map((f, i) => ({
+    index: i, tool: f.tool, ruleId: f.ruleId, message: f.message, file: f.file, line: f.line, severity: f.severity,
+  }));
+  const prompt = buildTriagePrompt(items, [fd], 3);
+  check("triage prompt carries the real snippet", prompt.includes("b();"));
+  check("...not the no-content fallback", !prompt.includes("no matching file content found"));
 }
 
 // Tool findings skip quote anchoring entirely, so a PRR_WORKDIR checkout that disagrees
@@ -1053,13 +1120,13 @@ section("excluded categories (PRR_EXCLUDE_CATEGORIES)");
     ],
   }];
   process.env["PRR_EXCLUDE_CATEGORIES"] = "performance";
-  const c = anchorAndDedupe(out, [f]);
+  const c = anchorAndDedupe(out, new FileIndex([f]));
   eq("excluded category dropped before anchoring", c.merged.length, 1);
   eq("drop is counted, never silent", c.excluded, 1);
   eq("the surviving finding is the non-excluded one", c.merged[0]?.category, "correctness");
 
   delete process.env["PRR_EXCLUDE_CATEGORIES"];
-  const c2 = anchorAndDedupe(out, [f]);
+  const c2 = anchorAndDedupe(out, new FileIndex([f]));
   eq("unset -> nothing excluded", c2.merged.length, 2);
 }
 {
@@ -1075,6 +1142,7 @@ section("excluded categories (PRR_EXCLUDE_CATEGORIES)");
     ranTools: ["bandit", "mypy"],
     skipped: [],
     staleFiles: [],
+    unresolved: 0,
   };
   const dummyRunner = { chat: async () => ({ text: "", model: "none" }) };
   process.env["PRR_EXCLUDE_CATEGORIES"] = "security";
@@ -1435,7 +1503,7 @@ section("aggregate: dedupe pools and ranking");
   // Anchor-failed duplicate (bad quote) from model A, anchored from model B, same claim.
   const cands = anchorAndDedupe(
     [mk("a", { quote: "const a = 999;" }), mk("b", {})],
-    [file],
+    new FileIndex([file]),
   );
   eq("anchored finding survives with its anchor intact", cands.merged.length, 1);
   eq("anchor-failed twin stays in degraded, not merged in", cands.degraded.length, 1);
@@ -1444,7 +1512,7 @@ section("aggregate: dedupe pools and ranking");
   // Same line, same quote, different category → must merge (label instability).
   const cands2 = anchorAndDedupe(
     [mk("a", { category: "concurrency" }), mk("b", { category: "correctness" })],
-    [file],
+    new FileIndex([file]),
   );
   eq("same quote with differing category labels merges", cands2.merged.length, 1);
   eq("...and counts both sources", cands2.merged[0]?.sources.length, 2);

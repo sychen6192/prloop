@@ -4,6 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { PRLOOP_ROOT } from "../config";
+import { normalizePath } from "./fileindex";
 import { logVerbose } from "./log";
 
 export interface Rule {
@@ -89,7 +90,7 @@ export function loadRules(): Rule[] {
 
 /** The rules whose applyTo matches at least one changed path. */
 export function selectRules(rules: Rule[], changedPaths: string[]): Rule[] {
-  const normalized = changedPaths.map((p) => p.replace(/^\/+/, ""));
+  const normalized = changedPaths.map(normalizePath);
   const selected = rules.filter((r) =>
     r.applyTo.some((g) => {
       const re = globToRegExp(g);

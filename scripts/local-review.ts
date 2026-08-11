@@ -68,7 +68,7 @@ async function main() {
     raw: "",
   };
 
-  const candidates = anchorAndDedupe([output], ctx.files);
+  const candidates = anchorAndDedupe([output], ctx.index);
 
   console.log(`\n${"=".repeat(78)}\nAnchor results (${findings.length} findings)\n${"=".repeat(78)}`);
   for (const f of candidates.merged) {
