@@ -118,9 +118,13 @@ function touchesChangedLine(file: FileDiff, cand: Candidate): boolean {
 export function anchorFinding(finding: RawFinding, index: FileIndex): AnchorResult {
   const res = index.resolve(finding.file);
   if (!res.fd) {
-    // Both resolution failures (not in the change set, ambiguous) degrade the same way;
-    // the detail string carries the distinction into the summary.
-    return { failure: "file-not-in-diff", detail: res.detail };
+    // The two resolution failures degrade under different names: "file not in this
+    // change" is a true statement only for not-found, and an ambiguous path needs the
+    // summary to say so.
+    return {
+      failure: res.failure === "ambiguous" ? "file-ambiguous" : "file-not-in-diff",
+      detail: res.detail,
+    };
   }
   const file = res.fd;
 

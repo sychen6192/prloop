@@ -11,9 +11,9 @@
 // them sharing a filesystem.
 import { BOT_MARKER } from "../config";
 import { listThreads, setThreadStatus, type Thread } from "../ado/threads";
-import { normalizePath } from "../libs/fileindex";
+import type { FileIndex } from "../libs/fileindex";
 import { log, logVerbose } from "../libs/log";
-import type { FileDiff, PrRef } from "../libs/types";
+import type { PrRef } from "../libs/types";
 
 const ITERATION_MARKER = /<!-- prloop:iteration=(\d+) -->/;
 export const iterationMarker = (id: number) => `<!-- prloop:iteration=${id} -->`;
@@ -54,10 +54,7 @@ export interface StaleThread {
  * originally flagged. Anything less certain is left alone — wrongly resolving a live issue
  * is worse than leaving a stale thread for a human to close.
  */
-export function findStaleThreads(threads: Thread[], files: FileDiff[]): StaleThread[] {
-  const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(normalizePath(f.path), f);
-
+export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThread[] {
   const stale: StaleThread[] = [];
   for (const t of threads) {
     if (t.status !== "active") continue;
@@ -67,8 +64,10 @@ export function findStaleThreads(threads: Thread[], files: FileDiff[]): StaleThr
     const ctx = t.threadContext;
     if (!ctx?.filePath || !ctx.rightFileStart?.line) continue;
 
-    // ADO thread paths carry a leading slash; normalized at this read edge.
-    const fd = byPath.get(normalizePath(ctx.filePath));
+    // Thread paths are FULL paths from a prior iteration, in ADO's own shape; the index
+    // resolves them (exact, or the rename trail via originalPath — a thread created on the
+    // old name must still find the renamed file).
+    const fd = index.resolvePrior(ctx.filePath);
     // File untouched in this iteration → the flagged code is unchanged → leave it open.
     if (!fd) continue;
 

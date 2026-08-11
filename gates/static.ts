@@ -106,31 +106,28 @@ export function rekeyToolFindings(
   // are relative to this, or to the tool's own idea of a source root.
   prefix: string,
   index: FileIndex,
-): { kept: ToolFinding[]; unresolved: ToolFinding[] } {
+): { kept: ToolFinding[]; misses: ToolFinding[] } {
   const kept: ToolFinding[] = [];
-  const unresolved: ToolFinding[] = [];
+  const misses: ToolFinding[] = [];
   for (const f of findings) {
     const r = index.resolveTool(prefix, f.file);
     if (r.fd) kept.push({ ...f, file: r.fd.path });
-    else unresolved.push(f);
+    else misses.push(f);
   }
-  return { kept, unresolved };
+  return { kept, misses };
 }
 
 /** reviewdog's `added` filter mode: keep only findings on lines this PR changed. */
 export function filterToChangedLines(
   findings: ToolFinding[],
-  files: FileDiff[],
+  index: FileIndex,
 ): { kept: ToolFinding[]; dropped: number } {
-  // Findings arrive re-keyed (rekeyToolFindings), so the lookup is exact; normalizePath on
-  // both sides only defends directly-constructed inputs, it is not a resolution tier.
-  const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(normalizePath(f.path), f);
-
+  // Findings arrive re-keyed (rekeyToolFindings), so this is the index's exact lookup —
+  // never a resolution tier.
   const kept: ToolFinding[] = [];
   let dropped = 0;
   for (const f of findings) {
-    const fd = byPath.get(normalizePath(f.file));
+    const fd = index.exact(f.file);
     if (!fd) {
       dropped++;
       continue;
@@ -285,18 +282,21 @@ async function runTool(
   const broken = environmentFailure(spec, parsed, slash(path.relative(workdir, cwd)) || ".");
   if (broken) return { findings: [], skipped: broken, unresolved: 0 };
 
+  // Ignored rules go first: a finding the profile suppresses must not be able to inflate
+  // the unresolved count below — that count points readers at a coordinate problem, and
+  // config-suppressed output is not one.
+  const ignored = new Set(profile.ignoreRules ?? []);
+  const relevant = parsed.filter((f) => !ignored.has(f.ruleId));
+
   const prefix = slash(path.relative(workdir, cwd));
-  const { kept, unresolved } = rekeyToolFindings(parsed, prefix, index);
-  if (unresolved.length > 0) {
+  const { kept, misses } = rekeyToolFindings(relevant, prefix, index);
+  if (misses.length > 0) {
     logVerbose(
-      `  ${spec.name}: ${unresolved.length} findings did not resolve to any changed file ` +
-        `(e.g. ${unresolved[0]!.file})`,
+      `  ${spec.name}: ${misses.length} findings did not resolve to any changed file ` +
+        `(e.g. ${misses[0]!.file})`,
     );
   }
-
-  const ignored = new Set(profile.ignoreRules ?? []);
-  const findings = kept.filter((f) => !ignored.has(f.ruleId));
-  return { findings, unresolved: unresolved.length };
+  return { findings: kept, unresolved: misses.length };
 }
 
 export async function runStaticGate(
@@ -331,8 +331,6 @@ export async function runStaticGate(
   const skipped: Array<{ tool: string; reason: string }> = [];
   let unresolved = 0;
 
-  const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(f.path, f);
   const stale: string[] = [];
   let analysable = 0;
   // Files prloop never read (binary, or past the blob size limit). Counted apart from stale
@@ -344,7 +342,7 @@ export async function runStaticGate(
       const abs = path.join(WORKDIR, p);
       if (!fs.existsSync(abs)) return false;
       analysable++;
-      const fd = byPath.get(p);
+      const fd = index.exact(p);
       // No FileDiff means the profile matched something outside the change set; nothing to
       // filter it against later anyway, so leave the existing behaviour alone.
       if (!fd) return true;
@@ -445,7 +443,7 @@ export async function runStaticGate(
     };
   }
 
-  const { kept, dropped } = filterToChangedLines(all, files);
+  const { kept, dropped } = filterToChangedLines(all, index);
   const facts = kept.filter((f) => f.tier === "fact");
   const needsTriage = kept.filter((f) => f.tier === "triage");
   const suppressedCount = kept.filter((f) => f.tier === "suppress").length;
@@ -486,7 +484,7 @@ export async function runStaticGate(
 export async function triageAndConvert(
   runner: ModelRunner,
   result: StaticResult,
-  files: FileDiff[],
+  index: FileIndex,
 ): Promise<{ findings: AnchoredFinding[]; triaged: number; dropped: number; excluded: number }> {
   const kept: ToolFinding[] = [...result.facts];
   let dropped = 0;
@@ -513,7 +511,7 @@ export async function triageAndConvert(
     const res = await runner.chat({
       model: TRIAGE_MODEL,
       system: TRIAGE_SYSTEM,
-      user: buildTriagePrompt(items, files, TRIAGE_CONTEXT_LINES),
+      user: buildTriagePrompt(items, index, TRIAGE_CONTEXT_LINES),
       schema: TRIAGE_SCHEMA,
       schemaName: "triage",
     });
@@ -565,9 +563,6 @@ export async function triageAndConvert(
     dropped += batch.length;
   }
 
-  const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(normalizePath(f.path), f);
-
   // Same exclusion rule the model findings get in aggregate: a category the config turned
   // off is off for tools too, and the drop is counted rather than silent.
   const excludedCats = new Set(excludedCategories());
@@ -575,7 +570,7 @@ export async function triageAndConvert(
 
   const findings: AnchoredFinding[] = [];
   for (const f of kept) {
-    const fd = byPath.get(normalizePath(f.file));
+    const fd = index.exact(f.file);
     if (!fd) {
       // Impossible by construction — findings were re-keyed onto diff paths at entry
       // (rekeyToolFindings) — so a miss here is a coordinate bug worth hearing about.

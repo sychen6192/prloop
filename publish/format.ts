@@ -46,6 +46,7 @@ const FAILURE_LABEL: Record<string, string> = {
   "quote-not-found": "quoted code not found in the file",
   "quote-ambiguous": "quoted code appears more than once, location ambiguous",
   "file-not-in-diff": "file not in this change",
+  "file-ambiguous": "path matches more than one changed file, refusing to guess which",
   "outside-changed-lines": "outside the changed region",
 };
 

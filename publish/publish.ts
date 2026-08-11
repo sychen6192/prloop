@@ -2,7 +2,7 @@
 // anchored. Re-runs recognise their own threads by fingerprint and never post the same
 // issue twice (the "re-review amnesia" failure mode).
 import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun, BOT_MARKER } from "../config";
-import { normalizePath } from "../libs/fileindex";
+import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { createThread, listThreads, updateComment, type Thread } from "../ado/threads";
 import { postStatus } from "../ado/statuses";
 import { unmetCriteria } from "../gates/requirement";
@@ -45,7 +45,7 @@ function findSummaryThread(threads: Thread[]): { thread: Thread; commentId: numb
  * lines a reviewer already said no to is the same conversation reopened. Only "fixed" is
  * left out — the code there changed, and a fresh finding on the new code may be real.
  */
-export function postedPositions(threads: Thread[]): Array<{ file: string; start: number; end: number }> {
+export function postedPositions(threads: Thread[], index: FileIndex): Array<{ file: string; start: number; end: number }> {
   const out: Array<{ file: string; start: number; end: number }> = [];
   for (const t of threads) {
     if (t.status === "fixed") continue;
@@ -54,9 +54,11 @@ export function postedPositions(threads: Thread[]): Array<{ file: string; start:
     const ours = t.comments?.some((c) => !c.isDeleted && (c.content ?? "").includes(BOT_MARKER));
     if (!ours) continue;
     out.push({
-      // Thread paths come back from ADO in its own shape (leading slash); normalize at
-      // this read edge so they compare against the pipeline's canonical paths.
-      file: normalizePath(ctx.filePath),
+      // Thread paths come back from ADO in its own shape and may cite a pre-rename path;
+      // resolve through the index so a thread on the old name still occupies the renamed
+      // file's lines. A thread on a file outside this iteration keeps its normalized path
+      // — it cannot collide with a finding, which is always on a changed file.
+      file: index.resolvePrior(ctx.filePath)?.path ?? normalizePath(ctx.filePath),
       start: ctx.rightFileStart.line,
       end: ctx.rightFileEnd?.line ?? ctx.rightFileStart.line,
     });
@@ -109,7 +111,7 @@ export async function publish(
 
   // Close our own threads whose code has since changed, before adding new ones — otherwise
   // a PR accumulates stale comments the author already addressed.
-  result.resolved = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.files));
+  result.resolved = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex));
   result.dismissals = collectDismissals(threads);
   if (result.dismissals.length > 0 && LEARN_FROM_DISMISSALS) {
     // Persist into the per-repo learnings store: the next run (on this PR or any other)
@@ -121,7 +123,7 @@ export async function publish(
     );
   }
 
-  const positions = postedPositions(threads);
+  const positions = postedPositions(threads, ctx.fileIndex);
   for (const f of findings) {
     if (seen.has(f.fingerprint)) {
       result.alreadyPosted.push(f);

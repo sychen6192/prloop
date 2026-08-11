@@ -130,6 +130,6 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     files,
     skipped,
     changeTrackingIds: new Map(),
-    index: new FileIndex(files),
+    fileIndex: new FileIndex(files),
   };
 }

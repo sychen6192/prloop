@@ -156,6 +156,9 @@ export type AnchorFailure =
   | "quote-not-found"
   | "quote-ambiguous"
   | "file-not-in-diff"
+  // The cited path matched MORE than one changed file — distinct from not-in-diff, whose
+  // label ("file not in this change") would be actively false here.
+  | "file-ambiguous"
   | "outside-changed-lines";
 
 export interface Anchor {

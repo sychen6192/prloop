@@ -23,7 +23,7 @@ export interface ReviewContext {
   skipped: Array<{ path: string; reason: string }>;
   changeTrackingIds: Map<string, number>;
   // Built once here; the single resolver for foreign path strings (see CONTEXT.md).
-  index: FileIndex;
+  fileIndex: FileIndex;
 }
 
 async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> {
@@ -131,6 +131,6 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
     files,
     skipped,
     changeTrackingIds,
-    index: new FileIndex(files),
+    fileIndex: new FileIndex(files),
   };
 }
