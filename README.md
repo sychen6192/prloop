@@ -210,6 +210,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_LLM_RETRIES` | `1` | retries on transient model failures (never on 4xx) |
 | `PRR_LLM_MAX_TOKENS` | `8192` | **raise to 16384+ for thinking models** — reasoning is billed to this budget |
 | `PRR_LLM_STREAM` | `1` | stream completions (SSE) so gateways with idle timeouts can't 504 a long generation; `0` = buffered single response |
+| `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request, for engine knobs prloop has no flag for (e.g. `{"chat_template_kwargs":{"enable_thinking":false}}` switches Qwen3 thinking off on vLLM); prloop's own fields win on conflict |
 | `PRR_MIN_INLINE_SEVERITY` | `medium` | below this → summary only |
 | `PRR_MAX_INLINE_COMMENTS` | `10` | code axis (requirement axis has its own budget of 3) |
 | `PRR_EXCLUDE_CATEGORIES` | — | categories never reported (e.g. `performance,maintainability`); dropped before the skeptic spends tokens on them |
@@ -224,6 +225,11 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 not enough: a measured finder call on a self-hosted `qwen3.6:27b` used 7.8k completion tokens
 with ~24k characters of reasoning behind them. Overrun is reported as
 `response truncated at the token limit`, not as unparseable output — those need different fixes.
+When a model keeps burning the *entire* budget on reasoning no matter how high the limit, stop
+raising it — reasoning length is random per call, and a runaway eats whatever it is given.
+Point the finders at a non-thinking variant (finding + verbatim quoting doesn't need long
+reasoning; verification is where it earns its cost), or switch thinking off at the engine:
+`PRR_LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}` (vLLM / Qwen3).
 
 **Single-GPU / one-model-at-a-time backends** (a plain Ollama host) need
 `PRR_LLM_CONCURRENCY=1`. The finder fan-out otherwise interleaves requests for different

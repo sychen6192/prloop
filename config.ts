@@ -123,6 +123,34 @@ export const LLM_STRUCTURED_OUTPUT = process.env.PRR_LLM_STRUCTURED !== "0";
 // intermediary sees an idle connection; the response is still assembled and returned
 // whole. 0 = buffered requests (the old behaviour), for backends whose SSE is broken.
 export const LLM_STREAM = process.env.PRR_LLM_STREAM !== "0";
+/**
+ * Parses PRR_LLM_EXTRA_BODY: a JSON object merged into every model request body, for
+ * engine-specific knobs prloop has no first-class flag for. Exported for tests; the const
+ * below turns a parse failure into a startup fatal, because the alternative is a
+ * mysterious HTTP 400 on every single model call mid-run.
+ */
+export function parseExtraBody(raw: string | undefined): Record<string, unknown> | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const parsed: unknown = JSON.parse(raw); // throws on malformed JSON
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error('must be a JSON object, e.g. {"chat_template_kwargs":{"enable_thinking":false}}');
+  }
+  return parsed as Record<string, unknown>;
+}
+// The motivating case: a Qwen3-family finder on vLLM burning its entire token budget on
+// chain of thought — {"chat_template_kwargs":{"enable_thinking":false}} switches thinking
+// off at the engine. Applies to EVERY call (finder, skeptic, requirement, triage alike);
+// per-model behaviour belongs in the endpoint's own per-alias config (LiteLLM extra_body).
+// On a key conflict prloop's own fields always win — every field prloop manages already
+// has its own PRR_ knob, so a collision is always a mistake.
+export const LLM_EXTRA_BODY: Record<string, unknown> | undefined = (() => {
+  try {
+    return parseExtraBody(process.env.PRR_LLM_EXTRA_BODY);
+  } catch (e) {
+    console.error(`FATAL: PRR_LLM_EXTRA_BODY ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
 
 // --- Diff / token budget (PR-Agent style deterministic compression) ---
 export const MAX_DIFF_CHARS = numEnv("PRR_MAX_DIFF_CHARS", 240_000, 1000);

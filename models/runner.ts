@@ -4,6 +4,7 @@
 import {
   LLM_API_KEY,
   LLM_BASE_URL,
+  LLM_EXTRA_BODY,
   LLM_MAX_TOKENS,
   LLM_STREAM,
   LLM_STRUCTURED_OUTPUT,
@@ -185,6 +186,43 @@ export function isStreamingRejection(error: string): boolean {
   return /^HTTP 4\d\d/.test(error) && /stream/i.test(error);
 }
 
+/**
+ * Assembles the chat/completions request body.
+ *
+ * `extra` (PRR_LLM_EXTRA_BODY) is spread FIRST, so prloop's own fields always win on a key
+ * conflict: the knob exists to add engine-specific params — the motivating case is Qwen3's
+ * chat_template_kwargs.enable_thinking=false to stop a finder burning its whole budget on
+ * chain of thought — never to change the request shape the pipeline depends on. Everything
+ * prloop sets here already has its own PRR_ knob, so a collision is always a mistake.
+ */
+export function buildChatBody(
+  req: ChatRequest,
+  stream: boolean,
+  extra?: Record<string, unknown>,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    ...extra,
+    model: req.model,
+    messages: [
+      { role: "system", content: req.system },
+      { role: "user", content: req.user },
+    ],
+    temperature: req.temperature ?? LLM_TEMPERATURE,
+    max_tokens: req.maxTokens ?? LLM_MAX_TOKENS,
+    stream,
+  };
+  // Without this the stream carries no token counts. vLLM, LiteLLM and Ollama all honour
+  // it; a backend that rejects it as unknown trips the buffered fallback in chat().
+  if (stream) body["stream_options"] = { include_usage: true };
+  if (req.schema && LLM_STRUCTURED_OUTPUT) {
+    body["response_format"] = {
+      type: "json_schema",
+      json_schema: { name: req.schemaName ?? "output", schema: req.schema, strict: true },
+    };
+  }
+  return body;
+}
+
 export class OpenAICompatRunner implements ModelRunner {
   // Set after a backend rejects the streaming request shape itself; the rest of the run
   // goes buffered rather than paying a failed round trip on every call.
@@ -209,26 +247,7 @@ export class OpenAICompatRunner implements ModelRunner {
   }
 
   private async request(req: ChatRequest, stream: boolean): Promise<ChatResponse> {
-    const body: Record<string, unknown> = {
-      model: req.model,
-      messages: [
-        { role: "system", content: req.system },
-        { role: "user", content: req.user },
-      ],
-      temperature: req.temperature ?? LLM_TEMPERATURE,
-      max_tokens: req.maxTokens ?? LLM_MAX_TOKENS,
-      stream,
-    };
-    // Without this the stream carries no token counts. vLLM, LiteLLM and Ollama all honour
-    // it; a backend that rejects it as unknown trips the buffered fallback in chat().
-    if (stream) body["stream_options"] = { include_usage: true };
-    if (req.schema && LLM_STRUCTURED_OUTPUT) {
-      body["response_format"] = {
-        type: "json_schema",
-        json_schema: { name: req.schemaName ?? "output", schema: req.schema, strict: true },
-      };
-    }
-
+    const body = buildChatBody(req, stream, LLM_EXTRA_BODY);
     const url = `${this.baseUrl.replace(/\/+$/, "")}/chat/completions`;
     const ctrl = new AbortController();
     const timeoutMs = req.timeoutMs ?? LLM_TIMEOUT_MS;
