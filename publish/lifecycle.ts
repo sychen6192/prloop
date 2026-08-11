@@ -11,6 +11,7 @@
 // them sharing a filesystem.
 import { BOT_MARKER } from "../config";
 import { listThreads, setThreadStatus, type Thread } from "../ado/threads";
+import { normalizePath } from "../libs/fileindex";
 import { log, logVerbose } from "../libs/log";
 import type { FileDiff, PrRef } from "../libs/types";
 
@@ -55,7 +56,7 @@ export interface StaleThread {
  */
 export function findStaleThreads(threads: Thread[], files: FileDiff[]): StaleThread[] {
   const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(f.path.replace(/^\/+/, ""), f);
+  for (const f of files) byPath.set(normalizePath(f.path), f);
 
   const stale: StaleThread[] = [];
   for (const t of threads) {
@@ -66,7 +67,8 @@ export function findStaleThreads(threads: Thread[], files: FileDiff[]): StaleThr
     const ctx = t.threadContext;
     if (!ctx?.filePath || !ctx.rightFileStart?.line) continue;
 
-    const fd = byPath.get(ctx.filePath.replace(/^\/+/, ""));
+    // ADO thread paths carry a leading slash; normalized at this read edge.
+    const fd = byPath.get(normalizePath(ctx.filePath));
     // File untouched in this iteration → the flagged code is unchanged → leave it open.
     if (!fd) continue;
 

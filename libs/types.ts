@@ -64,6 +64,9 @@ export interface Hunk {
 }
 
 export interface FileDiff {
+  // Canonical: no leading slash, forward separators. Both intakes guarantee it at
+  // construction (libs/fileindex.ts normalizePath owns the rule); provider shapes are
+  // translated at the provider edges (e.g. ADO threads re-add the slash on write).
   path: string;
   originalPath?: string;
   changeType: ChangeType;

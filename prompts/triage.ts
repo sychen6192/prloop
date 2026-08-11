@@ -8,6 +8,7 @@
 //
 // Note the asymmetry with the skeptic: there the default is "refute", here the default is
 // "drop". A tool finding nobody can justify is noise, and noise is what gets bots muted.
+import { normalizePath } from "../libs/fileindex";
 import type { FileDiff } from "../libs/types";
 
 export const TRIAGE_SYSTEM = `You are deciding whether issues reported by static analysis tools deserve a developer's attention.
@@ -58,11 +59,13 @@ export interface TriageItem {
 }
 
 export function buildTriagePrompt(items: TriageItem[], files: FileDiff[], contextLines: number): string {
+  // Tool findings arrive re-keyed onto the diff's own paths (gates/static.ts), so this is
+  // an exact lookup, not a resolution step.
   const byPath = new Map<string, FileDiff>();
-  for (const f of files) byPath.set(f.path.replace(/^\/+/, ""), f);
+  for (const f of files) byPath.set(normalizePath(f.path), f);
 
   const blocks = items.map((it) => {
-    const fd = byPath.get(it.file.replace(/^\/+/, ""));
+    const fd = byPath.get(normalizePath(it.file));
     let snippet = "(no matching file content found)";
     if (fd) {
       const from = Math.max(1, it.line - contextLines);

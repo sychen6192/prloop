@@ -7,6 +7,7 @@
 //
 // This is what makes comments land on the right line, and it doubles as a hallucination
 // filter: a quote that doesn't exist in the file means the finding was invented.
+import type { FileIndex } from "../libs/fileindex";
 import type { Anchor, AnchorFailure, FileDiff, RawFinding } from "../libs/types";
 
 export interface AnchorResult {
@@ -35,33 +36,6 @@ function quoteLines(quote: string): string[] {
     .replace(/\r\n/g, "\n")
     .split("\n")
     .filter((l, i, arr) => !(l.trim() === "" && (i === 0 || i === arr.length - 1)));
-}
-
-/** Resolves the model's file string against the diff's real paths. */
-export function resolveFile(rawPath: string, files: FileDiff[]): FileDiff | undefined {
-  const want = rawPath.replace(/^\/+/, "").replace(/\\/g, "/");
-  const norm = (p: string) => p.replace(/^\/+/, "").replace(/\\/g, "/");
-
-  const exact = files.find((f) => norm(f.path) === want);
-  if (exact) return exact;
-
-  const ci = files.filter((f) => norm(f.path).toLowerCase() === want.toLowerCase());
-  if (ci.length === 1) return ci[0];
-
-  // Models often shorten paths to the last segments; accept only if unambiguous.
-  const suffix = files.filter((f) => norm(f.path).endsWith(`/${want}`) || norm(f.path) === want);
-  if (suffix.length === 1) return suffix[0];
-
-  const basename = want.split("/").pop() ?? want;
-  const byName = files.filter((f) => (norm(f.path).split("/").pop() ?? "") === basename);
-  if (byName.length === 1) return byName[0];
-
-  // A renamed file is often cited by its old path — the diff header shows both, and models
-  // copy whichever they read last.
-  const byOld = files.filter((f) => f.originalPath && norm(f.originalPath) === want);
-  if (byOld.length === 1) return byOld[0];
-
-  return undefined;
 }
 
 interface Candidate {
@@ -141,14 +115,14 @@ function touchesChangedLine(file: FileDiff, cand: Candidate): boolean {
   return false;
 }
 
-export function anchorFinding(finding: RawFinding, files: FileDiff[]): AnchorResult {
-  const file = resolveFile(finding.file, files);
-  if (!file) {
-    return {
-      failure: "file-not-in-diff",
-      detail: `file "${finding.file}" is not in this change set`,
-    };
+export function anchorFinding(finding: RawFinding, index: FileIndex): AnchorResult {
+  const res = index.resolve(finding.file);
+  if (!res.fd) {
+    // Both resolution failures (not in the change set, ambiguous) degrade the same way;
+    // the detail string carries the distinction into the summary.
+    return { failure: "file-not-in-diff", detail: res.detail };
   }
+  const file = res.fd;
 
   const stated: "right" | "left" = finding.side === "left" ? "left" : "right";
   const primary = anchorOnSide(finding, file, stated);

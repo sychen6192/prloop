@@ -2,6 +2,7 @@
 // anchored. Re-runs recognise their own threads by fingerprint and never post the same
 // issue twice (the "re-review amnesia" failure mode).
 import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun, BOT_MARKER } from "../config";
+import { normalizePath } from "../libs/fileindex";
 import { createThread, listThreads, updateComment, type Thread } from "../ado/threads";
 import { postStatus } from "../ado/statuses";
 import { unmetCriteria } from "../gates/requirement";
@@ -53,7 +54,9 @@ export function postedPositions(threads: Thread[]): Array<{ file: string; start:
     const ours = t.comments?.some((c) => !c.isDeleted && (c.content ?? "").includes(BOT_MARKER));
     if (!ours) continue;
     out.push({
-      file: ctx.filePath.replace(/^\/+/, ""),
+      // Thread paths come back from ADO in its own shape (leading slash); normalize at
+      // this read edge so they compare against the pipeline's canonical paths.
+      file: normalizePath(ctx.filePath),
       start: ctx.rightFileStart.line,
       end: ctx.rightFileEnd?.line ?? ctx.rightFileStart.line,
     });
@@ -130,10 +133,7 @@ export async function publish(
     if (
       f.anchor.side === "right" &&
       positions.some(
-        (p) =>
-          p.file === f.file.replace(/^\/+/, "") &&
-          f.anchor!.startLine <= p.end &&
-          f.anchor!.endLine >= p.start,
+        (p) => p.file === f.file && f.anchor!.startLine <= p.end && f.anchor!.endLine >= p.start,
       )
     ) {
       result.alreadyPosted.push(f);

@@ -4,6 +4,7 @@
 // being able to exercise the diff and anchoring path against real repositories without
 // needing ADO credentials. It reuses libs/diff.ts wholesale, so what it validates is the
 // same code that runs in production, not a parallel implementation.
+import { FileIndex } from "../libs/fileindex";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildHunks, diffLines } from "../libs/diff";
 import { splitLines } from "../ado/blobs";
@@ -64,17 +65,16 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
 
   for (const e of entries) {
     const changeType = mapStatus(e.status);
-    const adoPath = `/${e.path}`;
     if (isNoiseFile(e.path)) {
-      skipped.push({ path: adoPath, reason: "generated/lock/vendor" });
+      skipped.push({ path: e.path, reason: "generated/lock/vendor" });
       continue;
     }
     if (!isReviewable(e.path)) {
-      skipped.push({ path: adoPath, reason: `non-code (${detectLanguage(e.path)})` });
+      skipped.push({ path: e.path, reason: `non-code (${detectLanguage(e.path)})` });
       continue;
     }
     if (changeType === "delete") {
-      skipped.push({ path: adoPath, reason: "deleted" });
+      skipped.push({ path: e.path, reason: "deleted" });
       continue;
     }
 
@@ -88,12 +88,13 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       diffLines(leftLines, rightLines),
     );
     if (hunks.length === 0) {
-      skipped.push({ path: adoPath, reason: "no textual change" });
+      skipped.push({ path: e.path, reason: "no textual change" });
       continue;
     }
-    // Paths carry a leading slash so downstream code sees exactly the shape ADO returns.
+    // Canonical path shape, same as the ADO intake produces after normalization: no
+    // leading slash, forward separators. git already reports exactly that.
     files.push({
-      path: adoPath,
+      path: e.path,
       changeType,
       hunks,
       rightLines,
@@ -103,7 +104,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       truncated: false,
       language: detectLanguage(e.path),
     });
-    logVerbose(`  ${adoPath}: ${hunks.length} hunks, ${changedRightLines.size} changed lines`);
+    logVerbose(`  ${e.path}: ${hunks.length} hunks, ${changedRightLines.size} changed lines`);
   }
 
   const subject = (await git(opts.repo, ["log", "-1", "--format=%s", opts.head])).trim();
@@ -129,5 +130,6 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     files,
     skipped,
     changeTrackingIds: new Map(),
+    index: new FileIndex(files),
   };
 }

@@ -8,6 +8,7 @@
 //   - changeTrackingId, which the docs require for PRs with iteration support
 //   - iterationContext, so the thread is pinned to the iteration we actually reviewed
 import { adoGet, adoPatch, adoPost, prBase, type AdoList } from "./client";
+import { normalizePath } from "../libs/fileindex";
 import type { Anchor, PrRef } from "../libs/types";
 
 export interface ThreadComment {
@@ -66,10 +67,13 @@ export async function createThread(ref: PrRef, input: CreateThreadInput): Promis
     const a = input.anchor;
     const start = { line: a.startLine, offset: a.startOffset };
     const end = { line: a.endLine, offset: a.endOffset };
+    // The pipeline's paths are canonical (no leading slash); ADO's native shape carries
+    // one. The translation lives at this write edge, mirroring the strip at the read edge.
+    const filePath = `/${normalizePath(input.filePath)}`;
     body["threadContext"] =
       a.side === "right"
-        ? { filePath: input.filePath, rightFileStart: start, rightFileEnd: end }
-        : { filePath: input.filePath, leftFileStart: start, leftFileEnd: end };
+        ? { filePath, rightFileStart: start, rightFileEnd: end }
+        : { filePath, leftFileStart: start, leftFileEnd: end };
 
     if (input.iterationId !== undefined) {
       body["pullRequestThreadContext"] = {

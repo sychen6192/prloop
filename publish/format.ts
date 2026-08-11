@@ -246,6 +246,11 @@ export function renderSummary(input: SummaryInput): string {
     );
     for (const s of sr.skipped) notes.push(`Skipped tool ${s.tool}: ${s.reason}`);
   }
+  if (sr && sr.unresolved > 0 && !sr.skippedReason) {
+    notes.push(
+      `${sr.unresolved} tool findings had paths that resolved to no changed file, so they were not commented`,
+    );
+  }
   if (sr && sr.staleFiles.length > 0 && !sr.skippedReason) {
     notes.push(
       `Static analysis skipped ${sr.staleFiles.length} files: the PRR_WORKDIR checkout of them ` +
