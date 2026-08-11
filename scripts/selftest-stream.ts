@@ -6,10 +6,12 @@
 // Wired into `npm run check` alongside it.
 import {
   SseAccumulator,
+  buildChatBody,
   describeStreamedCompletion,
   isStreamingRejection,
   isTransientModelError,
 } from "../models/runner";
+import { parseExtraBody } from "../config";
 
 let passed = 0;
 let failed = 0;
@@ -127,6 +129,62 @@ section("streamed completion taxonomy: cut streams fail, a missing [DONE] alone 
   check("a schema 400 does not", !isStreamingRejection("HTTP 400: Invalid schema for response_format"));
   check("a 5xx does not (already transient)", !isStreamingRejection("HTTP 500: stream backend crashed"));
   check("a timeout does not", !isStreamingRejection("timeout (900s)"));
+}
+
+section("request body assembly: PRR_LLM_EXTRA_BODY adds engine knobs, never breaks the shape");
+{
+  // The motivating case: switching Qwen3 thinking off at the engine rides along untouched.
+  const body = buildChatBody({ model: "m", system: "s", user: "u" }, true, {
+    chat_template_kwargs: { enable_thinking: false },
+  });
+  eq("extra params ride along", JSON.stringify(body["chat_template_kwargs"]), '{"enable_thinking":false}');
+  eq("stream still requested", body["stream"], true);
+  eq("usage still requested", JSON.stringify(body["stream_options"]), '{"include_usage":true}');
+
+  // Core fields cannot be clobbered: everything prloop manages has its own PRR_ knob, so a
+  // conflict is always a mistake — resolved in favour of the pipeline.
+  const hostile = buildChatBody({ model: "m", system: "s", user: "u", maxTokens: 111 }, false, {
+    model: "evil",
+    messages: [],
+    stream: true,
+    max_tokens: 9,
+  });
+  eq("model wins over extra body", hostile["model"], "m");
+  eq("max_tokens wins over extra body", hostile["max_tokens"], 111);
+  eq("stream wins over extra body", hostile["stream"], false);
+  check("messages win over extra body", Array.isArray(hostile["messages"]) && (hostile["messages"] as unknown[]).length === 2);
+
+  // No knob set → exactly the old request shape.
+  const plain = buildChatBody({ model: "m", system: "s", user: "u" }, false, undefined);
+  check("absent knob adds nothing", !("chat_template_kwargs" in plain));
+  check("no stream_options when buffered", !("stream_options" in plain));
+
+  // Guided decoding still attaches alongside the extra body.
+  const withSchema = buildChatBody(
+    { model: "m", system: "s", user: "u", schema: { type: "object" }, schemaName: "findings" },
+    true,
+    { chat_template_kwargs: { enable_thinking: false } },
+  );
+  check("response_format present with schema", JSON.stringify(withSchema["response_format"]).includes('"findings"'));
+}
+
+section("PRR_LLM_EXTRA_BODY parsing fails fast at startup, not as HTTP 400 mid-run");
+{
+  eq("unset stays unset", parseExtraBody(undefined), undefined);
+  eq("blank stays unset", parseExtraBody("   "), undefined);
+  eq("an object parses", JSON.stringify(parseExtraBody('{"top_k":20}')), '{"top_k":20}');
+
+  const throws = (raw: string) => {
+    try {
+      parseExtraBody(raw);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  check("malformed JSON throws", throws("{oops"));
+  check("an array throws (must be an object)", throws("[1,2]"));
+  check("a bare string throws", throws('"enable_thinking=false"'));
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

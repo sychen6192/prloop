@@ -183,6 +183,19 @@ probe flags this.
   logs it and falls back to buffered mode for the run — then the only real fix is raising every
   intermediary's response timeout above your slowest generation, or `PRR_LLM_STREAM=0` plus those raised
   timeouts.
+- **A finder keeps failing with `truncated at the token limit`, reporting tens of thousands of chars of
+  reasoning.** A thinking model is spending the whole `PRR_LLM_MAX_TOKENS` budget on chain of thought and
+  never reaching the answer. Don't chase it with a bigger limit: reasoning length is random per call
+  (measured on one PR: 11k chars one run, 132k the next, same prompt), and a runaway eats whatever it is
+  given — each failure burns minutes and the full budget for zero findings. Fixes, best first:
+  - Point `PRR_FINDER_MODELS` at a **non-thinking variant**. Finding + verbatim quoting doesn't need long
+    reasoning — precision comes from the downstream gates. Keep the thinking model where reasoning pays:
+    the skeptic.
+  - Or switch thinking off at the engine for every call:
+    `PRR_LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}` (vLLM / Qwen3 syntax; note it
+    applies to the skeptic too).
+  - To disable thinking for the finders while keeping it on the skeptic, do it per alias in the
+    endpoint's own config (e.g. LiteLLM `extra_body` on the finder alias) instead.
 - **Too many comments.** Lower `PRR_MAX_INLINE_COMMENTS`, or raise `PRR_MIN_INLINE_SEVERITY` to `high`.
 - **Want to block merge.** Set `PRR_POST_STATUS=1` and add a status check with genre `prloop` / name
   `ai-review` to the branch policy. Don't have a bot cast a -10 vote — it fights the reviewer policy.
