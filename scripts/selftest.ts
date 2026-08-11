@@ -770,7 +770,7 @@ const spec = (format: string): ToolSpec =>
   const rekeyed = rekeyToolFindings([finding], "", new FileIndex([fd]));
   eq("a source-root-relative path resolves by suffix", rekeyed.kept.length, 1);
   eq("...and is re-keyed onto the diff's own path", rekeyed.kept[0]?.file, "svc/src/main/java/com/acme/Svc.java");
-  eq("...so the diff filter hits exactly", filterToChangedLines(rekeyed.kept, [fd]).kept.length, 1);
+  eq("...so the diff filter hits exactly", filterToChangedLines(rekeyed.kept, new FileIndex([fd])).kept.length, 1);
 
   // The Maven-submodule composition: the tool ran in svc/, so the blindly-prefixed path
   // "svc/com/acme/Svc.java" matches nothing — but the raw path still resolves by suffix.
@@ -784,7 +784,11 @@ const spec = (format: string): ToolSpec =>
   const twin = mkFile("api/src/main/java/com/acme/Svc.java", ["a();", "b();"], [2]);
   const amb = rekeyToolFindings([finding], "", new FileIndex([fd, twin]));
   eq("an ambiguous suffix is dropped, not guessed", amb.kept.length, 0);
-  eq("...and counted as unresolved, not merely dropped", amb.unresolved.length, 1);
+  eq("...and counted as unresolved, not merely dropped", amb.misses.length, 1);
+
+  // The filter itself no longer resolves: an un-rekeyed suffix-shaped path is a miss.
+  eq("filterToChangedLines alone drops a suffix-shaped path",
+    filterToChangedLines([finding], new FileIndex([fd])).kept.length, 0);
 }
 {
   // PMD's xml renderer speaks the checkstyle dialect but names its attributes beginline and
@@ -837,12 +841,12 @@ section("diff filtering of static findings");
     tool: "ruff", tier: "triage" as const, ruleId: "X", message: "m",
     file: "src/a.py", line, severity: "medium" as const,
   });
-  const r = filterToChangedLines([mk(1), mk(2), mk(3)], [f]);
+  const r = filterToChangedLines([mk(1), mk(2), mk(3)], new FileIndex([f]));
   eq("keeps only findings on changed lines", r.kept.length, 1);
   eq("the kept one is line 2", r.kept[0]?.line, 2);
   eq("the rest are dropped", r.dropped, 2);
 
-  const other = filterToChangedLines([{ ...mk(2), file: "other/z.py" }], [f]);
+  const other = filterToChangedLines([{ ...mk(2), file: "other/z.py" }], new FileIndex([f]));
   eq("files outside the diff are always dropped", other.kept.length, 0);
 }
 
@@ -874,6 +878,36 @@ section("FileIndex: one resolver for foreign paths");
   eq("prefixed exact hit", new FileIndex([a]).resolveTool("svc", "src/Main.java").fd?.path, "svc/src/Main.java");
 }
 {
+  // A bare filename from a project-scoped tool must not cross into another module: with
+  // app/util.ts unchanged, "util.ts" reported from app/ must NOT resolve to web/util.ts.
+  const web = mkFile("web/util.ts", ["w();"], [1]);
+  const idx = new FileIndex([web]);
+  eq("bare filename with a prefix does not cross projects", idx.resolveTool("app", "util.ts").failure, "not-found");
+  eq("...but a multi-segment source-root path still falls back", idx.resolveTool("app", "web/util.ts").fd?.path, "web/util.ts");
+  eq("...and at the workdir root the full ladder applies", idx.resolveTool("", "util.ts").fd?.path, "web/util.ts");
+}
+{
+  // An ambiguous FILE degrades under its own failure name — "file not in this change"
+  // would be actively false for a path that matched twice.
+  const a = mkFile("a/x.ts", ["a();"], [1]);
+  const b = mkFile("b/x.ts", ["b();"], [1]);
+  const r = anchorFinding(mkFinding({ file: "x.ts", quote: "a();" }), [a, b]);
+  eq("ambiguous file maps to file-ambiguous", r.failure, "file-ambiguous");
+  check("...and carries the ambiguity detail", (r.detail ?? "").includes("2 changed files"));
+}
+{
+  // Rename trail for stale-thread resolution: a thread on the old path finds the renamed
+  // file, so its staleness is judged against the file's current content.
+  const renamed = { ...mkFile("src/new.ts", ["x();"], [1]), originalPath: "src/old.ts" };
+  const t = {
+    id: 7, status: "active",
+    comments: [{ id: 1, content: "<!-- prloop -->issue" }],
+    threadContext: { filePath: "/src/old.ts", rightFileStart: { line: 99, offset: 1 } },
+  };
+  eq("a thread on the pre-rename path is judged against the renamed file",
+    findStaleThreads([t], new FileIndex([renamed])).length, 1);
+}
+{
   // Regression: a re-keyed tool finding reaches the triage prompt with real content.
   // Before the FileIndex, the suffix-resolved finding kept the tool's own path string and
   // the prompt's exact-only lookup fell back to "(no matching file content found)" — the
@@ -887,7 +921,7 @@ section("FileIndex: one resolver for foreign paths");
   const items = rekeyed.kept.map((f, i) => ({
     index: i, tool: f.tool, ruleId: f.ruleId, message: f.message, file: f.file, line: f.line, severity: f.severity,
   }));
-  const prompt = buildTriagePrompt(items, [fd], 3);
+  const prompt = buildTriagePrompt(items, new FileIndex([fd]), 3);
   check("triage prompt carries the real snippet", prompt.includes("b();"));
   check("...not the no-content fallback", !prompt.includes("no matching file content found"));
 }
@@ -1082,13 +1116,14 @@ section("comment lifecycle");
     comments: [{ id: 1, content: "<!-- prloop --><!-- prloop:fp=abc123 -->issue" }],
     threadContext: { filePath: "/src/a.ts", rightFileStart: { line, offset: 1 } },
   });
-  eq("line past end of file -> stale", findStaleThreads([ours(99, "active")], [f]).length, 1);
-  eq("line still in range -> leave it alone", findStaleThreads([ours(1, "active")], [f]).length, 0);
-  eq("closed thread is skipped", findStaleThreads([ours(99, "fixed")], [f]).length, 0);
+  const idx = new FileIndex([f]);
+  eq("line past end of file -> stale", findStaleThreads([ours(99, "active")], idx).length, 1);
+  eq("line still in range -> leave it alone", findStaleThreads([ours(1, "active")], idx).length, 0);
+  eq("closed thread is skipped", findStaleThreads([ours(99, "fixed")], idx).length, 0);
   // Someone else's comment must never be touched.
   const foreign = { id: 5, status: "active", comments: [{ id: 1, content: "a teammate's comment" }],
     threadContext: { filePath: "/src/a.ts", rightFileStart: { line: 99, offset: 1 } } };
-  eq("comments not from this tool are skipped", findStaleThreads([foreign], [f]).length, 0);
+  eq("comments not from this tool are skipped", findStaleThreads([foreign], idx).length, 0);
 }
 {
   const dismissed = [
@@ -1146,7 +1181,7 @@ section("excluded categories (PRR_EXCLUDE_CATEGORIES)");
   };
   const dummyRunner = { chat: async () => ({ text: "", model: "none" }) };
   process.env["PRR_EXCLUDE_CATEGORIES"] = "security";
-  const res = await triageAndConvert(dummyRunner, staticResult, [f]);
+  const res = await triageAndConvert(dummyRunner, staticResult, new FileIndex([f]));
   eq("bandit (security) finding excluded", res.findings.length, 1);
   eq("tool exclusion is counted", res.excluded, 1);
   eq("mypy (correctness) finding kept", res.findings[0]?.category, "correctness");
@@ -1231,11 +1266,23 @@ section("position dedupe covers dismissed threads");
     comments: [{ id: 1, content }],
     threadContext: { filePath: "/src/a.ts", rightFileStart: { line: 3, offset: 1 }, rightFileEnd: { line: 3, offset: 5 } },
   });
-  eq("active thread occupies its lines", postedPositions([mkT("active")]).length, 1);
-  eq("wontFix thread still occupies its lines", postedPositions([mkT("wontFix")]).length, 1);
-  eq("byDesign thread still occupies its lines", postedPositions([mkT("byDesign")]).length, 1);
-  eq("fixed thread frees its lines (code changed)", postedPositions([mkT("fixed")]).length, 0);
-  eq("someone else's thread never counts", postedPositions([mkT("active", "a teammate's comment")]).length, 0);
+  const noFiles = new FileIndex([]);
+  eq("active thread occupies its lines", postedPositions([mkT("active")], noFiles).length, 1);
+  eq("wontFix thread still occupies its lines", postedPositions([mkT("wontFix")], noFiles).length, 1);
+  eq("byDesign thread still occupies its lines", postedPositions([mkT("byDesign")], noFiles).length, 1);
+  eq("fixed thread frees its lines (code changed)", postedPositions([mkT("fixed")], noFiles).length, 0);
+  eq("someone else's thread never counts", postedPositions([mkT("active", "a teammate's comment")], noFiles).length, 0);
+
+  // Rename trail: a thread created on the old path still occupies the renamed file's
+  // lines, so a re-run cannot re-post the same finding onto the new name.
+  const renamed = { ...mkFile("src/new.ts", ["x();", "y();", "z();"], [3]), originalPath: "src/old.ts" };
+  const onOldName = {
+    id: 9, status: "active",
+    comments: [{ id: 1, content: "<!-- prloop -->issue" }],
+    threadContext: { filePath: "/src/old.ts", rightFileStart: { line: 3, offset: 1 }, rightFileEnd: { line: 3, offset: 5 } },
+  };
+  eq("a thread on the pre-rename path re-keys onto the renamed file",
+    postedPositions([onOldName], new FileIndex([renamed]))[0]?.file, "src/new.ts");
 }
 
 // --- realistic seeded PR ---

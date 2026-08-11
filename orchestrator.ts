@@ -145,7 +145,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           unresolved: 0,
           skippedReason: "static analysis skipped by config",
         })
-      : runStaticGate(ctx.files, ctx.index, ctx.iteration.sourceRefCommit)
+      : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit)
     ).catch((e): StaticResult => {
       stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
       return { facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason: "crashed" };
@@ -172,7 +172,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   run.saveJson("finder-outputs.json", outputs.map((o) => ({ ...o, raw: undefined })));
 
   banner("Step 3/4: anchor, adversarial verification and verdicts");
-  const candidates = anchorAndDedupe(outputs, ctx.index);
+  const candidates = anchorAndDedupe(outputs, ctx.fileIndex);
 
   // Learnings: findings a human already dismissed (on this PR or a previous one) skip the
   // skeptic — no verification budget is spent re-litigating a closed decision — and are
@@ -209,7 +209,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
 
   // Tool findings join the code axis after triage. They carry real line numbers, so they
   // skip anchoring, and a deterministic tool counts as its own corroboration.
-  const toolOut = await triageAndConvert(opts.runner, staticResult, ctx.files).catch((e) => {
+  const toolOut = await triageAndConvert(opts.runner, staticResult, ctx.fileIndex).catch((e) => {
     stageFailures.push(`triage stage (${e instanceof Error ? e.message : String(e)})`);
     return { findings: [], triaged: 0, dropped: 0, excluded: 0 };
   });
@@ -231,7 +231,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   if (reqOut.raw) run.save("requirement-raw.txt", reqOut.raw);
   run.saveJson("requirement.json", req);
 
-  const reqFindings = toRequirementFindings(req, ctx.index);
+  const reqFindings = toRequirementFindings(req, ctx.fileIndex);
   // Attach the tracking id ADO needs for each thread to survive future pushes.
   for (const f of [...agg.inline, ...reqFindings]) {
     f.changeTrackingId = ctx.changeTrackingIds.get(f.file);

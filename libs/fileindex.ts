@@ -29,11 +29,38 @@ export class FileIndex {
   // Precomputed canonical keys; FileDiff.path is already canonical from intake, but the
   // index normalizes its own keys so directly-constructed fixtures behave identically.
   private readonly entries: Array<{ key: string; fd: FileDiff }>;
-  private readonly byPath = new Map<string, FileDiff>();
+  private readonly byExactPath = new Map<string, FileDiff>();
 
   constructor(files: FileDiff[]) {
     this.entries = files.map((fd) => ({ key: normalizePath(fd.path), fd }));
-    for (const e of this.entries) this.byPath.set(e.key, e.fd);
+    for (const e of this.entries) this.byExactPath.set(e.key, e.fd);
+  }
+
+  /**
+   * Exact lookup by canonical path — for paths that are already the pipeline's own
+   * (re-keyed findings, FileDiff.path). This is the shared map the hand-rolled per-module
+   * copies used to be; it is deliberately NOT a resolution tier.
+   */
+  exact(rawPath: string): FileDiff | undefined {
+    return this.byExactPath.get(normalizePath(rawPath));
+  }
+
+  /**
+   * Resolve a FULL path as a prior iteration knew it — an existing PR thread's file path.
+   * Exact match, else the rename trail via originalPath (a thread created on the old name
+   * must find the renamed file, or stale-thread resolution and position dedupe both miss).
+   * Deliberately no shortened-path tiers: a full citation that doesn't match is a
+   * different file, not a shorthand — and mis-resolving someone's live thread is worse
+   * than leaving it alone.
+   */
+  resolvePrior(rawPath: string): FileDiff | undefined {
+    const want = normalizePath(rawPath);
+    const exact = this.byExactPath.get(want);
+    if (exact) return exact;
+    const byOld = this.entries.filter(
+      (e) => e.fd.originalPath && normalizePath(e.fd.originalPath) === want,
+    );
+    return byOld.length === 1 ? byOld[0]!.fd : undefined;
   }
 
   /**
@@ -47,7 +74,7 @@ export class FileIndex {
     const want = normalizePath(rawPath);
     if (!want) return { failure: "not-found", detail: "finding carries no file path" };
 
-    const exact = this.byPath.get(want);
+    const exact = this.byExactPath.get(want);
     if (exact) return { fd: exact };
 
     let ambiguous: { tier: string; count: number } | undefined;
@@ -100,9 +127,22 @@ export class FileIndex {
    */
   resolveTool(prefix: string, rawPath: string): ResolveResult {
     const p = normalizePath(prefix);
+    const raw = normalizePath(rawPath);
     if (p) {
-      const exact = this.byPath.get(normalizePath(`${p}/${normalizePath(rawPath)}`));
+      const exact = this.byExactPath.get(normalizePath(`${p}/${raw}`));
       if (exact) return { fd: exact };
+      // A bare filename from a tool that ran in a project directory means something only
+      // inside that project. Falling through to the shortened-path tiers would resolve it
+      // onto whatever same-named file some OTHER module changed — a comment on the wrong
+      // file, which is worse than no comment. Multi-segment paths keep the fallback: a
+      // source-root path like com/acme/Svc.java carries enough shape for the suffix tier
+      // to be evidence rather than a guess.
+      if (!raw.includes("/")) {
+        return {
+          failure: "not-found",
+          detail: `file "${rawPath}" is not in ${p}/ (a bare filename does not resolve across projects)`,
+        };
+      }
     }
     return this.resolve(rawPath);
   }
