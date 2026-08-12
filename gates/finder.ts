@@ -3,7 +3,7 @@
 // M1 runs one model. The signature is already plural because M3 turns this into a
 // heterogeneous fleet running in parallel — the only thing that changes is the fan-out,
 // not the parsing or validation.
-import { FINDER_MODELS, FINDING_CATEGORIES, SEVERITIES, type Severity } from "../config";
+import { FINDER_MODELS, FINDING_CATEGORIES, SEVERITIES, severityRank, type Severity } from "../config";
 import { parseJsonObject } from "../libs/json";
 import { log } from "../libs/log";
 import { loadRules, renderRules, selectRules } from "../libs/rules";
@@ -23,7 +23,7 @@ const VALID_SEVERITY = new Set<string>(SEVERITIES);
 const VALID_CATEGORY = new Set<string>(FINDING_CATEGORIES);
 
 /** Field-by-field validation. A finding missing its quote is unanchorable, so it's dropped. */
-function validateFinding(v: unknown): RawFinding | undefined {
+export function validateFinding(v: unknown): RawFinding | undefined {
   if (typeof v !== "object" || v === null) return undefined;
   const o = v as Record<string, unknown>;
 
@@ -47,9 +47,20 @@ function validateFinding(v: unknown): RawFinding | undefined {
   const rawCategory = (str("category") ?? "").toLowerCase();
   const category = VALID_CATEGORY.has(rawCategory) ? rawCategory : "correctness";
 
+  // The rules' citation contract, enforced structurally rather than by asking nicely:
+  // a maintainability finding is a judgment call by definition, and one that names no
+  // smell or project rule is a hypothesis — it may still appear in the summary, but it
+  // cannot spend an inline-comment slot, so it is capped below the default inline bar.
+  // Findings in behavioral categories cite their own broken behavior via quote+evidence.
+  const cites = str("cites")?.trim() || undefined;
+  const cappedSeverity: Severity =
+    category === "maintainability" && !cites && severityRank(severity) < severityRank("low")
+      ? "low"
+      : severity;
+
   return {
     category,
-    severity,
+    severity: cappedSeverity,
     confidence,
     file,
     quote,
@@ -60,6 +71,7 @@ function validateFinding(v: unknown): RawFinding | undefined {
     evidence: str("evidence"),
     suggested_fix: str("suggested_fix"),
     boundary_owner: o["boundary_owner"] === "external" ? "external" : "current",
+    cites,
   };
 }
 

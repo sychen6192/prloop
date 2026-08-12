@@ -262,6 +262,12 @@ over-reporting.
 
 `PRR_RULES_DIR` points elsewhere.
 
+The reviewed repository's own convention documents (`CONTRIBUTING.md`, `CODING_STANDARDS.md`,
+`docs/` variants, `CLAUDE.md`, `AGENTS.md`) are fetched automatically at the iteration's
+commit and injected ahead of the rules — they override the baseline, which is what makes the
+"repo conventions win" clause enforceable rather than aspirational. For standards that live
+anywhere else, put them in `PRR_RULES_DIR` as rule files with an `applyTo` glob.
+
 ## Development
 
 ```bash

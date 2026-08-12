@@ -107,3 +107,38 @@ export function renderRules(rules: Rule[]): string {
   if (rules.length === 0) return "";
   return rules.map((r) => r.body).join("\n\n---\n\n");
 }
+
+// Prompt-budget caps for injected convention documents. A convention file is context, not
+// the subject under review; an unbounded CONTRIBUTING.md must not crowd the diff out of
+// the window.
+const CONVENTION_FILE_CHARS = 6_000;
+const CONVENTION_TOTAL_CHARS = 12_000;
+
+/**
+ * Renders the reviewed repo's own convention documents as the highest-priority rules
+ * block. Pure (fetching lives in ado/conventions.ts) so the caps are testable offline.
+ */
+export function renderConventions(docs: Array<{ path: string; text: string }>): string {
+  if (docs.length === 0) return "";
+  const parts: string[] = [
+    "## This repository's own conventions",
+    "",
+    "The documents below come from the repository under review. They override everything" +
+      " else in these rules where they conflict.",
+  ];
+  let budget = CONVENTION_TOTAL_CHARS;
+  for (const d of docs) {
+    if (budget <= 0) {
+      parts.push("", `(${d.path} omitted — convention budget exhausted)`);
+      continue;
+    }
+    let text = d.text.trim();
+    const cap = Math.min(CONVENTION_FILE_CHARS, budget);
+    if (text.length > cap) {
+      text = `${text.slice(0, cap)}\n\n(truncated — read ${d.path} in the repo for the rest)`;
+    }
+    budget -= text.length;
+    parts.push("", `### ${d.path}`, "", text);
+  }
+  return parts.join("\n");
+}

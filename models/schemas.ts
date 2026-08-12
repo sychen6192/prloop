@@ -22,6 +22,7 @@ export const FINDINGS_SCHEMA = {
         required: [
           "category", "severity", "confidence", "file", "quote", "context_before",
           "context_after", "side", "claim", "evidence", "suggested_fix", "boundary_owner",
+          "cites",
         ],
         properties: {
           category: { type: "string", enum: [...FINDING_CATEGORIES] },
@@ -55,6 +56,11 @@ export const FINDINGS_SCHEMA = {
               "The corrected code, ready to paste in place of the quote. Code only, no prose. Null only when no concrete fix can be written.",
           },
           boundary_owner: { type: "string", enum: ["current", "external"] },
+          cites: {
+            type: ["string", "null"],
+            description:
+              "For maintainability findings: the named smell or project rule this invokes (e.g. \"Feature Envy\"). Null for findings that rest on concrete broken behavior.",
+          },
         },
       },
     },
