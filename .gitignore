@@ -1,6 +1,7 @@
 node_modules/
 runs/
-.env
+.env*
+!.env.example
 *.log
 
 # Certificates written by probe --export-ca: environment-specific, never committed
