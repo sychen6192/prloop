@@ -61,3 +61,28 @@ must never be reported from here.
   file born oversized, or one that makes an existing file grow significantly, is worth
   raising.
 - Suggestions with no concrete gap, like "could add more tests" or "could use more comments".
+
+## Two-axis review (summarized from Matt Pocock's `code-review` skill)
+
+The smell list above is that skill's Standards floor; this section carries the rest of its
+method. A review answers two independent questions, and neither may mask the other — code
+can follow every convention while implementing the wrong thing, and do exactly what was
+asked while breaking the conventions. Check both, always:
+
+- **Standards — is it built right?** The repo's documented standards first (they always
+  override), then the smell baseline above. A documented-standard breach may be reported
+  as a hard violation; a baseline smell never is.
+- **Spec — is it the right thing?** Judge the diff against whatever states the intent —
+  the linked issue, spec file, or PR description. Three checks:
+  1. Requirements asked for but missing or only partially implemented.
+  2. Behavior nobody asked for (scope creep).
+  3. Requirements that look implemented, but implemented wrongly.
+
+  Missing or wrong behavior is a `correctness` finding, severity by actual impact; scope
+  creep is a judgment call like the smells, `medium` at most.
+
+**Every finding carries a checkable citation** — the standards file and rule, the named
+smell plus the offending hunk, or the spec/description line it violates. A finding that
+cannot cite one of these is a hypothesis, not a finding: drop it. And when no spec or
+description exists, say so — never infer the requirements from the code and then review
+the code against them.
