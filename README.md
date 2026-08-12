@@ -27,11 +27,9 @@ Step 3  anchor → filter → skeptic    quote → line number, then refutation 
 Step 4  publish                     sticky summary + inline threads           0
 ```
 
-`N` = finder models, `R` = `PRR_SKEPTIC_ROUNDS`, and `M` = anchored findings **that survive
-the noise filter** — an excluded category or a previously dismissed finding costs no
-verification tokens at all.
-All model calls share one concurrency pool (`PRR_LLM_CONCURRENCY`, default 6) and retry once
-on transient failures.
+`N` = finder models, `R` = `PRR_SKEPTIC_ROUNDS`, `M` = anchored findings **that survive the
+noise filter** — exclusions and prior dismissals cost no verification tokens. All model calls
+share one concurrency pool (`PRR_LLM_CONCURRENCY`) and retry on transient failures.
 
 The requirement axis is not part of the step-2 barrier — its result is only needed at publish
 time, and the gate is non-fatal, so it must not be able to hold the pipeline. Step 3 starts as
@@ -209,11 +207,11 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size |
 | `PRR_LLM_RETRIES` | `1` | retries on transient model failures (never on 4xx) |
 | `PRR_LLM_MAX_TOKENS` | `8192` | **raise to 16384+ for thinking models** — reasoning is billed to this budget |
-| `PRR_LLM_STREAM` | `1` | stream completions (SSE) so gateways with idle timeouts can't 504 a long generation; `0` = buffered single response |
-| `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request, for engine knobs prloop has no flag for (e.g. `{"chat_template_kwargs":{"enable_thinking":false}}` switches Qwen3 thinking off on vLLM); prloop's own fields win on conflict |
+| `PRR_LLM_STREAM` | `1` | stream completions (SSE) so a gateway's idle timeout can't 504 a long generation; `0` = buffered |
+| `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request — engine knobs prloop has no flag for; prloop's own fields win on conflict |
 | `PRR_MIN_INLINE_SEVERITY` | `medium` | below this → summary only |
 | `PRR_MAX_INLINE_COMMENTS` | `10` | code axis (requirement axis has its own budget of 3) |
-| `PRR_EXCLUDE_CATEGORIES` | — | categories never reported (e.g. `performance,maintainability`); dropped before the skeptic spends tokens on them |
+| `PRR_EXCLUDE_CATEGORIES` | — | categories never reported (e.g. `performance,maintainability`) |
 | `PRR_LEARN_FROM_DISMISSALS` | `1` | `0` = re-post findings humans dismissed as wontFix/byDesign |
 | `PRR_REQUIRE_CORROBORATION` | `1` | `0` publishes unverified single-source findings |
 | `PRR_WORKDIR` | — | checkout at the iteration's `sourceRefCommit`; unset = static analysis skips. Files whose content differs from the iteration under review are skipped, not analysed |
@@ -221,15 +219,16 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |
 | `PRR_DRY_RUN` | — | `1` = compute, publish nothing |
 
-**Thinking models** bill their chain of thought against `max_tokens`, so the default 8192 is
-not enough: a measured finder call on a self-hosted `qwen3.6:27b` used 7.8k completion tokens
-with ~24k characters of reasoning behind them. Overrun is reported as
-`response truncated at the token limit`, not as unparseable output — those need different fixes.
-When a model keeps burning the *entire* budget on reasoning no matter how high the limit, stop
-raising it — reasoning length is random per call, and a runaway eats whatever it is given.
-Point the finders at a non-thinking variant (finding + verbatim quoting doesn't need long
-reasoning; verification is where it earns its cost), or switch thinking off at the engine:
-`PRR_LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}` (vLLM / Qwen3).
+**Thinking models** outgrow the default 8192-token budget: a measured finder call on a
+self-hosted `qwen3.6:27b` used 7.8k completion tokens with ~24k characters of reasoning
+behind them. Overrun is reported as `response truncated at the token limit`, not as
+unparseable output — those need different fixes.
+
+**Runaway reasoning** is the failure a bigger limit can't fix: reasoning length is random per
+call, and a model that burns the *entire* budget, however high, eats whatever it is given.
+Point the finders at a non-thinking variant (finding + verbatim quoting doesn't need
+long reasoning; verification is where it earns its cost), or switch thinking off at the
+engine: `PRR_LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}` (vLLM / Qwen3).
 
 **Single-GPU / one-model-at-a-time backends** (a plain Ollama host) need
 `PRR_LLM_CONCURRENCY=1`. The finder fan-out otherwise interleaves requests for different
@@ -260,13 +259,11 @@ binding constraints: the repo's own conventions override the baseline, and every
 judgment call capped at `medium` severity. That cap is the built-in guard against
 over-reporting.
 
-`PRR_RULES_DIR` points elsewhere.
-
 The reviewed repository's own convention documents (`CONTRIBUTING.md`, `CODING_STANDARDS.md`,
 `docs/` variants, `CLAUDE.md`, `AGENTS.md`) are fetched automatically at the iteration's
-commit and injected ahead of the rules — they override the baseline, which is what makes the
-"repo conventions win" clause enforceable rather than aspirational. For standards that live
-anywhere else, put them in `PRR_RULES_DIR` as rule files with an `applyTo` glob.
+commit and injected ahead of the rules — that is what makes "conventions override the
+baseline" enforceable rather than aspirational. Standards that live anywhere else go in
+`PRR_RULES_DIR` as rule files with an `applyTo` glob.
 
 ## Development
 
