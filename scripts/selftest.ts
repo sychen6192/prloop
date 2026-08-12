@@ -10,7 +10,7 @@ import { parseJsonObject } from "../libs/json";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildDiffPayload } from "../libs/payload";
 import { htmlToText } from "../libs/html";
-import { globToRegExp, loadRules, selectRules } from "../libs/rules";
+import { globToRegExp, loadRules, renderConventions, selectRules } from "../libs/rules";
 import { finalize } from "../gates/aggregate";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
 import { parseVerdict as parseVerdictForTest } from "../gates/skeptic";
@@ -42,6 +42,9 @@ import { spawn as spawnChild } from "node:child_process";
 import { buildInvocation } from "../models/opencode";
 import { anchorAndDedupe } from "../gates/aggregate";
 import type { FinderOutput } from "../gates/finder";
+import { validateFinding } from "../gates/finder";
+import { applyReqSkepticVerdicts } from "../gates/requirement";
+import type { CriterionCheck, ReqVerdict } from "../libs/types";
 import { FINDINGS_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
 import { PRLOOP_ROOT } from "../config";
 import * as fs from "node:fs";
@@ -1742,6 +1745,49 @@ section("transient vs deterministic model failures");
   check("empty response does NOT retry", !isTransientModelError("model returned an empty response"));
   check("reasoning-only response does NOT retry", !isTransientModelError("model returned only reasoning (5000 chars) and no answer; raise PRR_LLM_MAX_TOKENS"));
   check("non-JSON body does NOT retry", !isTransientModelError("response is not JSON: <html>"));
+}
+
+section("two-axis wiring: citations, conventions, requirement skeptic");
+{
+  // Citation teeth: an uncited maintainability finding is a hypothesis — capped to low so
+  // it can never spend an inline slot; cited or behavioral findings keep their severity.
+  const base = { severity: "high", confidence: 0.9, file: "/a.ts", quote: "x()", claim: "c", side: "right" };
+  const uncited = validateFinding({ ...base, category: "maintainability" });
+  eq("uncited maintainability capped to low", uncited?.severity, "low");
+  const cited = validateFinding({ ...base, category: "maintainability", cites: "Feature Envy" });
+  eq("cited maintainability keeps severity", cited?.severity, "high");
+  eq("...and carries the citation", cited?.cites, "Feature Envy");
+  const behavioral = validateFinding({ ...base, category: "correctness" });
+  eq("behavioral finding needs no citation", behavioral?.severity, "high");
+
+  // Conventions rendering: repo docs get in, the prompt budget holds, absent means empty.
+  eq("no convention docs renders nothing", renderConventions([]), "");
+  const conv = renderConventions([{ path: "/CONTRIBUTING.md", text: "Use tabs." }]);
+  check("doc content present under its path", conv.includes("### /CONTRIBUTING.md") && conv.includes("Use tabs."));
+  check("override contract stated", conv.includes("override"));
+  const big = renderConventions([
+    { path: "/a.md", text: "x".repeat(10_000) },
+    { path: "/b.md", text: "y".repeat(10_000) },
+    { path: "/c.md", text: "z".repeat(10_000) },
+  ]);
+  check("per-file cap applies", big.includes("(truncated"));
+  check("exhausted budget names the omitted file", big.includes("/c.md omitted"));
+  check("total stays bounded", big.length < 16_000);
+
+  // Requirement skeptic: a refuted accusation demotes to not-verifiable (never satisfied),
+  // keeps the refuter's evidence, and errors/non-refutations change nothing (fail open).
+  const mk = (verdict: ReqVerdict): CriterionCheck => ({ workItemId: 1, criterion: "must audit", verdict, note: "n" });
+  const cs = [mk("missing"), mk("misunderstood"), mk("missing")];
+  const disputed = applyReqSkepticVerdicts(cs, [
+    { refuted: true, reason: "AuditLog.write added in diff", confidence: 0.9, model: "arch" },
+    { refuted: false, reason: "", confidence: 0.8, model: "arch" },
+    { refuted: true, reason: "", confidence: 0, model: "arch", error: "timeout (900s)" },
+  ]);
+  eq("only the clean refutation counts", disputed, 1);
+  eq("refuted missing becomes not-verifiable", cs[0]!.verdict, "not-verifiable");
+  check("...with the evidence in the note", cs[0]!.note.includes("AuditLog.write") && cs[0]!.note.includes("original note: n"));
+  eq("unrefuted verdict stands", cs[1]!.verdict, "misunderstood");
+  eq("errored verifier changes nothing (fail open)", cs[2]!.verdict, "missing");
 }
 
 section("model call concurrency cap");

@@ -62,6 +62,48 @@ export interface SkepticPromptInput {
   contextLines: number;
 }
 
+// ─── Requirement-verdict skeptic ─────────────────────────────────────────────
+// The requirement axis was the one model opinion in the pipeline published with no
+// downstream filter, and its worst outputs are accusations: "missing" (you didn't build
+// this) and "misunderstood" (you built the wrong thing) — told to an author who may have
+// done neither. Both are refutable claims about the diff, so they get the same adversarial
+// treatment as code findings: a different model family, cold start, kill mandate.
+export const REQ_SKEPTIC_SYSTEM = `Your task is to **refute** a review verdict which claims a Pull Request fails an acceptance criterion.
+
+You are not re-reviewing the PR. You are trying to prove this one verdict wrong by finding
+concrete evidence in the diff that the criterion WAS addressed.
+
+- Verdict "missing" is refuted by pointing at code in the diff that implements the
+  criterion (quote it in reason).
+- Verdict "misunderstood" is refuted by showing the implementation does match the
+  criterion's actual intent (explain the match concretely).
+
+\`refuted: true\` only with concrete evidence — quote the code. If you search honestly and
+find none, answer \`refuted: false\`; do not refute out of politeness. The author's claims in
+the PR description are not evidence either way. Set suggested_severity to null.`;
+
+export function buildReqSkepticPrompt(
+  criterion: string,
+  verdict: string,
+  note: string,
+  diffPayload: string,
+): string {
+  return `## The verdict under challenge
+
+- Acceptance criterion: ${criterion}
+- Verdict: ${verdict}
+- Reviewer's note: ${note || "(none)"}
+
+## The full change (unified diff)
+
+${diffPayload}
+
+## Your task
+
+Try to refute the verdict: search the diff for evidence that this criterion was in fact
+addressed. Emit JSON per the schema.`;
+}
+
 export function buildSkepticPrompt(input: SkepticPromptInput): string {
   const { file, side, startLine, endLine, contextLines } = input;
   const lines = side === "right" ? file.rightLines : file.leftLines;

@@ -4,12 +4,16 @@
 // plenty of PRs legitimately have no linked work item, and a review that refuses to run
 // because Boards hygiene is imperfect gets switched off.
 import { createHash } from "node:crypto";
-import { MAX_INLINE_REQ_COMMENTS, REQ_MODEL } from "../config";
+import { MAX_INLINE_REQ_COMMENTS, REQ_MODEL, SKEPTIC_MODELS } from "../config";
 import { getLinkedRequirements } from "../ado/workitems";
 import { anchorFinding } from "../anchoring/locate";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { parseJsonObject } from "../libs/json";
+import { buildDiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
+import { parseVerdict, type Verdict } from "./skeptic";
+import { VERDICT_SCHEMA } from "../models/schemas";
+import { REQ_SKEPTIC_SYSTEM, buildReqSkepticPrompt } from "../prompts/skeptic";
 import type {
   AnchoredFinding,
   CriterionCheck,
@@ -133,6 +137,8 @@ export async function runRequirementGate(
     .map(validateExtra)
     .filter((e): e is ExtraChange => e !== undefined);
 
+  await disputeAccusations(input, criteria);
+
   const counts = new Map<string, number>();
   for (const c of criteria) counts.set(c.verdict, (counts.get(c.verdict) ?? 0) + 1);
   log(
@@ -142,6 +148,66 @@ export async function runRequirementGate(
   );
 
   return { result: { workItems: withSpec, criteria, extras }, prompt, raw: res.text };
+}
+
+/**
+ * Adversarial pass over the axis's accusations. This axis was the one model opinion in the
+ * pipeline that published with no downstream filter, and its worst outputs accuse the
+ * author: "missing" and "misunderstood". Both are refutable claims about the diff, so a
+ * skeptic (different family, cold start, kill mandate) gets one attempt at each.
+ *
+ * One round, first skeptic model only — deliberately narrower than the code axis's
+ * majority vote: every call here re-reads the finder-sized diff payload, so rounds are
+ * priced like extra finders, not like 25-line verdicts. "partial" and "satisfied" are not
+ * verified: partial names its own gap with a quote, satisfied is anchored downstream.
+ *
+ * Same asymmetries as the code skeptic: fails open (an unanswered challenge changes
+ * nothing), and a refutation never flips a verdict to satisfied — it demotes it to
+ * not-verifiable with the refuter's evidence in the note, taking the accusation out of
+ * the unmet count while keeping the disagreement visible in the summary.
+ */
+async function disputeAccusations(input: RequirementGateInput, criteria: CriterionCheck[]): Promise<void> {
+  const model = SKEPTIC_MODELS[0];
+  if (!model) return; // no skeptic configured = no verification runs, same as the code axis
+  const accused = criteria.filter((c) => c.verdict === "missing" || c.verdict === "misunderstood");
+  if (accused.length === 0) return;
+
+  const payload = buildDiffPayload(input.files).text;
+  const verdicts = await Promise.all(
+    accused.map(async (c): Promise<Verdict> => {
+      const res = await input.runner.chat({
+        model,
+        system: REQ_SKEPTIC_SYSTEM,
+        user: buildReqSkepticPrompt(c.criterion, c.verdict, c.note, payload),
+        schema: VERDICT_SCHEMA,
+        schemaName: "verdict",
+      });
+      if (res.error) return { refuted: false, reason: "", confidence: 0, model, error: res.error };
+      return parseVerdict(res.text, model);
+    }),
+  );
+  const disputed = applyReqSkepticVerdicts(accused, verdicts);
+  if (disputed > 0) {
+    log(`requirement skeptic: ${disputed} of ${accused.length} accusations disputed → not-verifiable (model ${model})`);
+  }
+}
+
+/**
+ * Applies refutations onto accusation verdicts, in place. Exported for the selftest.
+ * Refuted → not-verifiable (never satisfied: the skeptic found counter-evidence, it did
+ * not perform the requirement review); errors and non-refutations leave the verdict alone.
+ */
+export function applyReqSkepticVerdicts(accused: CriterionCheck[], verdicts: Verdict[]): number {
+  let disputed = 0;
+  for (let i = 0; i < accused.length; i++) {
+    const c = accused[i];
+    const v = verdicts[i];
+    if (!c || !v || v.error || !v.refuted) continue;
+    c.note = `Disputed by verification (${v.model}): ${v.reason}${c.note ? ` — original note: ${c.note}` : ""}`;
+    c.verdict = "not-verifiable";
+    disputed++;
+  }
+  return disputed;
 }
 
 /** Verdicts that mean the PR does not yet do what was asked. */

@@ -41,9 +41,15 @@ functional or behavioral changes; do not list formatting or import cleanup.
   does not mean it was done. It counts only if you find the corresponding code in the diff.
 - **Do not relax a criterion.** If the criterion says "must write an audit log" and the diff
   only adds console output, that is partial or misunderstood, not satisfied.
+- **Judge only against the stated requirements.** Never infer what the requirements "must
+  have been" from the code itself and then review the code against your inference — that
+  circle always passes. If the stated criteria do not cover something, it belongs in
+  extras, not in a criterion you invented.
 - If a criterion is itself too vague to judge, use not-verifiable and explain the ambiguity
   in note.
-- Copy the criterion text verbatim into the "criterion" field. Do not rewrite or summarize it.`;
+- Copy the criterion text verbatim into the "criterion" field. Do not rewrite or summarize it.
+  The criterion is the citation for your verdict; a verdict on a paraphrased criterion
+  cannot be checked against the work item.`;
 
 export interface RequirementPromptInput {
   pr: PrInfo;

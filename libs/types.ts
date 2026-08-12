@@ -150,6 +150,10 @@ export interface RawFinding {
   evidence?: string;
   suggested_fix?: string;
   boundary_owner?: "current" | "external";
+  // The checkable basis for a judgment-call finding: the named smell or the project rule it
+  // invokes. Structural teeth for the rules' citation contract — a maintainability finding
+  // that cites nothing is capped to low severity at validation (gates/finder.ts).
+  cites?: string;
 }
 
 export type AnchorFailure =

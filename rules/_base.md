@@ -64,25 +64,20 @@ must never be reported from here.
 
 ## Two-axis review (summarized from Matt Pocock's `code-review` skill)
 
-The smell list above is that skill's Standards floor; this section carries the rest of its
-method. A review answers two independent questions, and neither may mask the other — code
-can follow every convention while implementing the wrong thing, and do exactly what was
-asked while breaking the conventions. Check both, always:
+The smell list above is that skill's Standards floor. The skill's full method reviews on
+two independent axes — **Standards** (is it built right?) and **Spec** (is it the right
+thing?) — and prloop enforces that split structurally: the Spec axis is the requirement
+stage, a separate model call that sees the linked work items you do not. So from here,
+review Standards only:
 
-- **Standards — is it built right?** The repo's documented standards first (they always
-  override), then the smell baseline above. A documented-standard breach may be reported
-  as a hard violation; a baseline smell never is.
-- **Spec — is it the right thing?** Judge the diff against whatever states the intent —
-  the linked issue, spec file, or PR description. Three checks:
-  1. Requirements asked for but missing or only partially implemented.
-  2. Behavior nobody asked for (scope creep).
-  3. Requirements that look implemented, but implemented wrongly.
+- The repo's documented standards first (when a "This repository's own conventions"
+  section appears above, it always overrides this baseline). A documented-standard breach
+  may be reported as a hard violation; a baseline smell never is.
+- Do not attempt spec review: never infer the requirements from the PR description or the
+  code and then report gaps against them. The requirement stage does that with the actual
+  acceptance criteria in hand.
 
-  Missing or wrong behavior is a `correctness` finding, severity by actual impact; scope
-  creep is a judgment call like the smells, `medium` at most.
-
-**Every finding carries a checkable citation** — the standards file and rule, the named
-smell plus the offending hunk, or the spec/description line it violates. A finding that
-cannot cite one of these is a hypothesis, not a finding: drop it. And when no spec or
-description exists, say so — never infer the requirements from the code and then review
-the code against them.
+**Every judgment-call finding carries a checkable citation** in `cites` — the named smell,
+or the documented rule it invokes. This is enforced: a maintainability finding that cites
+nothing is demoted to the summary instead of an inline comment. Findings about concrete
+broken behavior cite their own evidence through the quote, and need no `cites`.

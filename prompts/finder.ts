@@ -35,6 +35,12 @@ Output rules (violations cause the finding to be discarded by the system):
    every finding where a concrete fix exists; use null only when it genuinely does not (the
    fix is a design decision, or depends on context you cannot see). "Add a null check" is
    not a suggested fix; the rewritten lines with the null check in them are.
+8. "cites" is the checkable basis of a judgment-call finding: for maintainability findings,
+   name the smell or the project rule you are invoking (e.g. "Feature Envy", or the rule's
+   own heading). A maintainability finding that cites nothing is treated as a hypothesis
+   and demoted to the summary. For behavioral findings (correctness, concurrency, security,
+   reliability, data-integrity, performance), the quote and evidence are the basis — set
+   cites to null.
 
 Review coverage (coverage mode):
 - Report every issue you observe, including ones you are unsure about. Use "confidence"
@@ -81,6 +87,9 @@ Do not label a nitpick as high.
 - **This change only.** Do not raise pre-existing issues outside the diff, unless this
   change turns one into a real risk (for example, a newly added call path that makes an
   existing race condition actually reachable).
+- **Code axis only.** Whether this PR delivers what its linked work items asked for is a
+  separate stage that sees the requirements — you do not. Do not guess at requirements
+  from the PR description and report gaps against them.
 - If you find nothing worth reporting, return an empty findings array. **That is entirely
   acceptable and a common outcome.**`;
 
@@ -91,6 +100,9 @@ export interface FinderPromptInput {
   compareTo: number;
   // Rule bodies selected by glob for the paths in this PR; empty when nothing matched.
   rules?: string;
+  // The reviewed repo's own convention docs (rendered by renderConventions). Injected
+  // ahead of the rules so the "repo conventions override" clause has real text to act on.
+  conventions?: string;
 }
 
 export function buildFinderPrompt(input: FinderPromptInput): { text: string; omitted: string[] } {
@@ -100,8 +112,9 @@ export function buildFinderPrompt(input: FinderPromptInput): { text: string; omi
       ? `Review only the changes added after iteration ${input.compareTo} (iteration ${input.iterationId}).`
       : `Review the complete set of changes in this PR (iteration ${input.iterationId}).`;
 
-  const rulesBlock = input.rules?.trim()
-    ? `\n## Review rules for this project\n\nThe rules below were loaded automatically based on the files touched by this change. Where they conflict with the general guidance above, these win.\n\n${input.rules.trim()}\n`
+  const guidance = [input.conventions?.trim(), input.rules?.trim()].filter(Boolean).join("\n\n---\n\n");
+  const rulesBlock = guidance
+    ? `\n## Review rules for this project\n\nThe rules below were loaded automatically based on the files touched by this change. Where they conflict with the general guidance above, these win.\n\n${guidance}\n`
     : "";
 
   const text = `## Pull Request info

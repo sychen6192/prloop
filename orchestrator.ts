@@ -3,6 +3,8 @@
 // is made by code here (design principle: the loop never hands control to a model).
 import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, excludedCategories, isDryRun } from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
+import { fetchRepoConventions } from "./ado/conventions";
+import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
 import { runRequirementGate, toRequirementFindings } from "./gates/requirement";
@@ -130,6 +132,17 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     return { result: { workItems: [], criteria: [], extras: [], error: msg } };
   });
 
+  // The reviewed repo's own convention docs, fetched at the iteration's commit so the
+  // rules' "repo conventions override the baseline" clause has real text to fire on
+  // instead of the model's memory of a file it was never shown. Non-fatal: most repos
+  // have none, and a failed fetch costs the finder its context bonus, not the run.
+  const conventions = renderConventions(
+    await fetchRepoConventions(opts.ref, ctx.iteration.sourceRefCommit).catch((e) => {
+      log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
+      return [];
+    }),
+  );
+
   // Stages that threw outright (vs returning their own error fields); reported as
   // incomplete so the run exits 3 instead of pretending the stage passed.
   const stageFailures: string[] = [];
@@ -155,6 +168,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       files: ctx.files,
       iterationId: ctx.iteration.id,
       compareTo: ctx.compareTo,
+      conventions,
     }).catch((e): Awaited<ReturnType<typeof runFinders>> => {
       stageFailures.push(`finder stage (${e instanceof Error ? e.message : String(e)})`);
       return { outputs: [], prompt: "", omitted: [], rules: [] };
