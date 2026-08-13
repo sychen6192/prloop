@@ -211,6 +211,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request — engine knobs prloop has no flag for; prloop's own fields win on conflict |
 | `PRR_MIN_INLINE_SEVERITY` | `medium` | below this → summary only |
 | `PRR_MAX_INLINE_COMMENTS` | `10` | code axis (requirement axis has its own budget of 3) |
+| `PRR_MAX_EXTRAS` | `5` | cap on reported out-of-scope changes; the model ranks, the gate slices |
 | `PRR_EXCLUDE_CATEGORIES` | — | categories never reported (e.g. `performance,maintainability`) |
 | `PRR_LEARN_FROM_DISMISSALS` | `1` | `0` = re-post findings humans dismissed as wontFix/byDesign |
 | `PRR_REQUIRE_CORROBORATION` | `1` | `0` publishes unverified single-source findings |

@@ -205,6 +205,10 @@ export const MAX_TRIAGE_ITEMS = numEnv("PRR_MAX_TRIAGE_ITEMS", 40, 1);
 // --- Review axes ---
 // 1 = skip the requirement axis entirely.
 export const SKIP_REQUIREMENT = process.env.PRR_SKIP_REQUIREMENT === "1";
+// Ceiling on reported out-of-scope changes. Unbounded extras made the count a per-run
+// dice roll (the same diff enumerated at different granularity); the prompt asks for the
+// most significant first and the gate slices to this.
+export const MAX_EXTRAS = numEnv("PRR_MAX_EXTRAS", 5, 1);
 // 1 = treat a PR with no linked work item as a failure rather than a warning.
 export const REQUIRE_WORK_ITEM = process.env.PRR_REQUIRE_WORK_ITEM === "1";
 

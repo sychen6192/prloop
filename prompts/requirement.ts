@@ -4,6 +4,7 @@
 // defects it would be tempted to call requirements satisfied, and vice versa. Keeping them
 // independent is what stops one axis from masking the other (PROPOSAL §6.1).
 import { buildDiffPayload } from "../libs/payload";
+import type { CriterionRef } from "../libs/criteria";
 import type { FileDiff, PrInfo, WorkItem } from "../libs/types";
 
 export const REQUIREMENT_SYSTEM = `You are checking whether a Pull Request actually delivers the requirements it is linked to.
@@ -13,8 +14,9 @@ has bugs is a separate, independent review — not your job, and not something t
 
 ## How to judge
 
-Take each acceptance criterion one at a time and check it against the diff. Decide *how it
-fails* — not "what percentage is done". Five verdicts:
+The acceptance criteria arrive as a numbered list with a bracketed id each, split by the
+pipeline — the list is fixed. Take each one at a time and check it against the diff.
+Decide *how it fails* — not "what percentage is done". Five verdicts:
 
 | verdict | when to use it |
 | --- | --- |
@@ -47,14 +49,20 @@ functional or behavioral changes; do not list formatting or import cleanup.
   extras, not in a criterion you invented.
 - If a criterion is itself too vague to judge, use not-verifiable and explain the ambiguity
   in note.
-- Copy the criterion text verbatim into the "criterion" field. Do not rewrite or summarize it.
-  The criterion is the citation for your verdict; a verdict on a paraphrased criterion
-  cannot be checked against the work item.`;
+- Answer with the criterion's bracketed id in "criterionId", exactly as listed. Judge EVERY
+  listed id, and never invent one — the id resolves back to the work item's own text, so a
+  verdict on an unlisted id is discarded. A concern no criterion covers belongs in extras.`;
 
 export interface RequirementPromptInput {
   pr: PrInfo;
   workItems: WorkItem[];
   files: FileDiff[];
+  // Deterministically pre-split criteria with stable ids (libs/criteria.ts). The model
+  // judges these units and no others — the denominator is fixed before the call.
+  criteria: CriterionRef[];
+  // Cap echoed into the prompt so the model ranks instead of enumerating; the gate slices
+  // to the same number afterwards.
+  maxExtras: number;
 }
 
 export function buildRequirementPrompt(input: RequirementPromptInput): string {
@@ -63,11 +71,14 @@ export function buildRequirementPrompt(input: RequirementPromptInput): string {
   const wiBlocks = input.workItems
     .map((w) => {
       const parts = [`### Work Item #${w.id} — ${w.type}: ${w.title} (state: ${w.state})`];
-      if (w.description) parts.push(`\n**Description**\n${w.description}`);
-      if (w.acceptanceCriteria) {
-        parts.push(`\n**Acceptance Criteria**\n${w.acceptanceCriteria}`);
+      if (w.description) parts.push(`\n**Description** (context)\n${w.description}`);
+      const refs = input.criteria.filter((c) => c.workItemId === w.id);
+      if (refs.length > 0) {
+        parts.push(
+          "\n**Acceptance criteria to judge**\n" + refs.map((c) => `[${c.id}] ${c.text}`).join("\n"),
+        );
       } else {
-        parts.push("\n(this work item has no acceptance criteria)");
+        parts.push("\n(no judgeable criteria on this work item)");
       }
       return parts.join("\n");
     })
@@ -91,6 +102,7 @@ ${payload.text}
 
 ## Your output
 
-Emit JSON per the schema. Put every acceptance criterion above into the criteria array with a
-verdict. If a work item has no acceptance criteria, judge against its description instead.`;
+Emit JSON per the schema. The criteria array must contain one entry for EVERY bracketed id
+listed above — echo the id in criterionId exactly. List at most ${input.maxExtras} extras,
+most significant first.`;
 }
