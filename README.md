@@ -282,15 +282,3 @@ verified against the real file with `grep -n`. It pins four boundaries: a duplic
 no context **must be ruled ambiguous rather than guessed**; the same duplicate with differing
 `context_before` must resolve correctly each way; a quoted line that doesn't exist must be
 blocked; and reformatted indentation must still match on the second pass.
-
-Toy fixtures prove the algorithm runs. This one proves it lands on the right line in code that
-looks real.
-
-## Status
-
-M1–M6 complete: REST + quote anchoring → requirement axis → multi-model adversarial
-verification → rules + static analysis → incremental review and comment lifecycle →
-dismissal learnings and category exclusions.
-Runs end-to-end on real PRs.
-
-MIT.
