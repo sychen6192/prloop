@@ -43,7 +43,8 @@ import { buildInvocation } from "../models/opencode";
 import { anchorAndDedupe } from "../gates/aggregate";
 import type { FinderOutput } from "../gates/finder";
 import { validateFinding } from "../gates/finder";
-import { applyReqSkepticVerdicts } from "../gates/requirement";
+import { applyReqSkepticVerdicts, resolveJudgments } from "../gates/requirement";
+import { extractCriteria, splitCriteria } from "../libs/criteria";
 import type { CriterionCheck, ReqVerdict } from "../libs/types";
 import { FINDINGS_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
 import { PRLOOP_ROOT } from "../config";
@@ -1788,6 +1789,43 @@ section("two-axis wiring: citations, conventions, requirement skeptic");
   check("...with the evidence in the note", cs[0]!.note.includes("AuditLog.write") && cs[0]!.note.includes("original note: n"));
   eq("unrefuted verdict stands", cs[1]!.verdict, "misunderstood");
   eq("errored verifier changes nothing (fail open)", cs[2]!.verdict, "missing");
+}
+
+section("requirement criteria: the pipeline owns the denominator, not the model");
+{
+  // Deterministic splitting: list items are the units, sub-bullets and continuations
+  // attach upward, framing prose is dropped, and no list structure = one criterion.
+  eq("dash list splits", splitCriteria("The following must hold:\n- audit log written\n- retry on 5xx\n- alerts fire"), ["audit log written", "retry on 5xx", "alerts fire"]);
+  eq("numbered list splits", splitCriteria("1. first thing\n2) second thing"), ["first thing", "second thing"]);
+  eq("indented sub-bullet attaches to its parent", splitCriteria("- outer rule\n  - covers weekends\n- other rule"), ["outer rule covers weekends", "other rule"]);
+  eq("continuation prose attaches", splitCriteria("- rule spanning\n  two lines\n- next"), ["rule spanning two lines", "next"]);
+  eq("prose with no markers is ONE criterion", splitCriteria("Just make login work again."), ["Just make login work again."]);
+  eq("empty field yields none", splitCriteria("  \n "), []);
+
+  // Stable ids per work item; description is the fallback source.
+  const refs = extractCriteria({ id: 4711, acceptanceCriteria: "- a\n- b", description: "ignored" });
+  eq("ids are stable and sequential", refs.map((r) => r.id), ["4711-AC1", "4711-AC2"]);
+  eq("description used when AC empty", extractCriteria({ id: 9, acceptanceCriteria: "", description: "fix the leak" })[0]?.id, "9-AC1");
+
+  // Verdicts bind by id: text always comes from the work item, invented ids are dropped,
+  // skipped criteria surface instead of vanishing, output is in ref order every run.
+  const out = resolveJudgments(
+    [
+      { criterionId: "[4711-AC2]", verdict: "missing", note: "n2", quote: null, file: null },
+      { criterionId: "4711-AC9", verdict: "missing", note: "invented", quote: null, file: null },
+      { criterionId: "4711-AC1", verdict: "SATISFIED", note: "", quote: "x()", file: "/a.ts" },
+    ],
+    refs,
+  );
+  eq("one entry per listed criterion, in ref order", out.criteria.map((c) => c.criterion), ["a", "b"]);
+  eq("bracketed id spelling tolerated", out.criteria[1]?.verdict, "missing");
+  eq("verdict case normalized", out.criteria[0]?.verdict, "satisfied");
+  eq("invented id counted and dropped", out.unknownIds, 1);
+  eq("nothing unjudged here", out.unjudged, 0);
+  const skipped = resolveJudgments([], refs);
+  eq("skipped criteria surface as not-verifiable", skipped.criteria.map((c) => c.verdict), ["not-verifiable", "not-verifiable"]);
+  eq("...and are counted", skipped.unjudged, 2);
+  check("...with an honest note", (skipped.criteria[0]?.note ?? "").includes("not judged"));
 }
 
 section("model call concurrency cap");

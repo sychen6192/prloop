@@ -4,9 +4,10 @@
 // plenty of PRs legitimately have no linked work item, and a review that refuses to run
 // because Boards hygiene is imperfect gets switched off.
 import { createHash } from "node:crypto";
-import { MAX_INLINE_REQ_COMMENTS, REQ_MODEL, SKEPTIC_MODELS } from "../config";
+import { MAX_EXTRAS, MAX_INLINE_REQ_COMMENTS, REQ_MODEL, SKEPTIC_MODELS } from "../config";
 import { getLinkedRequirements } from "../ado/workitems";
 import { anchorFinding } from "../anchoring/locate";
+import { extractCriteria, type CriterionRef } from "../libs/criteria";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { parseJsonObject } from "../libs/json";
 import { buildDiffPayload } from "../libs/payload";
@@ -32,25 +33,61 @@ import { REQUIREMENT_SYSTEM, buildRequirementPrompt } from "../prompts/requireme
 
 const VALID_VERDICT = new Set<string>(REQ_VERDICTS);
 
-function validateCriterion(v: unknown): CriterionCheck | undefined {
-  if (typeof v !== "object" || v === null) return undefined;
-  const o = v as Record<string, unknown>;
-  const criterion = typeof o["criterion"] === "string" ? o["criterion"].trim() : "";
-  if (!criterion) return undefined;
-
-  const raw = typeof o["verdict"] === "string" ? o["verdict"].toLowerCase() : "";
-  // An unrecognised verdict must not silently become "satisfied".
-  const verdict: ReqVerdict = VALID_VERDICT.has(raw) ? (raw as ReqVerdict) : "not-verifiable";
-  const str = (k: string) => (typeof o[k] === "string" ? (o[k] as string) : undefined);
-
-  return {
-    workItemId: Number(o["workItemId"]) || 0,
-    criterion,
-    verdict,
-    note: str("note") ?? "",
-    quote: str("quote"),
-    file: str("file"),
-  };
+/**
+ * Binds the model's verdicts back onto the pipeline's own criterion list. Exported for
+ * the selftest.
+ *
+ * Three properties fix the axis's dominant flakiness (a moving denominator):
+ * - Verdicts attach by id; the criterion TEXT always comes from the work item, never from
+ *   the model — an invented criterion has no id and is dropped (counted, never judged).
+ * - Output is in ref order, one entry per ref: the denominator is identical every run.
+ * - A criterion the model skipped is surfaced as not-verifiable ("not judged"), because a
+ *   silently vanished criterion reads as a clean pass.
+ */
+export function resolveJudgments(
+  rawItems: unknown[],
+  refs: CriterionRef[],
+): { criteria: CriterionCheck[]; unknownIds: number; unjudged: number } {
+  const byId = new Map(refs.map((r) => [r.id, r]));
+  const judged = new Map<string, CriterionCheck>();
+  let unknownIds = 0;
+  for (const v of rawItems) {
+    if (typeof v !== "object" || v === null) continue;
+    const o = v as Record<string, unknown>;
+    // Tolerate the bracketed/prefixed spellings weak models produce: "[4711-AC2]", "#4711-AC2".
+    const id =
+      typeof o["criterionId"] === "string" ? o["criterionId"].trim().replace(/^[#[\s]+|[\]\s]+$/g, "") : "";
+    const ref = byId.get(id);
+    if (!ref) {
+      unknownIds++;
+      continue;
+    }
+    const raw = typeof o["verdict"] === "string" ? o["verdict"].toLowerCase() : "";
+    // An unrecognised verdict must not silently become "satisfied".
+    const verdict: ReqVerdict = VALID_VERDICT.has(raw) ? (raw as ReqVerdict) : "not-verifiable";
+    const str = (k: string) => (typeof o[k] === "string" ? (o[k] as string) : undefined);
+    judged.set(ref.id, {
+      workItemId: ref.workItemId,
+      criterion: ref.text,
+      verdict,
+      note: str("note") ?? "",
+      quote: str("quote"),
+      file: str("file"),
+    });
+  }
+  let unjudged = 0;
+  const criteria = refs.map((r) => {
+    const j = judged.get(r.id);
+    if (j) return j;
+    unjudged++;
+    return {
+      workItemId: r.workItemId,
+      criterion: r.text,
+      verdict: "not-verifiable" as ReqVerdict,
+      note: "not judged: the model returned no verdict for this criterion",
+    };
+  });
+  return { criteria, unknownIds, unjudged };
 }
 
 function validateExtra(v: unknown): ExtraChange | undefined {
@@ -103,13 +140,25 @@ export async function runRequirementGate(
 
   log(`requirement axis: checking ${withSpec.length} work items (${withSpec.map((w) => `#${w.id}`).join(", ")})`);
 
-  const prompt = buildRequirementPrompt({ pr: input.pr, workItems: withSpec, files: input.files });
+  // The unit of judgment is fixed HERE, before any model runs: same work items → same
+  // criterion list → same denominator every run (see libs/criteria.ts for why).
+  const refs = withSpec.flatMap(extractCriteria);
+  const prompt = buildRequirementPrompt({
+    pr: input.pr,
+    workItems: withSpec,
+    files: input.files,
+    criteria: refs,
+    maxExtras: MAX_EXTRAS,
+  });
   const res = await input.runner.chat({
     model: REQ_MODEL,
     system: REQUIREMENT_SYSTEM,
     user: prompt,
     schema: REQUIREMENT_SCHEMA,
     schemaName: "requirements",
+    // Judgment, not generation: rerunning the same PR should give the same verdicts, and
+    // sampling noise here turns directly into flapping accusations.
+    temperature: 0,
   });
 
   if (res.error) {
@@ -130,12 +179,23 @@ export async function runRequirementGate(
     };
   }
 
-  const criteria = (Array.isArray(parsed.value.criteria) ? parsed.value.criteria : [])
-    .map(validateCriterion)
-    .filter((c): c is CriterionCheck => c !== undefined);
+  const resolved = resolveJudgments(
+    Array.isArray(parsed.value.criteria) ? parsed.value.criteria : [],
+    refs,
+  );
+  const criteria = resolved.criteria;
+  if (resolved.unknownIds > 0 || resolved.unjudged > 0) {
+    log(
+      `[WARN] requirement axis: ${resolved.unknownIds} verdicts on invented criterion ids dropped, ` +
+        `${resolved.unjudged} listed criteria left unjudged (marked not-verifiable)`,
+    );
+  }
   const extras = (Array.isArray(parsed.value.extras) ? parsed.value.extras : [])
     .map(validateExtra)
-    .filter((e): e is ExtraChange => e !== undefined);
+    .filter((e): e is ExtraChange => e !== undefined)
+    // Deterministic cap on top of the schema's static ceiling; the prompt asked for the
+    // most significant first, so slicing keeps the ranked head.
+    .slice(0, MAX_EXTRAS);
 
   await disputeAccusations(input, criteria);
 
@@ -181,6 +241,7 @@ async function disputeAccusations(input: RequirementGateInput, criteria: Criteri
         user: buildReqSkepticPrompt(c.criterion, c.verdict, c.note, payload),
         schema: VERDICT_SCHEMA,
         schemaName: "verdict",
+        temperature: 0,
       });
       if (res.error) return { refuted: false, reason: "", confidence: 0, model, error: res.error };
       return parseVerdict(res.text, model);

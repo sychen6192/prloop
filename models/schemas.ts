@@ -79,12 +79,15 @@ export const REQUIREMENT_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["workItemId", "criterion", "verdict", "note", "quote", "file"],
+        // No free-form criterion text: the pipeline enumerated the criteria with stable
+        // ids, and the verdict binds to an id. A model that could restate the criterion
+        // could also invent one — and an invented criterion is always, correctly per the
+        // diff, "missing" (the false-accusation generator this replaced).
+        required: ["criterionId", "verdict", "note", "quote", "file"],
         properties: {
-          workItemId: { type: "number" },
-          criterion: {
+          criterionId: {
             type: "string",
-            description: "The acceptance criterion being judged, copied verbatim.",
+            description: "The bracketed id of the criterion being judged, exactly as listed (e.g. \"4711-AC2\"). Never invent an id.",
           },
           verdict: { type: "string", enum: [...REQ_VERDICTS] },
           note: { type: "string" },
@@ -98,7 +101,11 @@ export const REQUIREMENT_SCHEMA = {
     },
     extras: {
       type: "array",
-      description: "Changes in the diff that no criterion asked for (scope creep).",
+      description: "Changes in the diff that no criterion asked for (scope creep), most significant first.",
+      // Static ceiling for guided decoding; the effective cap is PRR_MAX_EXTRAS, applied
+      // deterministically in the gate. Unbounded extras made the count a per-run dice
+      // roll (10 one run, 5 the next — the same diff enumerated at different granularity).
+      maxItems: 10,
       items: {
         type: "object",
         additionalProperties: false,
