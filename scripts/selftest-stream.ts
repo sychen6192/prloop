@@ -11,7 +11,7 @@ import {
   isStreamingRejection,
   isTransientModelError,
 } from "../models/runner";
-import { parseExtraBody } from "../config";
+import { parseExtraBody, resolveExtraBody } from "../config";
 
 let passed = 0;
 let failed = 0;
@@ -185,6 +185,17 @@ section("PRR_LLM_EXTRA_BODY parsing fails fast at startup, not as HTTP 400 mid-r
   check("malformed JSON throws", throws("{oops"));
   check("an array throws (must be an object)", throws("[1,2]"));
   check("a bare string throws", throws('"enable_thinking=false"'));
+}
+
+section("per-model extra body: the mixed fleet's switchboard");
+{
+  const off = { chat_template_kwargs: { enable_thinking: false } };
+  eq("no map falls back to the global", resolveExtraBody("coder", undefined, off), off);
+  eq("unlisted model falls back to the global", resolveExtraBody("coder-flash", { coder: {} }, off), off);
+  eq("listed model wins over the global", JSON.stringify(resolveExtraBody("coder", { coder: { top_k: 20 } }, off)), '{"top_k":20}');
+  eq("empty entry means send none (thinking back on)", JSON.stringify(resolveExtraBody("coder", { coder: {} }, off)), "{}");
+  check("empty entry adds nothing to the request", !("chat_template_kwargs" in buildChatBody({ model: "coder", system: "s", user: "u" }, true, resolveExtraBody("coder", { coder: {} }, off))));
+  check("fallback still disables thinking on the wire", JSON.stringify(buildChatBody({ model: "coder-flash", system: "s", user: "u" }, true, resolveExtraBody("coder-flash", { coder: {} }, off))).includes('"enable_thinking":false'));
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

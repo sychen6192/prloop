@@ -209,6 +209,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_LLM_MAX_TOKENS` | `8192` | **raise to 16384+ for thinking models** — reasoning is billed to this budget |
 | `PRR_LLM_STREAM` | `1` | stream completions (SSE) so a gateway's idle timeout can't 504 a long generation; `0` = buffered |
 | `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request — engine knobs prloop has no flag for; prloop's own fields win on conflict |
+| `PRR_LLM_EXTRA_BODY_BY_MODEL` | — | per-model override map ({} = send none): run a mixed fleet, e.g. thinking disabled globally but re-enabled for one deep finder and the skeptic |
 | `PRR_MIN_INLINE_SEVERITY` | `medium` | below this → summary only |
 | `PRR_MAX_INLINE_COMMENTS` | `10` | code axis (requirement axis has its own budget of 3) |
 | `PRR_MAX_EXTRAS` | `5` | cap on reported out-of-scope changes; the model ranks, the gate slices |
