@@ -11,7 +11,7 @@
 // are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
 // live in descriptions and in the validators.
 import { FINDER_CATEGORIES, SEVERITIES } from "../config";
-import { REQ_VERDICTS, type ChatRequest } from "../libs/types";
+import { REQ_VERDICTS, SKEPTIC_VERDICTS, type ChatRequest } from "../libs/types";
 
 export const FINDINGS_SCHEMA = {
   type: "object",
@@ -130,13 +130,28 @@ export const REQUIREMENT_SCHEMA = {
 export const VERDICT_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["refuted", "reason", "confidence", "suggested_severity"],
+  required: ["verdict", "reason", "evidence_quote", "confidence", "suggested_severity"],
   properties: {
-    refuted: {
-      type: "boolean",
-      description: "true only when you can state concretely why the finding is wrong.",
+    // Three answers, not two. A boolean forced "I could not check this" to be reported as
+    // "I found no grounds to refute it", and downstream counted that as the finding having
+    // been cleared — precision that was never earned (PROPOSAL §5.2).
+    verdict: {
+      type: "string",
+      enum: [...SKEPTIC_VERDICTS],
+      description:
+        "\"refuted\": you can state concretely why the finding is wrong AND quote the line that proves it. " +
+        "\"insufficient-context\": the claim is about code you were not shown. " +
+        "\"holds\": you checked what the claim is about and found no grounds to refute it.",
     },
     reason: { type: "string" },
+    // The teeth behind "refuted only with concrete evidence": the gate checks this quote
+    // against the snippet the skeptic was shown, and a refutation it cannot find there is
+    // downgraded to insufficient-context. Prompt text alone enforced nothing.
+    evidence_quote: {
+      type: ["string", "null"],
+      description:
+        "Required for \"refuted\": the source line(s) from the snippet above, copied verbatim, that prove the accusation wrong. Null otherwise.",
+    },
     confidence: { type: "number", description: "0 to 1." },
     suggested_severity: {
       type: ["string", "null"],
@@ -160,7 +175,7 @@ export const TRIAGE_SCHEMA = {
         additionalProperties: false,
         required: ["index", "keep", "reason", "severity"],
         properties: {
-          index: { type: "number" },
+          index: { type: "integer" },
           keep: { type: "boolean" },
           reason: { type: "string" },
           severity: { type: ["string", "null"], enum: [...SEVERITIES, null] },

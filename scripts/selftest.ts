@@ -32,7 +32,16 @@ import {
   truncateDescription,
   untrustedNotice,
 } from "../prompts/untrusted";
-import { applyVerdicts, parseVerdict as parseVerdictForTest, votedSeverity, type SkepticOutcome, type Verdict } from "../gates/skeptic";
+import {
+  applyVerdicts,
+  modelFamily,
+  parseVerdict as parseVerdictForTest,
+  runSkeptic,
+  skepticRoster,
+  votedSeverity,
+  type SkepticOutcome,
+  type Verdict,
+} from "../gates/skeptic";
 import { environmentFailure, filterToChangedLines, matchesReviewedContent, projectDirsFor, rekeyToolFindings } from "../gates/static";
 import { renderFindingComment } from "../publish/format";
 import { parseToolOutput } from "../profiles/parsers";
@@ -759,25 +768,29 @@ section("rule selection");
 // --- adversarial verification ---
 section("skeptic verdict parsing (fail-open)");
 {
-  const v = parseVerdictForTest('{"refuted":true,"reason":"this is try-with-resources, it closes automatically","confidence":0.9}', "test-model");
-  check("explicit refutation", v.refuted && v.confidence === 0.9);
+  const v = parseVerdictForTest(
+    '{"verdict":"refuted","reason":"this is try-with-resources, it closes automatically","confidence":0.9,"evidence_quote":"try (var in = open()) {"}',
+    "test-model",
+    "try (var in = open()) {\n  in.read();\n}",
+  );
+  check("explicit refutation", v.verdict === "refuted" && v.confidence === 0.9);
 }
 {
-  const v = parseVerdictForTest('{"refuted":false,"reason":"","confidence":0.7}', "test-model");
-  check("not refuted", !v.refuted);
+  const v = parseVerdictForTest('{"verdict":"holds","reason":"","confidence":0.7}', "test-model");
+  check("not refuted", v.verdict === "holds");
 }
 {
   // A broken verifier must not be able to delete findings.
   const v = parseVerdictForTest("model broke, this is not JSON", "test-model");
-  check("unparseable -> fail-open (not refuted)", !v.refuted);
+  check("unparseable -> fail-open (not refuted)", v.verdict !== "refuted");
   check("unparseable records the error", v.error !== undefined);
 }
 {
-  const v = parseVerdictForTest('{"refuted":false,"reason":"impact overstated","confidence":0.8,"suggested_severity":"low"}', "test-model");
+  const v = parseVerdictForTest('{"verdict":"holds","reason":"impact overstated","confidence":0.8,"suggested_severity":"low"}', "test-model");
   eq("accepts severity downgrade suggestion", v.suggestedSeverity, "low");
 }
 {
-  const v = parseVerdictForTest('{"refuted":false,"reason":"x","confidence":0.5,"suggested_severity":"catastrophic"}', "test-model");
+  const v = parseVerdictForTest('{"verdict":"holds","reason":"x","confidence":0.5,"suggested_severity":"catastrophic"}', "test-model");
   check("invalid severity ignored", v.suggestedSeverity === undefined);
 }
 
@@ -1961,15 +1974,15 @@ section("strict-mode schema invariant");
 section("skeptic verdict semantics");
 {
   const empty = parseVerdictForTest("{}", "m");
-  check("a verdict without a refuted field is an error, not an answer", empty.error !== undefined);
-  const good = parseVerdictForTest('{"refuted": false, "reason": "holds", "confidence": 0.8, "suggested_severity": null}', "m");
+  check("a verdict with no verdict field is an error, not an answer", empty.error !== undefined);
+  const good = parseVerdictForTest('{"verdict": "holds", "reason": "holds", "confidence": 0.8, "suggested_severity": null}', "m");
   check("null suggested_severity parses", good.error === undefined && good.suggestedSeverity === undefined);
 }
 
 section("skeptic severity vote: a downgrade takes the median, not one dissenting voice");
 {
   const vote = (s?: Severity, error?: string): Verdict =>
-    ({ refuted: false, reason: "", confidence: 0.8, model: "s", suggestedSeverity: s, ...(error ? { error } : {}) });
+    ({ verdict: "holds", reason: "", confidence: 0.8, model: "s", suggestedSeverity: s, ...(error ? { error } : {}) });
   const outcome = (severity: Severity, verdicts: Verdict[]): SkepticOutcome => ({
     finding: {
       category: "correctness", severity, confidence: 0.8, file: "/a.ts", quote: "x();", claim: "c",
@@ -2192,9 +2205,9 @@ section("two-axis wiring: citations, conventions, requirement skeptic");
   const mk = (verdict: ReqVerdict): CriterionCheck => ({ workItemId: 1, criterion: "must audit", verdict, note: "n" });
   const cs = [mk("missing"), mk("misunderstood"), mk("missing")];
   const disputed = applyReqSkepticVerdicts(cs, [
-    { refuted: true, reason: "AuditLog.write added in diff", confidence: 0.9, model: "arch" },
-    { refuted: false, reason: "", confidence: 0.8, model: "arch" },
-    { refuted: true, reason: "", confidence: 0, model: "arch", error: "timeout (900s)" },
+    { verdict: "refuted", reason: "AuditLog.write added in diff", confidence: 0.9, model: "arch" },
+    { verdict: "holds", reason: "", confidence: 0.8, model: "arch" },
+    { verdict: "refuted", reason: "", confidence: 0, model: "arch", error: "timeout (900s)" },
   ]);
   eq("only the clean refutation counts", disputed, 1);
   eq("refuted missing becomes not-verifiable", cs[0]!.verdict, "not-verifiable");
@@ -3409,6 +3422,266 @@ section("ADO and parser edges");
     check(`${knob} is in .env.example`, envExample.includes(knob));
     check(`${knob} is in the README table`, row(knob) !== "");
   }
+}
+
+// --- Phase 3G: verification quality ---------------------------------------------------
+// The audit that motivated all of this: "not refuted" was counted as a clearing, so a
+// verifier that could not see the code the claim was about published single-source
+// findings as verified; "refuted only with evidence" was prompt text with nothing
+// enforcing it; and three rounds over two models manufactured a majority out of one
+// opinion.
+
+// finalize() takes the anchoring stage's output; these sections only exercise the
+// corroboration rule, so they hand it an empty candidate set.
+const EMPTY_CANDIDATES = { merged: [], degraded: [], rawCount: 0, byFailure: {}, excluded: 0 };
+
+section("skeptic verdict: three answers, and a refutation must carry evidence");
+{
+  const snippet = "public void close() {\n  stream.close();\n}";
+  const v = (json: string, snip?: string) => parseVerdictForTest(json, "skeptic-a", snip);
+
+  eq(
+    "insufficient-context is a first-class answer",
+    v('{"verdict":"insufficient-context","reason":"the caller is not shown","confidence":0.4}').verdict,
+    "insufficient-context",
+  );
+  eq("holds parses", v('{"verdict":"holds","reason":"checked it","confidence":0.6}').verdict, "holds");
+  eq(
+    "refuted with evidence from the snippet stands",
+    v('{"verdict":"refuted","reason":"it is closed","confidence":0.9,"evidence_quote":"stream.close();"}', snippet).verdict,
+    "refuted",
+  );
+
+  // A backend that ignores the enum still speaks the old shape; mapping it beats reading
+  // a whole run's verification as garbage.
+  eq(
+    "a stale backend's refuted:true still refutes",
+    v('{"refuted":true,"reason":"r","evidence_quote":"stream.close();"}', snippet).verdict,
+    "refuted",
+  );
+  eq("a stale backend's refuted:false maps to holds", v('{"refuted":false,"reason":"r"}', snippet).verdict, "holds");
+
+  const bare = v('{"verdict":"refuted","reason":"it closes automatically","confidence":0.9,"evidence_quote":null}', snippet);
+  eq("a refutation with no evidence_quote is downgraded", bare.verdict, "insufficient-context");
+  check("...and the downgrade says why", (bare.downgraded ?? "").includes("evidence_quote"));
+
+  const invented = v(
+    '{"verdict":"refuted","reason":"r","confidence":0.9,"evidence_quote":"try (var s = open()) { }"}',
+    snippet,
+  );
+  eq("evidence that is not in the snippet shown is downgraded", invented.verdict, "insufficient-context");
+  eq("...it neither kills nor clears", invented.verdict === "refuted" || invented.verdict === "holds", false);
+
+  const respaced = v(
+    '{"verdict":"refuted","reason":"r","confidence":0.9,"evidence_quote":"stream.close();"}',
+    "public void close() {\n\t\tstream.close();\n}",
+  );
+  eq("evidence is matched with the anchoring tiers' whitespace tolerance", respaced.verdict, "refuted");
+  eq("...and the quote is kept for the audit trail", respaced.evidenceQuote, "stream.close();");
+
+  eq(
+    "a quote copied with the snippet's own gutter still matches",
+    v('{"verdict":"refuted","reason":"r","confidence":0.9,"evidence_quote":">+   12 | stream.close();"}', snippet).verdict,
+    "refuted",
+  );
+
+  // The requirement axis shows its skeptic the whole diff and asks for the quote in prose,
+  // so it declares no snippet and nothing is enforced against one.
+  eq("with no snippet declared, the answer is taken as given", v('{"verdict":"refuted","reason":"r"}').verdict, "refuted");
+}
+
+section("skeptic votes: only refuted kills, only holds clears, a tie does neither");
+{
+  const file = mkFile("/src/a.ts", ["export function read(x: Buf) {", "  return x.data.length;", "}"], [2]);
+  const finding = (): AnchoredFinding => ({
+    category: "correctness",
+    severity: "high",
+    confidence: 0.8,
+    file: "/src/a.ts",
+    quote: "  return x.data.length;",
+    claim: "x.data may be undefined here",
+    sources: ["finder-a"],
+    fingerprint: "f1",
+    anchor: { side: "right", startLine: 2, endLine: 2, startOffset: 1, endOffset: 24 },
+  });
+  const REFUTE = '{"verdict":"refuted","reason":"guarded upstream","confidence":0.9,"evidence_quote":"return x.data.length;"}';
+  const HOLDS = '{"verdict":"holds","reason":"checked, it stands","confidence":0.8}';
+  const UNKNOWN = '{"verdict":"insufficient-context","reason":"the callers are in another file","confidence":0.5}';
+  const scripted = (byModel: Record<string, string>) => ({
+    chat: async (req: ChatRequest) => ({ model: req.model, text: byModel[req.model] ?? "" }),
+  });
+  const verify = async (byModel: Record<string, string>, findings = [finding()]) =>
+    runSkeptic(scripted(byModel), findings, [file], {
+      models: Object.keys(byModel),
+      rounds: Object.keys(byModel).length,
+      finders: ["finder-a"],
+    });
+
+  const killedOut = await verify({ alpha: REFUTE, beta: REFUTE, gamma: HOLDS });
+  eq("3 rounds, 2 evidenced refutations: killed", killedOut[0]?.killed, true);
+  eq("...and a killed finding never reaches the survivors", applyVerdicts(killedOut).length, 0);
+
+  const clearedOut = await verify({ alpha: HOLDS, beta: HOLDS, gamma: REFUTE });
+  eq("2 holds against 1 refutation: survives", clearedOut[0]?.killed, false);
+  const cleared = applyVerdicts(clearedOut)[0]!;
+  eq("...counted as 2 clearings", cleared.skepticVerdicts, 2);
+  eq("...and 1 dissent", cleared.skepticRefuted, 1);
+  eq("...and it publishes on that clearing alone", finalize(EMPTY_CANDIDATES, [cleared]).inline.length, 1);
+
+  const tiedOut = await verify({ alpha: HOLDS, beta: REFUTE });
+  eq("an even split does not kill", tiedOut[0]?.killed, false);
+  const tied = applyVerdicts(tiedOut)[0]!;
+  // The bug this closes: the same split both survived the kill vote and satisfied the
+  // corroboration gate, so a finding one verifier called wrong was published as verified.
+  eq("...and clears nothing", finalize(EMPTY_CANDIDATES, [tied]).inline.length, 0);
+
+  const unknownOut = await verify({ alpha: UNKNOWN, beta: UNKNOWN, gamma: UNKNOWN });
+  eq("verifiers that could not check it do not kill", unknownOut[0]?.killed, false);
+  const unchecked = applyVerdicts(unknownOut)[0]!;
+  eq("...they clear nothing", unchecked.skepticVerdicts, 0);
+  eq("...they refute nothing", unchecked.skepticRefuted, 0);
+  eq("...and they are counted as unchecked", unchecked.skepticUnchecked, 3);
+  eq(
+    "a single-source finding nobody could check stays out of inline comments",
+    finalize(EMPTY_CANDIDATES, [unchecked]).inline.length,
+    0,
+  );
+
+  // An unevidenced refutation must not kill: end to end, not just in the parser.
+  const unevidenced = await verify({
+    alpha: '{"verdict":"refuted","reason":"trust me","confidence":0.9,"evidence_quote":null}',
+    beta: '{"verdict":"refuted","reason":"trust me too","confidence":0.9,"evidence_quote":"lines the model never saw"}',
+  });
+  eq("two refutations with no usable evidence do not kill", unevidenced[0]?.killed, false);
+  eq("...they are recorded as unchecked", applyVerdicts(unevidenced)[0]?.skepticUnchecked, 2);
+
+  // The skeptic sees the hunk as well as the window, so a claim about the change itself is
+  // answerable instead of automatically "insufficient-context".
+  const prompts: string[] = [];
+  await runSkeptic(
+    { chat: async (req: ChatRequest) => (prompts.push(req.user), { model: req.model, text: HOLDS }) },
+    [finding()],
+    [file],
+    { models: ["alpha"], rounds: 1, finders: ["finder-a"] },
+  );
+  check("the skeptic is shown the hunk, both sides", (prompts[0] ?? "").includes("both sides of this hunk"));
+  check("...alongside the ±context window", (prompts[0] ?? "").includes("export function read(x: Buf) {"));
+}
+
+section("skeptic rounds: a model may not vote twice");
+{
+  const { roster, capped } = skepticRoster(["a", "b"], 3);
+  eq("3 rounds over 2 models is capped to 2 verifiers", roster, ["a", "b"]);
+  eq("...and the shortfall is reported", capped, 1);
+  eq("duplicates in the config collapse", skepticRoster(["a", "a", "b"], 3).roster, ["a", "b"]);
+  eq("fewer rounds than models takes a prefix", skepticRoster(["a", "b", "c"], 2).roster, ["a", "b"]);
+  eq("rounds within the roster are not capped", skepticRoster(["a", "b"], 2).capped, 0);
+
+  const file = mkFile("/src/b.ts", ["const a = 1;", "const b = a + 1;", "export { b };"], [2]);
+  const f = (fp: string): AnchoredFinding => ({
+    category: "correctness", severity: "high", confidence: 0.8, file: "/src/b.ts",
+    quote: "const b = a + 1;", claim: "off by one", sources: ["finder-a"], fingerprint: fp,
+    anchor: { side: "right", startLine: 2, endLine: 2, startOffset: 1, endOffset: 16 },
+  });
+  const lines: string[] = [];
+  attachLogSink((l) => lines.push(l));
+  const out = await runSkeptic(
+    { chat: async (req: ChatRequest) => ({ model: req.model, text: '{"verdict":"holds","reason":"","confidence":0.7}' }) },
+    [f("f1"), f("f2")],
+    [file],
+    { models: ["alpha", "beta"], rounds: 3, finders: ["finder-a"] },
+  );
+  detachLogSink();
+  eq("a capped run issues one call per distinct model", out[0]?.verdicts.length, 2);
+  eq("...and no model votes twice", [...new Set(out[0]!.verdicts.map((v) => v.model))].length, 2);
+  eq(
+    "the cap is logged once per run, not once per finding",
+    lines.filter((l) => l.includes("skeptic rounds capped")).length,
+    1,
+  );
+}
+
+section("model families: same-family verification is weak verification");
+{
+  const same = (a: string, b: string) => modelFamily(a) !== "" && modelFamily(a) === modelFamily(b);
+  check("qwen3-coder and qwen2.5-instruct are the same family", same("qwen3-coder:30b", "qwen2.5-coder-32b"));
+  check("claude and qwen are not", !same("claude-sonnet-4-5", "qwen3-coder"));
+  check("gateway prefixes do not hide the family", same("bedrock/anthropic.claude-3-5-sonnet", "claude-opus-4"));
+  check("devstral is a mistral", same("devstral-small", "mistral-large"));
+  check("codellama is a llama", same("codellama:13b", "llama-3.3-70b"));
+  // The one that must never fire: two names we do not recognise are not evidence of
+  // anything, and a false "same family" warning trains people to ignore the real one.
+  eq("an unknown name has no family", modelFamily("acme-reviewer-v2"), "");
+  check("two unknown names are not called the same family", !same("acme-reviewer-v2", "internal-model-7"));
+  check("gpt is matched last, so gpt-4o is gpt", same("openai/gpt-4o-mini", "gpt-4.1"));
+
+  const file = mkFile("/src/c.ts", ["let n = 0;", "n += step;", "export { n };"], [2]);
+  const finding: AnchoredFinding = {
+    category: "correctness", severity: "high", confidence: 0.8, file: "/src/c.ts",
+    quote: "n += step;", claim: "step may be NaN", sources: ["qwen3-coder"], fingerprint: "f1",
+    anchor: { side: "right", startLine: 2, endLine: 2, startOffset: 1, endOffset: 10 },
+  };
+  const lines: string[] = [];
+  attachLogSink((l) => lines.push(l));
+  const out = await runSkeptic(
+    { chat: async (req: ChatRequest) => ({ model: req.model, text: '{"verdict":"holds","reason":"","confidence":0.7}' }) },
+    [finding],
+    [file],
+    { models: ["qwen2.5-coder"], rounds: 1, finders: ["qwen3-coder"] },
+  );
+  detachLogSink();
+  check(
+    "a same-family fleet is warned about at runtime, naming both models",
+    lines.some((l) => l.includes("[WARN]") && l.includes("qwen2.5-coder") && l.includes("qwen3-coder")),
+  );
+  eq("the verdict is marked same-family", out[0]?.verdicts[0]?.sameFamily, true);
+  const survivor = applyVerdicts(out)[0]!;
+  // Fail open: on a single-family deployment refusing these clearings would delete every
+  // single-source finding. The clearing counts; the comment discloses what it was worth.
+  eq("...the clearing still counts", survivor.skepticVerdicts, 1);
+  eq("...and the finding still publishes", finalize(EMPTY_CANDIDATES, [survivor]).inline.length, 1);
+  check("...but the comment says the check was weaker", renderFindingComment(survivor).includes("same model family"));
+}
+
+section("static triage runs in batches, and one bad batch loses only its own items");
+{
+  const n = 25;
+  const lines = Array.from({ length: n }, (_, i) => `x${i} = eval(src[${i}])`);
+  const file = mkFile("/src/t.py", lines, Array.from({ length: n }, (_, i) => i + 1));
+  const idx = new FileIndex([file]);
+  const items: ToolFinding[] = lines.map((_, i) => ({
+    tool: "bandit", tier: "triage", ruleId: "B307", message: "use of eval", file: "src/t.py",
+    line: i + 1, severity: "medium",
+  }));
+  const staticResult = {
+    facts: [], needsTriage: items, suppressedCount: 0, ranTools: ["bandit"], skipped: [],
+    staleFiles: [], unresolved: 0,
+  };
+  const keepAll = (count: number) =>
+    JSON.stringify({
+      results: Array.from({ length: count }, (_, i) => ({ index: i, keep: true, reason: "on request data", severity: "medium" })),
+    });
+
+  let call = 0;
+  const res = await triageAndConvert(
+    {
+      chat: async () => {
+        const which = call++;
+        // The middle batch dies. Before batching, this one failure dropped all 25.
+        if (which === 1) return { model: "t", text: "", error: "timeout (180s)" };
+        return { model: "t", text: keepAll(which === 2 ? 5 : 10) };
+      },
+    },
+    staticResult,
+    idx,
+    "triage-model",
+  );
+  eq("25 items go out as 3 batches of ~10", call, 3);
+  eq("the surviving batches' verdicts are applied", res.triaged, 15);
+  eq("...and only the failed batch's items are dropped", res.dropped, 10);
+  eq("...which is exactly what converts into findings", res.findings.length, 15);
+  check("the failure is reported, named, and located", (res.error ?? "").includes("batch 2/3: timeout (180s)"));
+  check("the raw answers of every batch are kept for debugging", (res.raw ?? "").includes("batch 2/3"));
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

@@ -76,10 +76,19 @@ do the filtering:
 2. **Skeptic** — a model from a *different family* is told to **refute** the finding, not
    assess it. A verifier asked "is this right?" agrees. It also **never sees the finder's
    reasoning**, only the claim and the code; shared reasoning creates an anchoring effect.
+   Its verdict has three values, not two: `refuted` (which must quote the line that proves
+   it, checked against the snippet the verifier was shown — an unevidenced refutation is
+   discarded), `holds`, and `insufficient-context` for a claim about code it was not shown
+   (another file, a caller, a deleted line). "I could not check this" is no longer reported
+   as "I checked it and it holds". Each round uses a *different* model — rounds beyond the
+   number of configured models are dropped, because re-sampling one model at temperature 0.2
+   is not a second opinion — and a run whose skeptics all share a family with a finder says
+   so, loudly, on every run.
 3. **Consensus** — an inline comment needs corroboration: two finders found it independently,
-   or a skeptic actively cleared it. A lone unverified finding stays in the summary. Each
-   finder reads the same files in its own seeded order, so agreement on a finding is not
-   agreement on where it sat in the prompt.
+   or a majority of the skeptics that answered actively **cleared** it. An even split clears
+   nothing, and neither does a verdict of `insufficient-context`. A lone unverified finding
+   stays in the summary. Each finder reads the same files in its own seeded order, so
+   agreement on a finding is not agreement on where it sat in the prompt.
 
 A fourth filter answers to the team rather than to the models: categories this repo does not
 want (`PRR_EXCLUDE_CATEGORIES`) and findings a reviewer already closed as *wontFix* never
@@ -242,7 +251,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | --- | --- | --- |
 | `PRR_FINDER_MODELS` | `qwen3-coder` | comma-separated; different families is the point |
 | `PRR_SKEPTIC_MODELS` | — | empty = no verification runs |
-| `PRR_SKEPTIC_ROUNDS` | `1` | 3 gives a majority vote worth the name |
+| `PRR_SKEPTIC_ROUNDS` | `1` | 3 gives a majority vote worth the name; capped at the number of distinct `PRR_SKEPTIC_MODELS` |
 | `PRR_MAX_SKEPTIC_FINDINGS` | `30` | fan-out ceiling; worst findings verified first, overflow logged |
 | `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |

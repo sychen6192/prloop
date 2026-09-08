@@ -92,7 +92,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_STRICT_COVERAGE", kind: "bool", section: S_BUDGET, description: "0 = files nobody read no longer make the run incomplete" },
 
   { name: "PRR_SKEPTIC_MODELS", kind: "csv", section: S_SKEPTIC, description: "verifiers; empty = no verification runs" },
-  { name: "PRR_SKEPTIC_ROUNDS", kind: "number", section: S_SKEPTIC, description: "verifiers per finding; 3 gives a real majority" },
+  { name: "PRR_SKEPTIC_ROUNDS", kind: "number", section: S_SKEPTIC, description: "verifiers per finding; capped at the distinct model count" },
   { name: "PRR_SKEPTIC_CONTEXT_LINES", kind: "number", section: S_SKEPTIC, description: "source lines shown around the finding" },
   { name: "PRR_SKEPTIC_TIMEOUT_MS", kind: "number", section: S_SKEPTIC, description: "deadline per verdict (tighter than a finder's)" },
   { name: "PRR_SKEPTIC_MAX_TOKENS", kind: "number", section: S_SKEPTIC, description: "output budget per verdict" },
@@ -740,10 +740,14 @@ export const SKEPTIC_MODELS = strEnv("PRR_SKEPTIC_MODELS", "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-// Verifiers per finding. 1 is a single gate; 3 gives a majority vote worth the name.
+// Verifiers per finding. 1 is a single gate; 3 gives a majority vote worth the name — but
+// only over 3 DISTINCT models: the gate caps the rounds at the number of configured skeptics,
+// because two samples of one model at temperature 0.2 are one opinion counted twice.
 export const SKEPTIC_ROUNDS = numEnv("PRR_SKEPTIC_ROUNDS", 1);
-// Source lines shown around the finding. Small on purpose: models degrade with unlimited
-// context, and a skeptic that needs the whole file is guessing.
+// Source lines shown around the finding, on top of the whole hunk it sits in (the window
+// shows one side; a claim about a deleted line was uncheckable from it). Small on purpose:
+// models degrade with unlimited context, and a skeptic that needs the whole file is guessing
+// — it answers "insufficient-context", which kills nothing and clears nothing.
 export const SKEPTIC_CONTEXT_LINES = numEnv("PRR_SKEPTIC_CONTEXT_LINES", 25);
 // Skeptic calls are small and numerous, so they get a much tighter deadline than a finder
 // reading a whole diff. Kept separate because a skeptic timeout fails open: one slow verifier

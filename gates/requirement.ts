@@ -253,7 +253,7 @@ async function disputeAccusations(input: RequirementGateInput, criteria: Criteri
         schemaName: "verdict",
         temperature: 0,
       });
-      if (res.error) return { refuted: false, reason: "", confidence: 0, model, error: res.error };
+      if (res.error) return { verdict: "insufficient-context", reason: "", confidence: 0, model, error: res.error };
       return parseVerdict(res.text, model);
     }),
   );
@@ -273,7 +273,10 @@ export function applyReqSkepticVerdicts(accused: CriterionCheck[], verdicts: Ver
   for (let i = 0; i < accused.length; i++) {
     const c = accused[i];
     const v = verdicts[i];
-    if (!c || !v || v.error || !v.refuted) continue;
+    // Only a refutation disputes. "holds" and "insufficient-context" both leave the
+    // accusation standing — the second says the skeptic could not check it, which is not
+    // a reason to take a criterion out of the unmet count.
+    if (!c || !v || v.error || v.verdict !== "refuted") continue;
     c.note = `Disputed by verification (${v.model}): ${v.reason}${c.note ? ` — original note: ${c.note}` : ""}`;
     c.verdict = "not-verifiable";
     disputed++;

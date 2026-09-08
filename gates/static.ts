@@ -53,6 +53,12 @@ export interface StaticResult {
   unresolved: number;
 }
 
+// Findings per triage call. Not a knob: the number that matters to an operator is the
+// ceiling (PRR_MAX_TRIAGE_ITEMS), and this only decides how the ceiling is split so that
+// one truncated completion cannot take the whole run's tool findings with it. Ten keeps a
+// batch's answer well inside any sane output budget.
+const TRIAGE_BATCH_SIZE = 10;
+
 const EMPTY: StaticResult = {
   facts: [],
   needsTriage: [],
@@ -617,55 +623,95 @@ export async function triageAndConvert(
   }
 
   if (batch.length > 0 && model) {
-    const items: TriageItem[] = batch.map((f, i) => ({
-      index: i,
-      tool: f.tool,
-      ruleId: f.ruleId,
-      message: f.message,
-      file: f.file,
-      line: f.line,
-      severity: f.severity,
-    }));
-    const res = await runner.chat({
-      model,
-      system: TRIAGE_SYSTEM,
-      user: buildTriagePrompt(items, index, TRIAGE_CONTEXT_LINES),
-      schema: TRIAGE_SCHEMA,
-      schemaName: "triage",
-    });
+    // Batched, because the whole cap used to travel in ONE call: 40 findings in, one
+    // truncated completion or one malformed brace out, and all 40 were dropped with a
+    // single line in the log. Smaller batches fail independently — a bad batch costs its
+    // own items and nothing else — and each fits comfortably inside an output budget, so
+    // truncation stops being the common case.
+    const batches: ToolFinding[][] = [];
+    for (let i = 0; i < batch.length; i += TRIAGE_BATCH_SIZE) {
+      batches.push(batch.slice(i, i + TRIAGE_BATCH_SIZE));
+    }
+    const failures: string[] = [];
+    let lost = 0;
+    const name = (i: number) => (batches.length > 1 ? `batch ${i + 1}/${batches.length}: ` : "");
+    const plural = (n: number) => `${n} ${n === 1 ? "batch" : "batches"}`;
 
-    raw = res.text;
-    if (res.error) {
-      // Fail closed: an un-triaged high-FP finding is noise, so it does not get posted.
-      log(`[WARN] static triage failed (${res.error}); ${batch.length} findings awaiting verdict will not be commented`);
-      dropped += batch.length;
-      error = res.error;
-    } else {
+    const answers = await Promise.all(
+      batches.map(async (group) => {
+        // Indexes are per-prompt: each batch is its own conversation, so the model counts
+        // from 0 and the caller maps back to the global position.
+        const items: TriageItem[] = group.map((f, i) => ({
+          index: i,
+          tool: f.tool,
+          ruleId: f.ruleId,
+          message: f.message,
+          file: f.file,
+          line: f.line,
+          severity: f.severity,
+        }));
+        return runner.chat({
+          model,
+          system: TRIAGE_SYSTEM,
+          user: buildTriagePrompt(items, index, TRIAGE_CONTEXT_LINES),
+          schema: TRIAGE_SCHEMA,
+          schemaName: "triage",
+        });
+      }),
+    );
+
+    // One artifact per run, so a triage pass that dropped everything is still debuggable
+    // against what each batch actually answered.
+    raw = answers.map((r, i) => `${name(i)}${name(i) ? "\n" : ""}${r.text}`).join("\n\n");
+
+    answers.forEach((res, bi) => {
+      const group = batches[bi]!;
+      if (res.error) {
+        // Fail closed: an un-triaged high-FP finding is noise, so it does not get posted.
+        log(`[WARN] static triage failed (${name(bi)}${res.error}); ${group.length} findings awaiting verdict will not be commented`);
+        dropped += group.length;
+        lost += group.length;
+        failures.push(`${name(bi)}${res.error}`);
+        return;
+      }
       const parsed = parseTriageVerdicts(res.text);
       if (parsed.error) {
-        log(`[WARN] static triage ${parsed.error}; ${batch.length} findings will not be commented`);
-        dropped += batch.length;
-        error = parsed.error;
-      } else {
-        const { verdicts } = parsed;
-        batch.forEach((f, i) => {
-          const v = verdicts.get(i);
-          // No verdict means the model skipped it; treat that as "not justified".
-          if (!v?.keep) {
-            dropped++;
-            return;
-          }
-          triaged++;
-          // Same rule as the skeptic: a verifying model may lower severity, never raise
-          // it. The tool's own rating owns the ceiling.
-          const sev =
-            v.severity !== undefined && severityRank(v.severity) > severityRank(f.severity)
-              ? v.severity
-              : f.severity;
-          kept.push({ ...f, severity: sev, message: v.reason || f.message });
-        });
-        log(`static triage: ${batch.length} awaiting verdict → kept ${triaged}, filtered out ${batch.length - triaged}`);
+        log(`[WARN] static triage ${name(bi)}${parsed.error}; ${group.length} findings will not be commented`);
+        dropped += group.length;
+        lost += group.length;
+        failures.push(`${name(bi)}${parsed.error}`);
+        return;
       }
+      const { verdicts } = parsed;
+      group.forEach((f, i) => {
+        const v = verdicts.get(i);
+        // No verdict means the model skipped it; treat that as "not justified".
+        if (!v?.keep) {
+          dropped++;
+          return;
+        }
+        triaged++;
+        // Same rule as the skeptic: a verifying model may lower severity, never raise
+        // it. The tool's own rating owns the ceiling.
+        const sev =
+          v.severity !== undefined && severityRank(v.severity) > severityRank(f.severity)
+            ? v.severity
+            : f.severity;
+        kept.push({ ...f, severity: sev, message: v.reason || f.message });
+      });
+    });
+
+    // A single failure keeps its own precise name (a timeout and an unparseable answer
+    // have different fixes); several are listed, because "the triage stage failed" hides
+    // that most of it worked.
+    if (failures.length > 0) error = failures.join("; ");
+    const judged = batch.length - lost;
+    if (judged > 0) {
+      log(
+        `static triage: ${batch.length} awaiting verdict in ${plural(batches.length)} → kept ${triaged}, ` +
+          `filtered out ${judged - triaged}` +
+          (lost > 0 ? `, ${lost} lost to ${plural(failures.length)} that failed` : ""),
+      );
     }
   } else if (batch.length > 0) {
     log(`[WARN] PRR_TRIAGE_MODEL not set; ${batch.length} high-false-positive findings will not be commented`);

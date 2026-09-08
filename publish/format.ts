@@ -82,10 +82,18 @@ export function renderFindingComment(f: AnchoredFinding): string {
     bits.push(`${f.overlapping.join(", ")} flagged these lines with a different claim (not counted as corroboration)`);
   }
   if (f.skepticVerdicts) {
+    // The qualifiers are the point. "Passed verification" reads as a stronger check than it
+    // is when the verifier is the finder's own model family (shared blind spots), or when
+    // some verifiers answered that they could not check the claim at all.
+    const caveats = [
+      f.skepticRefuted ? `${f.skepticRefuted} dissenting` : "",
+      f.skepticUnchecked ? `${f.skepticUnchecked} could not check it` : "",
+      f.skepticSameFamily ? "same model family as the finder, so a weaker check" : "",
+    ].filter(Boolean);
     bits.push(
-      f.skepticRefuted
-        ? `${f.skepticVerdicts} rounds of adversarial verification (${f.skepticRefuted} dissenting)`
-        : `passed ${f.skepticVerdicts} rounds of adversarial verification`,
+      caveats.length === 0
+        ? `passed ${f.skepticVerdicts} rounds of adversarial verification`
+        : `cleared by ${f.skepticVerdicts} of its verifiers (${caveats.join("; ")})`,
     );
   }
   parts.push("", `<sub>${bits.filter(Boolean).join(" | ")}</sub>`);

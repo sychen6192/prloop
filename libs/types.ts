@@ -156,6 +156,16 @@ export interface RawFinding {
   cites?: string;
 }
 
+// --- Adversarial verification ---
+
+// A skeptic's answer has three shapes, not two. "I checked it and found no grounds to
+// refute it" and "I could not check this from what you showed me" used to collapse into
+// the same `refuted: false`, and downstream read both as an active clearing — which
+// published single-source findings on the strength of a verifier that never saw the code
+// the claim was about (another file, a caller, a line this PR deleted).
+export const SKEPTIC_VERDICTS = ["refuted", "holds", "insufficient-context"] as const;
+export type SkepticVerdictKind = (typeof SKEPTIC_VERDICTS)[number];
+
 export type AnchorFailure =
   | "quote-not-found"
   | "quote-ambiguous"
@@ -195,8 +205,17 @@ export interface AnchoredFinding extends RawFinding {
   fingerprint: string;
   changeTrackingId?: number;
   // Adversarial verification results (M3); undefined when the skeptic stage didn't run.
+  // skepticVerdicts counts CLEARINGS ("holds") only — a verifier that could not check the
+  // claim is not corroboration, and counting it as one is how single-source findings got
+  // published unverified.
   skepticVerdicts?: number;
   skepticRefuted?: number;
+  // Verifiers that answered "insufficient-context": they neither killed nor cleared it.
+  skepticUnchecked?: number;
+  // Every verifier shared a model family with a finder. The clearing still counts (fail
+  // open: refusing it would delete findings on a single-family deployment, which is most
+  // of them), but the reader is told the check was weaker than it looks.
+  skepticSameFamily?: boolean;
   // Why this finding did not reach an inline comment, when it didn't.
   suppressedBy?: "severity" | "cap" | "no-corroboration" | "dismissed";
 }

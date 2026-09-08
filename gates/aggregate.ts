@@ -326,7 +326,13 @@ export function finalize(
       continue;
     }
     const multiSource = f.sources.length >= MIN_CONSENSUS_SOURCES;
-    const clearedBySkeptic = (f.skepticVerdicts ?? 0) > 0;
+    // A strict majority of the verifiers that answered must have CLEARED it. Two things
+    // used to pass here that should not: a verifier answering "I could not check this"
+    // (counted as a clearing, so a finding nobody had examined published as verified), and
+    // an even split, which both survived the kill vote and cleared the corroboration gate
+    // off the same verdicts. holds > refuted + unchecked is exactly holds*2 > answered.
+    const clearedBySkeptic =
+      (f.skepticVerdicts ?? 0) > (f.skepticRefuted ?? 0) + (f.skepticUnchecked ?? 0);
     if (!REQUIRE_CORROBORATION || multiSource || clearedBySkeptic) corroborated.push(f);
     else {
       f.suppressedBy = "no-corroboration";
@@ -353,11 +359,24 @@ export function finalize(
   // Distinguish "one model said it and a verifier disagreed or never ran" from "one model
   // said it and no verifier was configured". They look identical in the counts above, and
   // only the first is a fixable failure.
-  const verifierDied = uncorroborated.filter((f) => (f.skepticVerdicts ?? 0) === 0 && (f.skepticRefuted ?? 0) === 0);
+  const verifierDied = uncorroborated.filter(
+    (f) => (f.skepticVerdicts ?? 0) === 0 && (f.skepticRefuted ?? 0) === 0 && (f.skepticUnchecked ?? 0) === 0,
+  );
   if (verifierDied.length > 0 && SKEPTIC_MODELS.length > 0) {
     for (const f of verifierDied) {
       log(`  no corroboration: ${f.file}:${f.anchor?.startLine} — single source and its verifier returned nothing`);
     }
+  }
+  // A third case, and the one the new verdict exists to name: the verifiers answered, and
+  // what they answered was "I cannot check this from what you showed me". Nothing is
+  // broken — the claim is about code outside the snippet — so it must not be reported as a
+  // dead verifier, which would send the reader to fix an endpoint that is working.
+  const uncheckable = uncorroborated.filter((f) => (f.skepticUnchecked ?? 0) > 0 && (f.skepticVerdicts ?? 0) === 0);
+  for (const f of uncheckable) {
+    log(
+      `  no corroboration: ${f.file}:${f.anchor?.startLine} — single source, and every verifier ` +
+        `answered it could not check the claim from the code it was shown`,
+    );
   }
 
   return {
