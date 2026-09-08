@@ -110,6 +110,14 @@ export interface SummaryInput {
   staticResult?: StaticResult;
   // "The team keeps dismissing category X" — surfaced as a config suggestion, never applied.
   dismissalHints?: CategoryHint[];
+  // What the posting loop actually did, filled in by publish() AFTER it ran. The summary
+  // used to be rendered before posting and claimed every inline finding had been
+  // "commented on the relevant lines" — including the ones that then failed to post, or
+  // that a thread from an earlier run already covered. Absent (dry run, local-review,
+  // demo) means "no posting happened", and the summary makes no claim about it.
+  posted?: AnchoredFinding[];
+  alreadyPosted?: AnchoredFinding[];
+  failed?: Array<{ finding: AnchoredFinding; error: string }>;
   durationSec: number;
   runDir: string;
 }
@@ -119,6 +127,9 @@ const REQ_LABEL: Record<ReqVerdict, string> = {
   missing: "❌ Not implemented",
   partial: "⚠️ Partial",
   misunderstood: "🔄 Wrong direction",
+  // Scope, not a failure — worded so nobody reads it as an accusation and nobody mistakes
+  // it for a pass either.
+  "not-this-pr": "↗️ Another PR's scope",
   "not-verifiable": "❓ Not verifiable from code",
 };
 
@@ -144,15 +155,29 @@ function renderRequirementSection(req: RequirementResult | undefined): string[] 
   const unmet = req.criteria.filter(
     (c) => c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood",
   );
+  // Criteria the axis judged to belong to a different task or PR are not part of this PR's
+  // denominator: counting them would restate "5/9 unmet" for work nobody in this PR owed,
+  // which is the false accusation the verdict exists to retire. They stay in the table —
+  // dropping them would hide that the work item asks for more than this PR delivers.
+  const scoped = req.criteria.filter((c) => c.verdict === "not-this-pr");
+  const inScope = req.criteria.length - scoped.length;
   const wiList = req.workItems.map((w) => `#${w.id}`).join(", ");
+  // The qualifier appears only when something was actually scoped out; on a PR where every
+  // criterion was judged, "all N are implemented" is the stronger and still true claim.
+  const of = scoped.length > 0 ? `${wiList} in this PR's scope` : wiList;
   lines.push(
     unmet.length === 0
-      ? `✅ **All ${req.criteria.length} acceptance criteria for ${wiList} are implemented.**`
-      : `⚠️ **${unmet.length}/${req.criteria.length} acceptance criteria for ${wiList} are unmet.**`,
-    "",
-    "| Status | Acceptance criterion | Note |",
-    "| --- | --- | --- |",
+      ? `✅ **All ${inScope} acceptance criteria for ${of} are implemented.**`
+      : `⚠️ **${unmet.length}/${inScope} acceptance criteria for ${of} are unmet.**`,
   );
+  if (scoped.length > 0) {
+    lines.push(
+      "",
+      `_${scoped.length} further ${scoped.length === 1 ? "criterion belongs" : "criteria belong"} to another task or PR ` +
+        `and ${scoped.length === 1 ? "was" : "were"} not counted against this change._`,
+    );
+  }
+  lines.push("", "| Status | Acceptance criterion | Note |", "| --- | --- | --- |");
   for (const c of req.criteria) {
     const loc = c.file ? ` (\`${c.file}\`)` : "";
     lines.push(
@@ -170,6 +195,39 @@ function renderRequirementSection(req: RequirementResult | undefined): string[] 
     lines.push("", "</details>", "");
   }
   return lines;
+}
+
+/**
+ * Per-finding note for the summary table, saying what happened to a finding that did NOT
+ * get a comment. Empty for everything else, including every finding when nothing was
+ * posted (dry run) — an absent posting record is not evidence of a failed post.
+ */
+function postingOutcome(input: SummaryInput): (f: AnchoredFinding) => string {
+  if (!input.posted) return () => "";
+  const already = new Set((input.alreadyPosted ?? []).map((f) => f.fingerprint));
+  const failed = new Map((input.failed ?? []).map((x) => [x.finding.fingerprint, x.error]));
+  return (f) =>
+    failed.has(f.fingerprint)
+      ? ` _(no comment: ${escapeCell(failed.get(f.fingerprint) ?? "post failed")})_`
+      : already.has(f.fingerprint)
+        ? " _(already commented)_"
+        : "";
+}
+
+/** The headline over the findings table: what was found, and what reached the code. */
+function postingClaim(input: SummaryInput, inline: AnchoredFinding[]): string {
+  const found = `Found **${inline.length}** issues worth attention`;
+  if (!input.posted) return `${found}, commented on the relevant lines.`;
+  const posted = new Set(input.posted.map((f) => f.fingerprint));
+  const already = new Set((input.alreadyPosted ?? []).map((f) => f.fingerprint));
+  const nowPosted = inline.filter((f) => posted.has(f.fingerprint)).length;
+  const seen = inline.filter((f) => already.has(f.fingerprint)).length;
+  const missed = inline.length - nowPosted - seen;
+  if (missed === 0 && seen === 0) return `${found}, commented on the relevant lines.`;
+  const parts = [`${nowPosted} commented on the relevant lines`];
+  if (seen > 0) parts.push(`${seen} already commented by an earlier run`);
+  if (missed > 0) parts.push(`**${missed} could not be posted**`);
+  return `${found} (${parts.join(", ")}).`;
 }
 
 export function renderSummary(input: SummaryInput): string {
@@ -200,7 +258,7 @@ export function renderSummary(input: SummaryInput): string {
   } else if (agg.inline.length === 0) {
     lines.push("✅ **No issues above the reporting threshold.**", "");
   } else {
-    lines.push(`Found **${agg.inline.length}** issues worth attention, commented on the relevant lines.`, "");
+    lines.push(postingClaim(input, agg.inline), "");
     const bySeverity = new Map<string, number>();
     for (const f of agg.inline) bySeverity.set(f.severity, (bySeverity.get(f.severity) ?? 0) + 1);
     const order = ["critical", "high", "medium", "low"];
@@ -210,9 +268,12 @@ export function renderSummary(input: SummaryInput): string {
       .join(" | ");
     if (counts) lines.push(counts, "");
     lines.push("| Severity | File | Issue |", "| --- | --- | --- |");
+    const outcome = postingOutcome(input);
     for (const f of agg.inline) {
       const loc = f.anchor ? `${f.file}:${f.anchor.startLine}` : f.file;
-      lines.push(`| ${SEVERITY_LABEL[f.severity] ?? f.severity} | \`${loc}\` | ${escapeCell(f.claim)} |`);
+      lines.push(
+        `| ${SEVERITY_LABEL[f.severity] ?? f.severity} | \`${loc}\` | ${escapeCell(f.claim)}${outcome(f)} |`,
+      );
     }
     lines.push("");
   }
@@ -276,6 +337,12 @@ export function renderSummary(input: SummaryInput): string {
   }
   for (const e of input.finderErrors) {
     notes.push(`Model ${e.model} produced no result: ${e.error}`);
+  }
+  // Named here as well as in the table: a requirement finding that failed to post is not in
+  // the code table at all, and "we found it but you never saw it" must not be invisible.
+  for (const x of input.failed ?? []) {
+    const loc = x.finding.anchor ? `${x.finding.file}:${x.finding.anchor.startLine}` : x.finding.file;
+    notes.push(`Comment on ${loc} could not be posted: ${x.error}`);
   }
   if (agg.stats.excluded > 0) {
     notes.push(

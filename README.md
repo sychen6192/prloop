@@ -398,9 +398,18 @@ baseline" enforceable rather than aspirational. Standards that live anywhere els
 ## Development
 
 ```bash
-npm run check              # typecheck + selftest
-npx tsx scripts/demo.ts    # render comments from fake data, no ADO or model calls
+npm run check                 # typecheck + selftest
+npx tsx scripts/demo.ts       # render comments from fake data, no ADO or model calls
+npx tsx scripts/calibrate.ts  # is it getting better? joins runs/ to the dismissal store
 ```
+
+`scripts/calibrate.ts` reads `runs/**/findings.json`, `runs/**/skeptic.json` and each repo's
+`dismissals.jsonl` and prints the dismissal rate by finder confidence, by category and by
+finder model; each skeptic model's kill rate and "could not check it" rate; and how many
+published findings a human later dismissed — the tool's own false-positive rate. It is
+read-only and offline, counts each finding once no matter how often the PR was re-reviewed,
+and skips (counting) any artifact it cannot read, so an old or half-written `runs/` tree
+still yields a report. Pass a directory to point it somewhere other than `PRR_RUNS_DIR`.
 
 `scripts/selftest.ts` is the regression net for anchoring — **run it after touching
 `libs/diff.ts` or `anchoring/locate.ts`**. Its assertions map directly onto the causes of

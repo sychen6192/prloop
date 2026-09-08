@@ -74,10 +74,22 @@ import { BASE_SMELLS, checkFinding, citeIsKnown, knownCitesFor, normalizeCite, r
 import { FINDER_SYSTEM, buildFinderPrompt, finderSystemFor, renderRecap } from "../prompts/finder";
 import { mulberry32, seedFor, shuffle } from "../libs/prng";
 import { coverageGaps } from "../orchestrator";
-import { applyReqSkepticVerdicts, resolveJudgments, verifySatisfiedEvidence } from "../gates/requirement";
+import {
+  applyReqSkepticVerdicts,
+  resolveDisputeVerdicts,
+  resolveJudgments,
+  toRequirementFindings,
+  unmetCriteria,
+  verifySatisfiedEvidence,
+} from "../gates/requirement";
+import { REQUIREMENT_SYSTEM } from "../prompts/requirement";
+import { buildReqDisputePrompt } from "../prompts/skeptic";
+import { coveredByThread } from "../publish/publish";
+import { rankForVerification } from "../gates/skeptic";
+import { calibrate } from "./calibrate";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
-import type { CriterionCheck, ReqVerdict } from "../libs/types";
-import { FINDINGS_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
+import type { CriterionCheck, ReqVerdict, RequirementResult, WorkItem } from "../libs/types";
+import { FINDINGS_SCHEMA, REQ_DISPUTE_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
 import {
   FINDER_CATEGORIES,
   KNOWN_KEYS,
@@ -692,6 +704,23 @@ eq("numeric entities", htmlToText("&#65;&#66;"), "AB");
 eq("script removed", htmlToText("<p>keep</p><script>evil()</script>"), "keep");
 eq("empty input", htmlToText(undefined), "");
 check("<p> splits paragraphs", htmlToText("<p>one</p><p>two</p>").split("\n").length === 2);
+// The criterion splitter reads top-level markers as units and INDENTED ones as
+// continuations, so flattening "1./2./3." into three identical bullets and un-indenting
+// sub-bullets changed the denominator with the shape of the author's HTML.
+eq("<ol> keeps its numbering", htmlToText("<ol><li>first</li><li>second</li><li>third</li></ol>"), "1. first\n2. second\n3. third");
+eq("each list numbers from one", htmlToText("<ol><li>a</li></ol><ol><li>b</li></ol>"), "1. a\n\n1. b");
+eq(
+  "a nested list is indented by depth",
+  htmlToText("<ul><li>outer<ul><li>inner</li></ul></li><li>next</li></ul>"),
+  "- outer\n\n  - inner\n\n- next",
+);
+eq(
+  "...so the splitter attaches the sub-bullet to its parent",
+  splitCriteria(htmlToText("<ul><li>outer<ul><li>inner</li></ul></li><li>next</li></ul>")),
+  ["outer inner", "next"],
+);
+eq("an image leaves a placeholder, not a hole", htmlToText('<li>looks like <img src="a.png" alt="the dialog"></li>'), "- looks like [image: the dialog]");
+eq("...even with no alt text", htmlToText("<p><img src='a.png'></p>"), "[image]");
 
 // --- rule globs ---
 section("rule glob matching");
@@ -1528,6 +1557,171 @@ section("position dedupe covers dismissed threads");
     postedPositions([onOldName], new FileIndex([renamed]))[0]?.file, "src/new.ts");
 }
 
+section("publish honesty: the summary reports what actually reached the PR");
+{
+  const mk = (fp: string, claim: string): AnchoredFinding => ({
+    category: "correctness", severity: "high", confidence: 0.8, file: "src/a.ts", quote: "x();",
+    claim, sources: ["m1"], fingerprint: fp,
+    anchor: { side: "right", startLine: 3, endLine: 3, startOffset: 1, endOffset: 5 },
+  });
+  const inline = [mk("fp1", "one"), mk("fp2", "two"), mk("fp3", "three")];
+  const ctx = {
+    ref: { baseUrl: "https://dev.azure.com/o", org: "o", project: "p", repoId: "r", prId: 1 },
+    pr: { title: "t", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" },
+    iterations: [],
+    iteration: { id: 1, sourceRefCommit: "", targetRefCommit: "", commonRefCommit: "", createdDate: "" },
+    compareTo: 0, files: [], skipped: [], changeTrackingIds: new Map(),
+  } as unknown as Parameters<typeof renderSummary>[0]["ctx"];
+  const base = {
+    ctx,
+    agg: { inline, belowBar: [], degraded: [], stats: { raw: 3, afterDedupe: 3, anchored: 3, survived: 3, refuted: 0, inline: 3, byFailure: {}, excluded: 0, dismissed: 0 } },
+    finderErrors: [], omittedFiles: [], appliedRules: [], durationSec: 1, runDir: "",
+  };
+
+  // The summary was rendered BEFORE the posting loop, so it claimed every finding had been
+  // "commented on the relevant lines" — including the ones that then failed to post.
+  const honest = renderSummary({
+    ...base,
+    posted: [inline[0]!],
+    alreadyPosted: [inline[1]!],
+    failed: [{ finding: inline[2]!, error: "TF401232: thread context is not valid." }],
+  });
+  check("the headline counts what was posted", honest.includes("Found **3** issues worth attention (1 commented on the relevant lines"));
+  check("...names what an earlier run already covered", honest.includes("1 already commented by an earlier run"));
+  check("...and does not hide the one that failed", honest.includes("**1 could not be posted**"));
+  check("the row for the failed finding says why", honest.includes("_(no comment: TF401232: thread context is not valid.)_"));
+  check("the row for the deduped finding says so", honest.includes("_(already commented)_"));
+  check("the failure is named in the run notes too", honest.includes("Comment on src/a.ts:3 could not be posted: TF401232"));
+
+  const allPosted = renderSummary({ ...base, posted: inline, alreadyPosted: [], failed: [] });
+  eq("nothing to qualify keeps the plain claim", allPosted.includes("Found **3** issues worth attention, commented on the relevant lines."), true);
+  const noPosting = renderSummary(base);
+  eq("a run that posted nothing makes no claim about posting", noPosting.includes("_(no comment"), false);
+  check("...and still reports what it found", noPosting.includes("Found **3** issues worth attention"));
+}
+
+section("position dedupe stays inside one axis");
+{
+  // The one place the "two blind axes, separate budgets" invariant leaked: a requirement
+  // thread on lines 10-12 marked a new critical CODE finding on line 11 as already posted.
+  const mkT = (cat: string | undefined, line: number) => ({
+    id: 1, status: "active",
+    comments: [{ id: 1, content: `<!-- prloop -->${cat ? `<!-- prloop:cat=${cat} -->` : ""}issue` }],
+    threadContext: { filePath: "/src/a.ts", rightFileStart: { line, offset: 1 }, rightFileEnd: { line: line + 2, offset: 5 } },
+  });
+  const idx = new FileIndex([]);
+  const reqThread = postedPositions([mkT("req-mismatch", 10)], idx);
+  const codeThread = postedPositions([mkT("security", 10)], idx);
+  const legacyThread = postedPositions([mkT(undefined, 10)], idx);
+  eq("a requirement thread is tagged as one", reqThread[0]?.axis, "requirement");
+  eq("any finder category is the code axis", codeThread[0]?.axis, "code");
+  eq("a thread from before the marker has no axis", legacyThread[0]?.axis, undefined);
+
+  const mkF = (category: string): AnchoredFinding => ({
+    category, severity: "critical", confidence: 0.9, file: "src/a.ts", quote: "x();", claim: "c",
+    sources: ["m1"], fingerprint: "fp1",
+    anchor: { side: "right", startLine: 11, endLine: 11, startOffset: 1, endOffset: 5 },
+  });
+  eq("a requirement thread no longer swallows a code finding", coveredByThread(mkF("security"), reqThread), false);
+  eq("a code thread no longer swallows a requirement verdict", coveredByThread(mkF("req-mismatch"), codeThread), false);
+  eq("same axis still dedupes (that is the point of it)", coveredByThread(mkF("correctness"), codeThread), true);
+  eq("...on the requirement side too", coveredByThread(mkF("req-mismatch"), reqThread), true);
+  eq("an unlabelled thread still blocks both axes", coveredByThread(mkF("req-mismatch"), legacyThread), true);
+  eq("...and the code axis as well", coveredByThread(mkF("correctness"), legacyThread), true);
+  const elsewhere = postedPositions([mkT("security", 40)], idx);
+  eq("a thread on other lines covers nothing here", coveredByThread(mkF("correctness"), elsewhere), false);
+}
+
+section("measurability: the fields that cost tokens, the order that spends the budget");
+{
+  // boundary_owner: required, undescribed, never mentioned in the prompt, read by nothing —
+  // a coin flip under guided decoding, paid for on every finding.
+  check("gone from the finder schema", !JSON.stringify(FINDINGS_SCHEMA).includes("boundary_owner"));
+  const f = validateFinding({ category: "correctness", severity: "high", confidence: 0.9, file: "/a.ts", quote: "x()", claim: "c", side: "right", boundary_owner: "external" });
+  check("...and the validator no longer carries it through", f !== undefined && !("boundary_owner" in f));
+  check("...nor does the finder prompt mention it", !FINDER_SYSTEM.includes("boundary_owner"));
+
+  // Fan-out ranking: severity, then confidence. The tiebreak used to be arrival order —
+  // which model answered first — deciding which findings got verified at all.
+  const mk = (severity: Severity, confidence: number, claim: string): AnchoredFinding => ({
+    category: "correctness", severity, confidence, file: "src/a.ts", quote: "x();", claim,
+    sources: ["m1"], fingerprint: claim,
+    anchor: { side: "right", startLine: 1, endLine: 1, startOffset: 1, endOffset: 5 },
+  });
+  const ranked = rankForVerification([
+    mk("high", 0.3, "high-weak"),
+    mk("critical", 0.4, "crit-weak"),
+    mk("high", 0.9, "high-strong"),
+    mk("critical", 0.95, "crit-strong"),
+    mk("low", 1, "low-certain"),
+  ]);
+  eq(
+    "severity first, then the finder's own confidence",
+    ranked.map((r) => r.claim),
+    ["crit-strong", "crit-weak", "high-strong", "high-weak", "low-certain"],
+  );
+  eq("ranking never mutates the caller's array", rankForVerification([mk("low", 0.1, "a")]).length, 1);
+}
+
+section("calibration: joining what we published to what humans rejected");
+{
+  const f = (fingerprint: string, category: string, confidence: number, sources: string[], published: boolean) =>
+    ({ fingerprint, category, confidence, sources, published });
+  const report = calibrate({
+    findings: [
+      // The same finding from two runs of the same PR: counted once, published if it was
+      // ever published — otherwise a PR reviewed ten times weighs ten times as much.
+      f("a", "correctness", 0.95, ["m1", "m2"], false),
+      f("a", "correctness", 0.95, ["m1", "m2"], true),
+      f("b", "security", 0.8, ["m1"], true),
+      f("c", "maintainability", 0.4, ["m2"], true),
+      f("d", "correctness", 0.95, ["m1"], false),
+      f("", "correctness", 0.9, ["m1"], true),
+    ],
+    verdicts: [
+      { model: "sk1", verdict: "refuted", error: false },
+      { model: "sk1", verdict: "holds", error: false },
+      { model: "sk1", verdict: "insufficient-context", error: false },
+      { model: "sk1", verdict: "", error: true },
+      { model: "sk2", verdict: "holds", error: false },
+    ],
+    dismissed: new Set(["a", "c", "zzz"]),
+  });
+  eq("findings are counted once per fingerprint", report.findings, 4);
+  // A fingerprint-less record is not a finding: it cannot be joined to a dismissal, and
+  // counting it would inflate the denominator every rate below is measured against.
+  eq("published in any run counts as published, fingerprint-less records excluded", report.published, 3);
+  eq("dismissed findings counted", report.dismissed, 2);
+  eq("published-then-dismissed is the false-positive number", report.publishedDismissed, 2);
+  eq("a dismissal whose run was pruned is named, not silently dropped", report.orphanDismissals, 1);
+
+  const conf = new Map(report.byConfidence.map((b) => [b.key, b]));
+  eq("confidence buckets are in descending order", report.byConfidence.map((b) => b.key), ["0.9-1.0", "0.7-0.9", "<0.5"]);
+  eq("the top bucket holds both 0.95 findings", conf.get("0.9-1.0")?.findings, 2);
+  eq("...only one of which was ever published", conf.get("0.9-1.0")?.published, 1);
+  eq("...and the rate is dismissed over PUBLISHED, not over found", conf.get("0.9-1.0")?.rate, 1);
+  eq("an undismissed bucket rates zero", conf.get("0.7-0.9")?.rate, 0);
+
+  const cat = new Map(report.byCategory.map((b) => [b.key, b]));
+  eq("category rolls up across runs", cat.get("correctness")?.findings, 2);
+  eq("...with its own rate", cat.get("maintainability")?.rate, 1);
+
+  const finder = new Map(report.byFinder.map((b) => [b.key, b]));
+  eq("a shared finding counts for both finders", [finder.get("m1")?.findings, finder.get("m2")?.findings], [3, 2]);
+  eq("...and so does its dismissal", finder.get("m1")?.dismissed, 1);
+
+  const sk = new Map(report.skeptics.map((v) => [v.model, v]));
+  eq("errored calls are not answers", sk.get("sk1")?.answered, 3);
+  eq("...they are counted as errors", sk.get("sk1")?.errors, 1);
+  eq("kill rate is over answers", sk.get("sk1")?.killRate, 1 / 3);
+  eq("so is the could-not-check rate", sk.get("sk1")?.uncheckedRate, 1 / 3);
+  eq("a verifier that never killed anything reads zero", sk.get("sk2")?.killRate, 0);
+
+  const empty = calibrate({ findings: [], verdicts: [], dismissed: new Set() });
+  eq("an empty store divides by nothing", [empty.findings, empty.published, empty.publishedDismissed], [0, 0, 0]);
+  eq("...and reports no buckets", [empty.byConfidence.length, empty.byCategory.length, empty.skeptics.length], [0, 0, 0]);
+}
+
 // --- realistic seeded PR ---
 // Toy fixtures prove the algorithm runs; this proves it lands on the right line in code
 // that looks like real code. Every expectation below was verified against `grep -n` on the
@@ -1940,6 +2134,7 @@ section("strict-mode schema invariant");
     ["findings", FINDINGS_SCHEMA],
     ["requirement", REQUIREMENT_SCHEMA],
     ["verdict", VERDICT_SCHEMA],
+    ["req_dispute", REQ_DISPUTE_SCHEMA],
     ["triage", TRIAGE_SCHEMA],
   ] as const) {
     const missing = walk(schema, name);
@@ -1968,6 +2163,7 @@ section("strict-mode schema invariant");
     ["findings", FINDINGS_SCHEMA],
     ["requirement", REQUIREMENT_SCHEMA],
     ["verdict", VERDICT_SCHEMA],
+    ["req_dispute", REQ_DISPUTE_SCHEMA],
     ["triage", TRIAGE_SCHEMA],
   ] as const) {
     const found = constraints(schema, name);
@@ -2255,6 +2451,26 @@ section("requirement criteria: the pipeline owns the denominator, not the model"
   eq("skipped criteria surface as not-verifiable", skipped.criteria.map((c) => c.verdict), ["not-verifiable", "not-verifiable"]);
   eq("...and are counted", skipped.unjudged, 2);
   check("...with an honest note", (skipped.criteria[0]?.note ?? "").includes("not judged"));
+  eq("the pipeline's own id rides along, for the dispute pass to address", out.criteria[0]?.id, "4711-AC1");
+
+  // A model that answers the same id twice used to have its LAST word win silently, so a
+  // repeat could close a criterion it had just called missing.
+  const dup = resolveJudgments(
+    [
+      { criterionId: "4711-AC1", verdict: "missing", note: "no code", quote: null, file: null },
+      { criterionId: "4711-ac1", verdict: "satisfied", note: "on reflection", quote: "x()", file: "/a.ts" },
+      { criterionId: "4711-AC2", verdict: "partial", note: "half", quote: null, file: null },
+      { criterionId: "4711-AC2", verdict: "misunderstood", note: "wrong way", quote: null, file: null },
+    ],
+    refs,
+  );
+  eq("a duplicate never softens the verdict", dup.criteria[0]?.verdict, "missing");
+  eq("...and does not carry over the softer note", dup.criteria[0]?.note, "no code");
+  eq("a duplicate may harden it", dup.criteria[1]?.verdict, "misunderstood");
+  eq("...and both duplicates are counted, not swallowed", dup.duplicates, 2);
+  const folded = resolveJudgments([{ criterionId: "4711-ac2", verdict: "missing", note: "", quote: null, file: null }], refs);
+  eq("ids are case-folded, not dropped as invented", folded.criteria[1]?.verdict, "missing");
+  eq("...so nothing counts as an invented id", folded.unknownIds, 0);
 }
 
 section("requirement axis: a satisfied verdict must anchor its evidence");
@@ -2281,6 +2497,161 @@ section("requirement axis: a satisfied verdict must anchor its evidence");
   eq("a quote in a file outside the change demotes", cs[3]!.verdict, "not-verifiable");
   eq("other verdicts are not touched", cs[4]!.verdict, "missing");
   eq("...nor their notes", cs[4]!.note, "no audit call");
+}
+
+section("requirement scope: a criterion this PR never owed is not a failure");
+{
+  // The false-"missing" class. A work item's criteria are delivered over several PRs, and a
+  // parent PBI's criteria arrive whole in a child task's PR — so "missing" was the
+  // structurally guaranteed verdict, and the axis accused the author of not doing work that
+  // was never in this change. not-this-pr says that, and says it without failing the PR.
+  const wi: WorkItem = {
+    id: 12043, title: "Partial refunds", type: "Product Backlog Item", state: "Active",
+    description: "", acceptanceCriteria: "", specSource: "acceptance-criteria", url: "",
+  };
+  const mk = (verdict: ReqVerdict, criterion: string): CriterionCheck =>
+    ({ workItemId: 12043, criterion, verdict, note: "n", quote: "  refund(order, amount)", file: "/src/refund.ts" });
+  const req: RequirementResult = {
+    workItems: [wi],
+    criteria: [mk("satisfied", "refund an amount"), mk("not-this-pr", "email the customer"), mk("missing", "cap at the total")],
+    extras: [],
+  };
+  eq("not-this-pr is not an unmet criterion", unmetCriteria(req).map((c) => c.criterion), ["cap at the total"]);
+  eq(
+    "...so a PR whose only open criteria are another PR's never trips exit code 2",
+    unmetCriteria({ ...req, criteria: [mk("not-this-pr", "a"), mk("not-this-pr", "b"), mk("satisfied", "c")] }).length,
+    0,
+  );
+  const f = mkFile("/src/refund.ts", ["export function refund(order, amount) {", "  refund(order, amount)", "}"], [1, 2, 3]);
+  eq(
+    "...and it never becomes an inline accusation, quote or no quote",
+    toRequirementFindings({ ...req, criteria: [mk("not-this-pr", "email the customer")] }, new FileIndex([f])).length,
+    0,
+  );
+
+  // Rendered, though: scope information a reader needs, kept out of the denominator.
+  const summaryCtx = {
+    ref: { baseUrl: "https://dev.azure.com/o", org: "o", project: "p", repoId: "r", prId: 1 },
+    pr: { title: "t", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" },
+    iterations: [],
+    iteration: { id: 1, sourceRefCommit: "", targetRefCommit: "", commonRefCommit: "", createdDate: "" },
+    compareTo: 0,
+    files: [],
+    skipped: [],
+    changeTrackingIds: new Map(),
+  } as unknown as Parameters<typeof renderSummary>[0]["ctx"];
+  const rendered = renderSummary({
+    ctx: summaryCtx,
+    agg: { inline: [], belowBar: [], degraded: [], stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 } },
+    req,
+    finderErrors: [], omittedFiles: [], appliedRules: [], durationSec: 1, runDir: "",
+  });
+  check("the scoped-out criterion is still in the table", rendered.includes("Another PR's scope") && rendered.includes("email the customer"));
+  check("the denominator drops it", rendered.includes("1/2 acceptance criteria for #12043 in this PR's scope are unmet"));
+  check("...and says where it went", rendered.includes("1 further criterion belongs to another task or PR"));
+  const clean = renderSummary({
+    ctx: summaryCtx,
+    agg: { inline: [], belowBar: [], degraded: [], stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 } },
+    req: { ...req, criteria: [mk("satisfied", "a"), mk("satisfied", "b")] },
+    finderErrors: [], omittedFiles: [], appliedRules: [], durationSec: 1, runDir: "",
+  });
+  check("nothing scoped out keeps the stronger claim", clean.includes("All 2 acceptance criteria for #12043 are implemented"));
+}
+
+section("requirement prompt: inherited criteria and the Bug question");
+{
+  const pr = { title: "t", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" };
+  const files = [mkFile("/src/a.ts", ["const a = 1;"], [1])];
+  const wi = (over: Partial<WorkItem>): WorkItem => ({
+    id: 1, title: "t", type: "Task", state: "Active", description: "",
+    acceptanceCriteria: "", specSource: "acceptance-criteria", url: "", ...over,
+  });
+  check("the verdict table offers the scope verdict", REQUIREMENT_SYSTEM.includes("| not-this-pr |"));
+  check("...and says when to prefer it over missing", REQUIREMENT_SYSTEM.includes("missing vs not-this-pr"));
+
+  // inheritedFrom was computed by ado/workitems.ts and consumed nowhere: the model saw a
+  // whole PBI's criteria with no hint that this PR is one task under it.
+  const inherited = buildRequirementPrompt({
+    pr,
+    workItems: [wi({ id: 12043, type: "Product Backlog Item" })],
+    files,
+    criteria: [{ id: "12043-AC1", workItemId: 12043, text: "email the customer" }],
+    maxExtras: 3,
+    inheritedFrom: [12043],
+    linkedIds: [12050, 12043],
+  });
+  check("the parent is named as the parent", inherited.includes("PARENT work item #12043"));
+  check("...and the task the PR is actually linked to", inherited.includes("this PR is linked to #12050"));
+  check("...with the sibling rule spelled out", inherited.includes("not-this-pr"));
+  const own = buildRequirementPrompt({
+    pr, workItems: [wi({ id: 7 })], files,
+    criteria: [{ id: "7-AC1", workItemId: 7, text: "cap the refund" }],
+    maxExtras: 3, inheritedFrom: [], linkedIds: [7],
+  });
+  check("a PR judged against its own work item gets no inheritance framing", !own.includes("PARENT work item"));
+  eq("the criterion ids are untouched by any of it", own.includes("[7-AC1] cap the refund"), true);
+
+  // A Bug states its spec as reproduction steps. Judged as acceptance criteria, a correct
+  // fix is "missing" on every one of them — it implements none of them, it stops them.
+  const bug = buildRequirementPrompt({
+    pr,
+    workItems: [wi({ id: 99, type: "Bug", specSource: "repro-steps" })],
+    files,
+    criteria: [{ id: "99-AC1", workItemId: 99, text: "click Refund twice; the order is refunded twice" }],
+    maxExtras: 3,
+  });
+  check("repro steps are labelled as repro steps", bug.includes("Reproduction steps to judge"));
+  check("...and asked the fix question, not the implementation question", bug.includes("does this diff plausibly stop the described behavior from happening?"));
+  const fromDesc = buildRequirementPrompt({
+    pr, workItems: [wi({ id: 5, specSource: "description" })], files,
+    criteria: [{ id: "5-AC1", workItemId: 5, text: "make login work" }], maxExtras: 3,
+  });
+  check("a description-sourced spec says so", fromDesc.includes("taken from the description"));
+  check("...and does not ask the Bug question", !fromDesc.includes("plausibly stop the described behavior"));
+}
+
+section("requirement dispute: one batched call, verdicts bound by id");
+{
+  const mk = (id: string, verdict: ReqVerdict): CriterionCheck =>
+    ({ workItemId: 1, id, criterion: `c-${id}`, verdict, note: "n" });
+  const accused = [mk("4711-AC1", "missing"), mk("4711-AC2", "partial"), mk("4711-AC3", "misunderstood")];
+
+  // The whole diff used to be re-sent once per accused criterion; now one prompt lists them.
+  const prompt = buildReqDisputePrompt(
+    accused.map((c) => ({ id: c.id!, criterion: c.criterion, verdict: c.verdict, note: c.note })),
+    "@@ -1 +1 @@\n+const a = 1;",
+  );
+  check("every accusation is in the one prompt", ["4711-AC1", "4711-AC2", "4711-AC3"].every((id) => prompt.includes(`[${id}]`)));
+  eq("...and the diff is sent exactly once", prompt.split("const a = 1;").length, 2);
+
+  // Answers bind by id, never by position: a model that reorders, skips or invents an id
+  // would otherwise land its refutation on somebody else's criterion.
+  const verdicts = resolveDisputeVerdicts(
+    [
+      { criterionId: "4711-AC3", verdict: "refuted", reason: "the mapper does exactly this", evidence_quote: "map()" },
+      { criterionId: "[4711-ac1]", verdict: "holds", reason: "nothing implements it" },
+      { criterionId: "4711-AC3", verdict: "holds", reason: "second thoughts" },
+      { criterionId: "4711-AC9", verdict: "refuted", reason: "invented id" },
+    ],
+    accused,
+    "arch",
+  );
+  eq("verdicts come back in accusation order", verdicts.map((v) => v.verdict), ["holds", "insufficient-context", "refuted"]);
+  check("a bracketed, case-folded id still resolves", verdicts[0]!.error === undefined);
+  check("an unanswered criterion is an error, so nothing changes", verdicts[1]!.error !== undefined);
+  eq("a repeated id keeps the first answer", verdicts[2]!.reason, "the mapper does exactly this");
+
+  const disputed = applyReqSkepticVerdicts(accused, verdicts);
+  eq("only the refuted accusation is disputed", disputed, 1);
+  eq("...demoted, never flipped to satisfied", accused[2]!.verdict, "not-verifiable");
+  check("...with the counter-evidence in the note", accused[2]!.note.includes("the mapper does exactly this"));
+  eq("a holds verdict leaves the accusation standing", accused[0]!.verdict, "missing");
+  eq("an unanswered one is left alone too (fail open)", accused[1]!.verdict, "partial");
+  eq(
+    "partial is now disputable at all — it accuses too",
+    accused.filter((c) => c.verdict === "partial").length,
+    1,
+  );
 }
 
 section("model call concurrency cap");

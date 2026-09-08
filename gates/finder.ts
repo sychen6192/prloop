@@ -160,7 +160,6 @@ export function checkFinding(v: unknown, knownCites: ReadonlySet<string> = DEFAU
       claim,
       evidence: str("evidence"),
       suggested_fix: str("suggested_fix"),
-      boundary_owner: o["boundary_owner"] === "external" ? "external" : "current",
       cites,
     },
   };

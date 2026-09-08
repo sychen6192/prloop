@@ -221,6 +221,23 @@ async function verifyOne(
   return { ...parseVerdict(res.text, model, snippet), raw: res.text, ...mark };
 }
 
+/**
+ * Order in which findings claim the fan-out budget: severity, then the finder's own
+ * confidence. Exported for the selftest.
+ *
+ * Severity alone left the tie broken by arrival order — which model answered first, and in
+ * what order that model happened to emit its findings. Confidence was already asked of the
+ * finder and spent on nothing but a sort tiebreak and a line of footer text; here it decides
+ * which of twenty equally-severe findings actually gets verified, which is the difference
+ * between a published finding and a summary line.
+ */
+export function rankForVerification(findings: AnchoredFinding[]): AnchoredFinding[] {
+  return [...findings].sort((a, b) => {
+    const s = severityRank(a.severity) - severityRank(b.severity);
+    return s !== 0 ? s : b.confidence - a.confidence;
+  });
+}
+
 export interface SkepticOptions {
   // Parameterised for the selftest, which cannot set PRR_SKEPTIC_* / PRR_FINDER_MODELS
   // after config loaded. Production passes none.
@@ -247,7 +264,7 @@ export async function runSkeptic(
   let toVerify = findings;
   let overflow: AnchoredFinding[] = [];
   if (findings.length > MAX_SKEPTIC_FINDINGS) {
-    const ranked = [...findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity));
+    const ranked = rankForVerification(findings);
     toVerify = ranked.slice(0, MAX_SKEPTIC_FINDINGS);
     overflow = ranked.slice(MAX_SKEPTIC_FINDINGS);
     log(

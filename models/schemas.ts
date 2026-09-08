@@ -28,8 +28,7 @@ export const FINDINGS_SCHEMA = {
         // A schema that violates this is a hard HTTP 400 from those backends.
         required: [
           "category", "severity", "confidence", "file", "quote", "context_before",
-          "context_after", "side", "claim", "evidence", "suggested_fix", "boundary_owner",
-          "cites",
+          "context_after", "side", "claim", "evidence", "suggested_fix", "cites",
         ],
         properties: {
           // The finder's eight, not the full taxonomy: req-mismatch is the requirement
@@ -64,7 +63,8 @@ export const FINDINGS_SCHEMA = {
             description:
               "The corrected code, ready to paste in place of the quote. Code only, no prose. Null only when no concrete fix can be written.",
           },
-          boundary_owner: { type: "string", enum: ["current", "external"] },
+          // No boundary_owner. It was required, undescribed, absent from the prompt and read
+          // by nothing — a coin flip under guided decoding, paid for on every finding.
           cites: {
             type: ["string", "null"],
             description:
@@ -157,6 +157,47 @@ export const VERDICT_SCHEMA = {
       type: ["string", "null"],
       enum: [...SEVERITIES, null],
       description: "Only when the finding holds but at a different severity; otherwise null.",
+    },
+  },
+} as const;
+
+// Requirement-dispute verdicts, batched. Same three-way vocabulary as the code skeptic —
+// only "refuted" disputes an accusation, and it must carry a quote — but keyed by criterion
+// id, because one call now answers every accusation in the run instead of one call per
+// accusation each re-sending the whole diff. No suggested_severity: a requirement verdict
+// has no severity to lower, so asking for one only invites the model to invent a field.
+export const REQ_DISPUTE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["verdicts"],
+  properties: {
+    verdicts: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["criterionId", "verdict", "reason", "evidence_quote"],
+        properties: {
+          criterionId: {
+            type: "string",
+            description: "The bracketed id of the accusation being challenged, exactly as listed (e.g. \"4711-AC2\"). Never invent an id.",
+          },
+          verdict: {
+            type: "string",
+            enum: [...SKEPTIC_VERDICTS],
+            description:
+              "\"refuted\": the diff does address this criterion, and you can quote the code that shows it. " +
+              "\"holds\": you searched the diff and found no such code. " +
+              "\"insufficient-context\": judging this criterion needs code the diff does not show.",
+          },
+          reason: { type: "string" },
+          evidence_quote: {
+            type: ["string", "null"],
+            description:
+              "Required for \"refuted\": the line(s) from the diff above, copied verbatim, that show the criterion was addressed. Null otherwise.",
+          },
+        },
+      },
     },
   },
 } as const;

@@ -92,23 +92,40 @@ export interface WorkItem {
   description: string;
   // Plain text, flattened from the field's HTML.
   acceptanceCriteria: string;
+  // Which field the spec above came from. A Bug's ReproSteps are read into
+  // acceptanceCriteria (that is where a Bug states what it wants), but they are steps that
+  // reproduce a defect, not criteria to implement — judging a fix diff against them as if
+  // they were acceptance criteria generates "missing" for every step. The prompt asks the
+  // different question when this says repro-steps (ado/workitems.ts sets it).
+  specSource: "acceptance-criteria" | "description" | "repro-steps";
   url: string;
   parentId?: number;
 }
 
 // Verdicts name the *way* a requirement failed, not how much of it was done. "60% covered"
 // tells a developer nothing; "you solved the wrong problem" tells them what to do.
+// "not-this-pr" is the answer to the axis's structural false-accusation generator: a work
+// item's criteria are routinely delivered across several PRs, and a parent PBI's criteria
+// are pulled into a child task's PR wholesale — so "missing" was the guaranteed verdict on
+// criteria this PR never set out to deliver, and the axis accused the author of not doing
+// work that was never theirs. It is scope information, not a failure: excluded from the
+// unmet count (gates/requirement.ts) and from exit code 2.
 export const REQ_VERDICTS = [
   "satisfied",
   "missing",
   "partial",
   "misunderstood",
+  "not-this-pr",
   "not-verifiable",
 ] as const;
 export type ReqVerdict = (typeof REQ_VERDICTS)[number];
 
 export interface CriterionCheck {
   workItemId: number;
+  // The pipeline's stable criterion id (libs/criteria.ts), when this check came from a
+  // listed criterion. The dispute pass addresses accusations by id, so it must survive
+  // resolveJudgments; absent only on checks built by hand (fixtures).
+  id?: string;
   criterion: string;
   verdict: ReqVerdict;
   note: string;
@@ -149,7 +166,6 @@ export interface RawFinding {
   claim: string;
   evidence?: string;
   suggested_fix?: string;
-  boundary_owner?: "current" | "external";
   // The checkable basis for a judgment-call finding: the named smell or the project rule it
   // invokes. Structural teeth for the rules' citation contract — a maintainability finding
   // that cites nothing is capped to low severity at validation (gates/finder.ts).

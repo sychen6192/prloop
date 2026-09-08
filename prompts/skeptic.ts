@@ -75,9 +75,10 @@ export interface SkepticPromptInput {
 // ─── Requirement-verdict skeptic ─────────────────────────────────────────────
 // The requirement axis was the one model opinion in the pipeline published with no
 // downstream filter, and its worst outputs are accusations: "missing" (you didn't build
-// this) and "misunderstood" (you built the wrong thing) — told to an author who may have
-// done neither. Both are refutable claims about the diff, so they get the same adversarial
-// treatment as code findings: a different model family, cold start, kill mandate.
+// this), "partial" (you half built it) and "misunderstood" (you built the wrong thing) —
+// told to an author who may have done none of the three. All are refutable claims about the
+// diff, so they get the same adversarial treatment as code findings: a different model
+// family, cold start, kill mandate.
 export const REQ_SKEPTIC_SYSTEM = `Your task is to **refute** a review verdict which claims a Pull Request fails an acceptance criterion.
 
 You are not re-reviewing the PR. You are trying to prove this one verdict wrong by finding
@@ -87,25 +88,43 @@ concrete evidence in the diff that the criterion WAS addressed.
   criterion (quote it in reason).
 - Verdict "misunderstood" is refuted by showing the implementation does match the
   criterion's actual intent (explain the match concretely).
+- Verdict "partial" is refuted by pointing at the code that closes the gap the reviewer
+  named — "half done" is an accusation too, and just as answerable.
 
 \`verdict: "refuted"\` only with concrete evidence — quote the implementing code in
 \`evidence_quote\` as well as in reason. If you search honestly and find none, answer
 \`verdict: "holds"\`; do not refute out of politeness. Answer \`verdict:
 "insufficient-context"\` when judging the criterion would need code the diff does not show.
-The author's claims in the PR description are not evidence either way. Set
-suggested_severity to null.`;
+The author's claims in the PR description are not evidence either way.
 
-export function buildReqSkepticPrompt(
-  criterion: string,
-  verdict: string,
-  note: string,
-  diffPayload: string,
-): string {
-  return `## The verdict under challenge
+You are given every accusation from this review at once, each with a bracketed id. Judge
+them **independently** — a refutation of one says nothing about the next — and answer with
+one entry per id, echoing the id exactly. Never invent an id, and answer each one once.`;
 
-- Acceptance criterion: ${criterion}
-- Verdict: ${verdict}
-- Reviewer's note: ${note || "(none)"}
+export interface DisputedAccusation {
+  // The pipeline's criterion id. The verdict binds back to it, never to the criterion text
+  // — a model that can restate the criterion can also invent one.
+  id: string;
+  criterion: string;
+  verdict: string;
+  note: string;
+}
+
+/**
+ * One dispute call for all of the run's accusations, not one per accusation.
+ *
+ * Each accusation used to get its own call, and each call re-sent the whole diff: a PR with
+ * six accused criteria paid six finder-sized prompts to check them, which is exactly why
+ * this pass is capped at one round and one model. The diff is identical for all of them, so
+ * it is sent once with the accusations listed against it.
+ */
+export function buildReqDisputePrompt(accused: DisputedAccusation[], diffPayload: string): string {
+  const list = accused
+    .map((a) => `[${a.id}] verdict "${a.verdict}" — criterion: ${a.criterion}\n  reviewer's note: ${a.note || "(none)"}`)
+    .join("\n\n");
+  return `## The verdicts under challenge (${accused.length})
+
+${list}
 
 ## The full change (unified diff)
 
@@ -113,8 +132,8 @@ ${diffPayload}
 
 ## Your task
 
-Try to refute the verdict: search the diff for evidence that this criterion was in fact
-addressed. Emit JSON per the schema.`;
+For EACH bracketed id above, try to refute that verdict: search the diff for evidence that
+the criterion was in fact addressed. Emit JSON per the schema, one entry per id.`;
 }
 
 export interface SkepticPrompt {

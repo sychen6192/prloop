@@ -10,6 +10,7 @@ npm run check        # typecheck + full offline selftest — run before every co
 npx tsx scripts/selftest.ts          # anchoring / pipeline regression net
 npx tsx scripts/selftest-stream.ts   # SSE transport regression net
 npx tsx scripts/demo.ts              # render comments from fake data, no network
+npx tsx scripts/calibrate.ts         # dismissal / kill rates from runs/ + dismissals.jsonl
 ```
 
 Everything is offline-testable; no test needs ADO credentials or a model endpoint.

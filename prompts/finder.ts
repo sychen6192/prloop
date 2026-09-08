@@ -112,7 +112,7 @@ The diff adds, directly after a call to the payment gateway:
     } catch (e) {
         return null;
     }
-  category: reliability · severity: high · confidence: 0.8 · side: right · boundary_owner: current
+  category: reliability · severity: high · confidence: 0.8 · side: right
   quote: "    } catch (e) {\\n        return null;"        (verbatim, prefix stripped, consecutive lines)
   context_before: "        gateway.refund(order.paymentId, amount);"
   claim: "A failed gateway refund is swallowed and returned to the caller as a successful null."
