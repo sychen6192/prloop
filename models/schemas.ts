@@ -3,6 +3,13 @@
 // open model spends its capability budget on judgement instead of on formatting.
 //
 // Note what is absent: no line numbers. Coordinates are the pipeline's job (PROPOSAL §9.8).
+//
+// Also absent, on purpose: value constraints (minimum/maximum, min/maxItems, min/maxLength,
+// pattern). Every backend enforces a different JSON Schema subset — Bedrock's structured
+// output rejected `minimum`/`maximum` on a number with an HTTP 400 that took a whole finder
+// down — and none of those constraints were load-bearing: confidence is clamped and extras
+// are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
+// live in descriptions and in the validators.
 import { FINDING_CATEGORIES, SEVERITIES } from "../config";
 import { REQ_VERDICTS } from "../libs/types";
 
@@ -27,7 +34,7 @@ export const FINDINGS_SCHEMA = {
         properties: {
           category: { type: "string", enum: [...FINDING_CATEGORIES] },
           severity: { type: "string", enum: [...SEVERITIES] },
-          confidence: { type: "number", minimum: 0, maximum: 1 },
+          confidence: { type: "number", description: "0 to 1." },
           file: { type: "string" },
           quote: {
             type: "string",
@@ -102,10 +109,6 @@ export const REQUIREMENT_SCHEMA = {
     extras: {
       type: "array",
       description: "Changes in the diff that no criterion asked for (scope creep), most significant first.",
-      // Static ceiling for guided decoding; the effective cap is PRR_MAX_EXTRAS, applied
-      // deterministically in the gate. Unbounded extras made the count a per-run dice
-      // roll (10 one run, 5 the next — the same diff enumerated at different granularity).
-      maxItems: 10,
       items: {
         type: "object",
         additionalProperties: false,
@@ -132,7 +135,7 @@ export const VERDICT_SCHEMA = {
       description: "true only when you can state concretely why the finding is wrong.",
     },
     reason: { type: "string" },
-    confidence: { type: "number", minimum: 0, maximum: 1 },
+    confidence: { type: "number", description: "0 to 1." },
     suggested_severity: {
       type: ["string", "null"],
       enum: [...SEVERITIES, null],

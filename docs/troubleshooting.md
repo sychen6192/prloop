@@ -196,6 +196,13 @@ probe flags this.
     applies to the skeptic too).
   - To disable thinking for the finders while keeping it on the skeptic, do it per alias in the
     endpoint's own config (e.g. LiteLLM `extra_body` on the finder alias) instead.
+- **`HTTP 400` naming the schema — `output_config.format.schema`, `json_schema`, "not supported", or a
+  keyword like `minimum` / `maxItems`.** The backend enforces a narrower JSON Schema dialect than the one
+  that validated the request in front of it (seen live: LiteLLM → Bedrock, which rejects numeric ranges).
+  prloop's schemas carry no value constraints for exactly this reason, so on a current build this means a
+  new keyword the dialect dislikes: report it, and unblock immediately with `PRR_LLM_STRUCTURED=0` — a
+  strong model (Claude, GPT-class) emits valid JSON from the prompt alone; guided decoding only matters
+  for weak open models.
 - **Too many comments.** Lower `PRR_MAX_INLINE_COMMENTS`, or raise `PRR_MIN_INLINE_SEVERITY` to `high`.
 - **Want to block merge.** Set `PRR_POST_STATUS=1` and add a status check with genre `prloop` / name
   `ai-review` to the branch policy. Don't have a bot cast a -10 vote — it fights the reviewer policy.
