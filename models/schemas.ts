@@ -10,7 +10,7 @@
 // down — and none of those constraints were load-bearing: confidence is clamped and extras
 // are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
 // live in descriptions and in the validators.
-import { FINDING_CATEGORIES, SEVERITIES } from "../config";
+import { FINDER_CATEGORIES, SEVERITIES } from "../config";
 import { REQ_VERDICTS, type ChatRequest } from "../libs/types";
 
 export const FINDINGS_SCHEMA = {
@@ -32,7 +32,9 @@ export const FINDINGS_SCHEMA = {
           "cites",
         ],
         properties: {
-          category: { type: "string", enum: [...FINDING_CATEGORIES] },
+          // The finder's eight, not the full taxonomy: req-mismatch is the requirement
+          // axis's category and a code-axis finding must not be able to claim it.
+          category: { type: "string", enum: [...FINDER_CATEGORIES] },
           severity: { type: "string", enum: [...SEVERITIES] },
           confidence: { type: "number", description: "0 to 1." },
           file: { type: "string" },

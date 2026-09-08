@@ -10,7 +10,7 @@ import { arrayField, escapeControlCharsInStrings, parseJsonObject } from "../lib
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildDiffPayload } from "../libs/payload";
 import { htmlToText } from "../libs/html";
-import { globToRegExp, loadRules, renderConventions, selectRules } from "../libs/rules";
+import { globToRegExp, loadRules, renderConventions, renderRules, ruleHeadings, selectRules } from "../libs/rules";
 import { finalize, findingsAgree, mergeToolFindings } from "../gates/aggregate";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
 import { applyVerdicts, parseVerdict as parseVerdictForTest, votedSeverity, type SkepticOutcome, type Verdict } from "../gates/skeptic";
@@ -31,7 +31,7 @@ import { parseTriageVerdicts, triageAndConvert } from "../gates/static";
 import type { ToolFinding } from "../profiles/types";
 import type { PrRef } from "../libs/types";
 import type { ToolSpec } from "../profiles/types";
-import type { AnchoredFinding, FileDiff, RawFinding } from "../libs/types";
+import type { AnchoredFinding, ChatRequest, FileDiff, RawFinding } from "../libs/types";
 import { SEEDED_FILES, EXPECTED_ANCHORS } from "../fixtures/seeded-pr";
 import { buildTriagePrompt } from "../prompts/triage";
 import { load, sourcePaths } from "../libs/tls";
@@ -42,13 +42,15 @@ import { spawn as spawnChild } from "node:child_process";
 import { buildInvocation, runFailure, traceEvent, type Acc } from "../models/opencode";
 import { anchorAndDedupe } from "../gates/aggregate";
 import type { FinderOutput } from "../gates/finder";
-import { runFinders, validateFinding } from "../gates/finder";
+import { BASE_SMELLS, checkFinding, citeIsKnown, knownCitesFor, normalizeCite, runFinders, validateFinding } from "../gates/finder";
+import { FINDER_SYSTEM, buildFinderPrompt, finderSystemFor, renderRecap } from "../prompts/finder";
+import { mulberry32, seedFor, shuffle } from "../libs/prng";
 import { coverageGaps } from "../orchestrator";
 import { applyReqSkepticVerdicts, resolveJudgments, verifySatisfiedEvidence } from "../gates/requirement";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
 import type { CriterionCheck, ReqVerdict } from "../libs/types";
 import { FINDINGS_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
-import { PRLOOP_ROOT, type Severity } from "../config";
+import { FINDER_CATEGORIES, PRLOOP_ROOT, parseFinderPromptSuffixes, parseFinderSeed, type Severity } from "../config";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -638,13 +640,16 @@ section("rule selection");
   check("python does not pull in js packs", !names(["/svc/app/handlers.py"]).includes("typescript.md"));
 
   const py = shipped.find((r) => r.name === "python.md")!;
-  // The pack's whole premise is not restating tool output; these are ruff defaults.
+  // The pack used to open with a list of ruff codes "already reported — do not report
+  // again": false (ruff runs with its E/F default set, and the finder never sees tool
+  // output anyway) and declared to win over the system prompt, so mutable defaults,
+  // closure capture and blocking-in-async were deleted from the finder's job. Gone.
   for (const code of ["B006", "RUF012", "B023", "ASYNC2xx", "DTZ005"]) {
-    check(`python pack names ${code} as already covered`, py.body.includes(code));
+    check(`python pack no longer hands ${code} to ruff`, !py.body.includes(code));
   }
-  // ...and these are the gaps it exists to fill, so it must say they are NOT default.
+  // The notes that a gap is NOT in ruff's default set stay: they tell the finder to look.
   for (const code of ["RUF006", "B904", "PLW1641"]) {
-    check(`python pack flags ${code} as not default`, py.body.includes(code));
+    check(`python pack still flags ${code} as not default`, py.body.includes(code));
   }
 }
 
@@ -2060,7 +2065,7 @@ section("two-axis wiring: citations, conventions, requirement skeptic");
   const uncited = validateFinding({ ...base, category: "maintainability" });
   eq("uncited maintainability capped to low", uncited?.severity, "low");
   const cited = validateFinding({ ...base, category: "maintainability", cites: "Feature Envy" });
-  eq("cited maintainability keeps severity", cited?.severity, "high");
+  eq("cited maintainability is capped to medium (a smell is a judgment call)", cited?.severity, "medium");
   eq("...and carries the citation", cited?.cites, "Feature Envy");
   const behavioral = validateFinding({ ...base, category: "correctness" });
   eq("behavioral finding needs no citation", behavioral?.severity, "high");
@@ -2192,6 +2197,319 @@ section("model call concurrency cap");
   // 0 disables the cap rather than blocking forever.
   const s3 = new Semaphore(0);
   eq("limit 0 means unlimited", await s3.run(async () => 42), 42);
+}
+
+section("rules: no pack hands a defect class to a linter");
+{
+  // The audit behind Phase 1B: every language pack opened with "the linter already
+  // reports these, do not report them again" — a false premise (ruff runs with its E/F
+  // default set, the static gate is off without PRR_WORKDIR, and the finder never sees
+  // tool output anyway) declared to WIN over the system prompt. The most common defect
+  // classes were deleted from the finder's job by its own rules. Regression net.
+  const shipped = loadRules();
+  check("shipped packs load", shipped.length >= 7);
+  const suppression = /must not be reported again|must never be reported|already reported|do not report (them|those|any of these)/i;
+  for (const r of shipped) {
+    check(`${r.name} carries no linter-suppression framing`, !suppression.test(r.body), (suppression.exec(r.body) ?? [""])[0]);
+  }
+  const neutral = "prloop dedupes tool and model findings downstream";
+  for (const name of ["_base.md", "python.md", "typescript.md", "java.md", "nextjs.md"]) {
+    const body = shipped.find((r) => r.name === name)?.body ?? "";
+    check(`${name} states the dedupe contract instead`, body.includes(neutral));
+  }
+  // Naming is scoped, not banned: conventions never; a misdescriptive name is a cited smell.
+  const base = shipped.find((r) => r.name === "_base.md")!.body;
+  check("_base.md: naming conventions are never reported", /naming \*\*conventions\*\*[^.]*never reported/i.test(base));
+  check("_base.md: a misdescriptive name is a reportable Mysterious Name", /misdescribes what the\s+code does[\s\S]{0,200}"Mysterious Name"/.test(base));
+}
+
+section("rules: java.md concurrency and @Transactional in rule → bad → good → why form");
+{
+  const java = loadRules().find((r) => r.name === "java.md")!;
+  eq("applyTo frontmatter intact", java.applyTo, ["**/*.java"]);
+  const sectionOf = (title: string) => {
+    const i = java.body.indexOf(`\n## ${title}`);
+    const j = java.body.indexOf("\n## ", i + 1);
+    return i < 0 ? "" : java.body.slice(i, j < 0 ? undefined : j);
+  };
+  for (const title of ["Concurrency", "Spring `@Transactional`"]) {
+    const s = sectionOf(title);
+    const rules = (s.match(/^### /gm) ?? []).length;
+    const bad = (s.match(/```java\n\/\/ bad/g) ?? []).length;
+    const good = (s.match(/```java\n\/\/ good/g) ?? []).length;
+    const why = (s.match(/^Why: /gm) ?? []).length;
+    check(
+      `${title}: every rule has a bad snippet, a good snippet and a why`,
+      rules >= 6 && bad === rules && good === rules && why === rules,
+      `${rules} rules, ${bad} bad, ${good} good, ${why} why`,
+    );
+    const lengths = [...s.matchAll(/```java\n([\s\S]*?)```/g)].map((m) => m[1]!.trim().split("\n").length);
+    check(`${title}: snippets stay short (3-6 lines)`, lengths.length > 0 && lengths.every((n) => n >= 3 && n <= 6), lengths.join(","));
+  }
+  const stream = sectionOf("Stream");
+  check("other sections stay prose", stream.includes("- **Reusing a consumed stream**") && !stream.includes("```java"));
+  // The rule names are headings — citable, and listed in the prompt recap — while a
+  // comment inside a fence is not one.
+  const heads = ruleHeadings(java.body);
+  check("rule names are headings", heads.includes("Self-invocation") && heads.includes("Compound operations on a volatile field"));
+  check("fenced code contributes no headings", !heads.some((h) => /^(bad|good)\b/.test(h)));
+}
+
+section("finder validation: the gating fields are dropped on garbage, never promoted");
+{
+  const base = { severity: "high", confidence: 0.9, file: "/a.ts", quote: "x()", claim: "c", side: "right", category: "correctness" };
+  // c. req-mismatch is the requirement axis's category (gates/requirement.ts builds those
+  // findings directly, never through validateFinding); the finder cannot claim it.
+  check("finder enum has eight categories", FINDER_CATEGORIES.length === 8 && !(FINDER_CATEGORIES as readonly string[]).includes("req-mismatch"));
+  const schemaEnum = FINDINGS_SCHEMA.properties.findings.items.properties.category.enum as readonly string[];
+  eq("schema enum is the finder enum", [...schemaEnum], [...FINDER_CATEGORIES]);
+  eq("validateFinding rejects req-mismatch", validateFinding({ ...base, category: "req-mismatch" }), undefined);
+  check("prompt says eight, not nine", FINDER_SYSTEM.includes("pick one of eight") && !/\bnine\b/.test(FINDER_SYSTEM));
+  const tableRows = FINDER_SYSTEM.split("\n").filter((l) => /^\| [a-z][a-z-]* \|/.test(l) && !l.startsWith("| category")).length;
+  eq("category table lists exactly the finder enum", tableRows, FINDER_CATEGORIES.length);
+  for (const c of FINDER_CATEGORIES) check(`table names ${c}`, FINDER_SYSTEM.includes(`| ${c} |`));
+
+  // d. An invalid severity used to become "medium" (the inline bar) and an invalid
+  // category "correctness": garbage in exactly the fields that decide publication was the
+  // most publishable finding in the batch. Dropped now, and the reason names the field.
+  eq("invalid severity is dropped", validateFinding({ ...base, severity: "urgent" }), undefined);
+  check("...and the rejection names the field", (checkFinding({ ...base, severity: "urgent" }).rejected ?? "").startsWith('severity "urgent"'));
+  eq("missing severity is dropped", validateFinding({ ...base, severity: undefined }), undefined);
+  eq("invalid category is dropped", validateFinding({ ...base, category: "style" }), undefined);
+  check("...naming the field", (checkFinding({ ...base, category: "style" }).rejected ?? "").startsWith('category "style"'));
+  eq("case is normalised, not rejected", validateFinding({ ...base, severity: "Medium", category: "Correctness" })?.severity, "medium");
+  check("incomplete fields still name what is missing", (checkFinding({ ...base, quote: "  " }).rejected ?? "").includes("missing quote"));
+  eq("a non-object is named as such", checkFinding("nope").rejected, "not an object");
+  check("the quote/file/claim requirement is unchanged", validateFinding(base) !== undefined);
+
+  // e. Maintainability never exceeds medium, cited or not: _base.md promised it and only
+  // the prompt enforced it, so a cited smell at "critical" sailed through to inline.
+  const smell = (severity: string, cites?: string) =>
+    validateFinding({ ...base, category: "maintainability", severity, cites })?.severity;
+  eq("cited critical smell → medium", smell("critical", "Feature Envy"), "medium");
+  eq("cited high smell → medium", smell("high", "Feature Envy"), "medium");
+  eq("cited medium smell stays medium", smell("medium", "Feature Envy"), "medium");
+  eq("cited low smell stays low", smell("low", "Feature Envy"), "low");
+  eq("uncited high smell → low", smell("high"), "low");
+  eq("uncited medium smell → low", smell("medium"), "low");
+  eq("behavioral critical is untouched", validateFinding({ ...base, severity: "critical" })?.severity, "critical");
+}
+
+section("finder citations: a cite must name a smell or a loaded rule heading");
+{
+  // f. `cites` accepted any non-empty string, so "SOLID" or "best practice" bought a
+  // maintainability finding the medium severity that reaches an inline comment.
+  const shipped = loadRules();
+  const base = shipped.find((r) => r.name === "_base.md")!;
+  const bullets = [...base.body.matchAll(/^- \*\*([^*]+)\*\* —/gm)].map((m) => m[1]!.trim());
+  eq("BASE_SMELLS matches the 12 bullets in _base.md", [...BASE_SMELLS], bullets);
+
+  const java = shipped.find((r) => r.name === "java.md")!;
+  const heads = ruleHeadings(java.body);
+  check("headings are extracted at every level", heads.includes("Java review rules") && heads.includes("Concurrency") && heads.includes("Self-invocation"));
+  check("markdown emphasis is stripped from headings", heads.includes("Spring @Transactional"));
+  eq("fenced '# lines' are not headings", ruleHeadings("# Real\n```py\n# not a heading\n```\n## Also real ##"), ["Real", "Also real"]);
+
+  const known = knownCitesFor([base, java]);
+  check("known cites carry the smells", known.has("feature envy") && known.has("mysterious name"));
+  check("...and the selected rules' headings", known.has("self-invocation") && known.has("spring @transactional"));
+  check("a smell name in any case is known", citeIsKnown("feature envy", known) && citeIsKnown("FEATURE ENVY (Refactoring ch. 3)", known));
+  check("a rule heading with markdown noise is known", citeIsKnown("Spring `@Transactional` › Self-invocation", known));
+  check("an unrelated citation is not", !citeIsKnown("SOLID", known) && !citeIsKnown("best practice", known) && !citeIsKnown("", known));
+  check("a heading of a rule NOT selected for this PR is not known", !citeIsKnown("Server Action security (highest priority)", known));
+  check("the repo's own convention headings count", citeIsKnown("no default exports", knownCitesFor([base], "## No default exports\n\nUse named exports.")));
+
+  const raw = { severity: "high", confidence: 0.9, file: "/A.java", quote: "x()", claim: "c", side: "right", category: "maintainability" };
+  const mk = (cites: string, k?: ReadonlySet<string>) => validateFinding({ ...raw, cites }, k);
+  eq("a known heading cite keeps medium", mk("Self-invocation", known)?.severity, "medium");
+  const unknown = mk("SOLID", known);
+  eq("an unknown cite is treated as uncited: capped to low", unknown?.severity, "low");
+  eq("...but stays on the finding for the artifacts", unknown?.cites, "SOLID");
+  eq("with only the smells known, a rule heading is not enough", mk("Self-invocation", new Set(BASE_SMELLS.map(normalizeCite)))?.severity, "low");
+  eq("the default known set is the smells", mk("Middle Man")?.severity, "medium");
+}
+
+section("seeded PRNG (libs/prng.ts)");
+{
+  const a = mulberry32(123);
+  const b = mulberry32(123);
+  eq("same seed, same sequence", [a(), a(), a()], [b(), b(), b()]);
+  check("a neighbouring seed diverges", mulberry32(123)() !== mulberry32(124)());
+  const vals = Array.from({ length: 1000 }, mulberry32(9));
+  check("values stay in [0, 1)", vals.every((v) => v >= 0 && v < 1));
+  const items = [1, 2, 3, 4, 5, 6, 7, 8];
+  const sh = shuffle(items, mulberry32(5));
+  eq("shuffle is a permutation", [...sh].sort((x, y) => x - y), items);
+  eq("...that does not mutate the input", items, [1, 2, 3, 4, 5, 6, 7, 8]);
+  eq("...and is reproducible", shuffle(items, mulberry32(5)), sh);
+  check("seedFor spreads finder indexes", new Set([0, 1, 2, 3].map((i) => seedFor(42, i))).size === 4);
+  check("seedFor stays a 32-bit unsigned value", [0, 1, 2].every((i) => Number.isInteger(seedFor(2 ** 32 - 1, i)) && seedFor(2 ** 32 - 1, i) >= 0 && seedFor(2 ** 32 - 1, i) < 2 ** 32));
+}
+
+section("diff budget: a per-finder order is a permutation of one fixed selection");
+{
+  // PROPOSAL §5.2 promised each finder a randomised file order and it was never built:
+  // every finder got the identical prompt, so consensus partly measured shared position
+  // bias. The shuffle must never touch WHAT is selected — only the sequence.
+  const files = ["a", "b", "c", "d", "e"].map((n) => mkFile(`/${n}.ts`, [`${n}1();`, `${n}2();`], [1, 2]));
+  const paths = (p: { includedFiles: string[] }) => p.includedFiles;
+  eq("no seed keeps prevalence order", paths(buildDiffPayload(files, 100_000)), files.map((f) => f.path));
+  const s1 = buildDiffPayload(files, 100_000, 1);
+  const s1again = buildDiffPayload(files, 100_000, 1);
+  eq("same seed, same order", paths(s1), paths(s1again));
+  eq("...and the same text", s1.text, s1again.text);
+  const s2 = buildDiffPayload(files, 100_000, 2);
+  check("different seeds, different order", paths(s1).join() !== paths(s2).join());
+  check("seeds really permute", new Set([1, 2, 3, 4, 5, 6].map((s) => paths(buildDiffPayload(files, 100_000, s)).join())).size > 1);
+  eq("the set of files is identical", [...paths(s1)].sort(), [...paths(s2)].sort());
+  const positions = paths(s1).map((p) => s1.text.indexOf(`### ${p} `));
+  check("the text lists the files in the shuffled order", positions.every((pos, i) => pos >= 0 && (i === 0 || pos > positions[i - 1]!)));
+  // Tight budget: the selection and the omitted list never depend on the seed.
+  const tight = [1, 2, 3].map((s) => buildDiffPayload(files, 200, s));
+  check("tight budget really omitted something", tight[0]!.omittedFiles.length > 0 && tight[0]!.includedFiles.length > 1);
+  check("selection is seed-independent", tight.every((t) => [...t.includedFiles].sort().join() === [...tight[0]!.includedFiles].sort().join()));
+  check("omitted list is seed-independent", tight.every((t) => t.omittedFiles.join() === tight[0]!.omittedFiles.join()));
+  eq("...and identical to the unseeded selection", buildDiffPayload(files, 200).omittedFiles, tight[0]!.omittedFiles);
+}
+
+section("finder knobs: PRR_FINDER_PROMPT_SUFFIX_BY_MODEL and PRR_FINDER_SEED");
+{
+  const throws = (fn: () => unknown) => {
+    try {
+      fn();
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  eq("unset suffix map is undefined", parseFinderPromptSuffixes(undefined), undefined);
+  eq("blank suffix map is undefined", parseFinderPromptSuffixes("  "), undefined);
+  eq("a model → text map parses", parseFinderPromptSuffixes('{"qwen":"Name the condition."}'), { qwen: "Name the condition." });
+  check("malformed JSON is fatal", throws(() => parseFinderPromptSuffixes("{oops")));
+  check("an array is fatal", throws(() => parseFinderPromptSuffixes('["x"]')));
+  check("a non-string value is fatal", throws(() => parseFinderPromptSuffixes('{"qwen":{"text":"x"}}')));
+  eq("the suffix is appended for its model only", finderSystemFor("qwen", { qwen: "Stance." }), `${FINDER_SYSTEM}\n\nStance.`);
+  eq("other models get the base prompt", finderSystemFor("claude", { qwen: "Stance." }), FINDER_SYSTEM);
+  eq("a blank suffix is no suffix", finderSystemFor("qwen", { qwen: "  " }), FINDER_SYSTEM);
+  eq("no map, base prompt", finderSystemFor("qwen", undefined), FINDER_SYSTEM);
+
+  eq("unset seed is undefined (random per run)", parseFinderSeed(undefined), undefined);
+  eq("seed parses", parseFinderSeed("42"), 42);
+  check("a non-integer seed is fatal", throws(() => parseFinderSeed("4.2")) && throws(() => parseFinderSeed("x")) && throws(() => parseFinderSeed("-1")));
+
+  // Through the environment, in a fresh process: config reads both at import time.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-finder-env-"));
+  const probe = path.join(dir, "probe.ts");
+  const cfg = pathToFileURL(path.join(PRLOOP_ROOT, "config.ts")).href;
+  fs.writeFileSync(
+    probe,
+    `import { FINDER_SEED, FINDER_PROMPT_SUFFIX_BY_MODEL } from ${JSON.stringify(cfg)};\n` +
+      `console.log(JSON.stringify({ seed: FINDER_SEED, suffixes: FINDER_PROMPT_SUFFIX_BY_MODEL }));\n`,
+  );
+  const tsxCli = path.join(PRLOOP_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+  const res = spawnSync(process.execPath, [tsxCli, probe], {
+    encoding: "utf8",
+    env: { ...process.env, PRR_FINDER_SEED: "4711", PRR_FINDER_PROMPT_SUFFIX_BY_MODEL: '{"m":"Stance."}', PRR_QUIET: "1" },
+  });
+  const out = parseJsonObject<{ seed?: number; suffixes?: Record<string, string> }>(res.stdout ?? "");
+  check("probe process ran", out.ok, (res.error ? String(res.error) : (res.stderr ?? "")).slice(0, 400));
+  if (out.ok) {
+    eq("PRR_FINDER_SEED is honoured", out.value.seed, 4711);
+    eq("PRR_FINDER_PROMPT_SUFFIX_BY_MODEL is honoured", out.value.suffixes, { m: "Stance." });
+  }
+  const bad = spawnSync(process.execPath, [tsxCli, probe], {
+    encoding: "utf8",
+    env: { ...process.env, PRR_FINDER_SEED: "soon", PRR_QUIET: "1" },
+  });
+  check("a bad PRR_FINDER_SEED is a startup fatal naming the variable", bad.status === 1 && (bad.stderr ?? "").includes("PRR_FINDER_SEED"));
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+section("finder stage: per-model stance, seeded file order, drop accounting");
+{
+  const files = ["a", "b", "c", "d", "e"].map((n) => mkFile(`/src/${n}.ts`, [`${n}();`], [1]));
+  const pr = { title: "t", description: "", sourceBranch: "s", targetBranch: "t", createdBy: "a", status: "active" };
+  const input = { pr, files, iterationId: 1, compareTo: 0 };
+  const seen: ChatRequest[] = [];
+  // "Async correctness" is a heading of typescript.md, which the .ts paths select.
+  const finding = { category: "maintainability", severity: "high", confidence: 0.9, file: "/src/a.ts", quote: "a();", claim: "c", side: "right", cites: "Async correctness" };
+  const runner = {
+    chat: async (req: ChatRequest) => {
+      seen.push(req);
+      return { text: JSON.stringify({ findings: [finding, { ...finding, category: "style" }, { ...finding, severity: "urgent" }] }), model: req.model };
+    },
+  };
+  const run1 = await runFinders(runner, input, ["alpha", "beta"], { seed: 7, promptSuffixes: { beta: "Name the failing condition." } });
+  eq("the run seed is reported", run1.seed, 7);
+  eq("each finder carries its own seed", run1.outputs.map((o) => o.seed), [seedFor(7, 0), seedFor(7, 1)]);
+  // 12b. The stance lands on the named model only.
+  eq("alpha gets the plain system prompt", seen[0]!.system, FINDER_SYSTEM);
+  check("beta gets the base prompt plus its suffix", seen[1]!.system.startsWith(FINDER_SYSTEM) && seen[1]!.system.endsWith("Name the failing condition."));
+  // 12c. Same files, different order; finder 0's prompt is the shared one.
+  const order = (text: string) => [...text.matchAll(/^### (\/src\/\w+\.ts) /gm)].map((m) => m[1]);
+  const o0 = order(run1.outputs[0]!.prompt!);
+  const o1 = order(run1.outputs[1]!.prompt!);
+  const all = files.map((f) => f.path).sort();
+  eq("both finders see all five files", [[...o0].sort(), [...o1].sort()], [all, all]);
+  check("...in different orders", o0.join() !== o1.join());
+  eq("finder 0's prompt is the shared prompt", run1.prompt, run1.outputs[0]!.prompt);
+  eq("both prompts carry the recap", run1.outputs.map((o) => o.prompt!.includes("## Recap")), [true, true]);
+  const run2 = await runFinders(runner, input, ["alpha", "beta"], { seed: 7 });
+  eq("the same seed replays the same prompts", run2.outputs.map((o) => o.prompt), run1.outputs.map((o) => o.prompt));
+  const run3 = await runFinders(runner, input, ["alpha"], { seed: 8 });
+  check("a different run seed gives a different order", order(run3.outputs[0]!.prompt!).join() !== o0.join());
+  // 11d/11f through the stage: the style category and the urgent severity are dropped and
+  // counted; the cite of a heading from a rule selected for this PR keeps medium.
+  const out = run1.outputs[0]!;
+  eq("garbage findings are counted as rejected", out.rejected, 2);
+  eq("the valid one survives", out.findings.length, 1);
+  eq("...at medium, citing a heading of a rule selected for this PR", out.findings[0]!.severity, "medium");
+  eq("no error: a partial drop is not a failed call", out.error, undefined);
+}
+
+section("finder prompt: coverage stance, recap after the diff, worked examples");
+{
+  // 12a. The closing line used to call an empty array "entirely acceptable and a common
+  // outcome" — permission to self-censor, in bold, as the last thing the model read.
+  check("empty-array permission is gone", !/entirely acceptable|common outcome/i.test(FINDER_SYSTEM));
+  check("empty is correct only after every hunk was examined", /empty findings array is correct only after every hunk/i.test(FINDER_SYSTEM));
+  check("the verification stage removes weak findings, not the finder", /verification stage removes them; the finder does not/i.test(FINDER_SYSTEM));
+  // 11a/11b. Duplicated logic is a smell (≤ medium), not a high-tier defect; naming is scoped.
+  const chain = FINDER_SYSTEM.slice(FINDER_SYSTEM.indexOf("## severity"), FINDER_SYSTEM.indexOf("## Important rules"));
+  check("duplicated logic is out of the high tier", chain.length > 0 && !/duplicated logic/i.test(chain));
+  check("maintainability is capped at medium in the chain", /Maintainability findings never exceed medium/.test(chain));
+  check(
+    "naming conventions never; a misdescriptive name is a cited Mysterious Name",
+    /naming CONVENTIONS[\s\S]{0,120}never findings[\s\S]{0,60}misdescribes[\s\S]{0,160}"Mysterious Name"/.test(FINDER_SYSTEM),
+  );
+  // 13b. One worked finding, one anti-example.
+  check("worked example present", FINDER_SYSTEM.includes("## Worked example") && /suggested_fix: ".*throw new RefundFailed/.test(FINDER_SYSTEM) && FINDER_SYSTEM.includes("cites: null"));
+  check("anti-example present", FINDER_SYSTEM.includes("## Not a finding") && FINDER_SYSTEM.includes("calcTotal"));
+
+  // 13a. The recap sits after the diff and before the output instruction, and carries the
+  // eight categories, the chain, and the headings of the rules selected for this PR.
+  const files = [mkFile("/src/A.java", ["x();"], [1])];
+  const pr = { title: "t", description: "", sourceBranch: "s", targetBranch: "t", createdBy: "a", status: "active" };
+  const selected = selectRules(loadRules(), ["/src/A.java"]);
+  const { text } = buildFinderPrompt({
+    pr,
+    files,
+    iterationId: 1,
+    compareTo: 0,
+    rules: renderRules(selected),
+    ruleHeadings: selected.map((r) => ({ name: r.name, headings: ruleHeadings(r.body) })),
+  });
+  const diffAt = text.indexOf("## The change (unified diff)");
+  const recapAt = text.indexOf("## Recap");
+  const outAt = text.indexOf("## Your output");
+  check("recap follows the diff and precedes the output instruction", diffAt >= 0 && recapAt > diffAt && outAt > recapAt);
+  check("the quoted code sits above the recap", text.indexOf("x();") > diffAt && text.indexOf("x();") < recapAt);
+  const recap = text.slice(recapAt, outAt);
+  for (const c of FINDER_CATEGORIES) check(`recap names ${c}`, recap.includes(c));
+  check("recap has the severity chain, one line per step", ["→ critical", "→ high", "→ medium", "→ low"].every((s) => recap.split("\n").some((l) => l.includes(s))));
+  check("recap lists the selected rule headings", recap.includes("- java.md: ") && recap.includes("Self-invocation") && recap.includes("- _base.md: "));
+  check("recap does not list rules that were not selected", !recap.includes("python.md"));
+  check("recap without rules says so", renderRecap([]).includes("No project rules were loaded"));
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

@@ -108,6 +108,30 @@ export function renderRules(rules: Rule[]): string {
   return rules.map((r) => r.body).join("\n\n---\n\n");
 }
 
+/**
+ * The heading texts of a markdown body (`# `, `## `, …) in document order, with backticks
+ * and emphasis stripped. Fenced code is skipped: a `# comment` inside a snippet is not a
+ * heading. Two consumers: the finder's citation check accepts a heading of any rule
+ * selected for the PR (gates/finder.ts), and the prompt recap lists them so the model can
+ * cite one verbatim (prompts/finder.ts).
+ */
+export function ruleHeadings(body: string): string[] {
+  const out: string[] = [];
+  let inFence = false;
+  for (const line of body.split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const m = /^#{1,6}\s+(.+?)\s*#*\s*$/.exec(line);
+    if (!m?.[1]) continue;
+    const text = m[1].replace(/[`*_]/g, "").replace(/\s+/g, " ").trim();
+    if (text) out.push(text);
+  }
+  return out;
+}
+
 // Prompt-budget caps for injected convention documents. A convention file is context, not
 // the subject under review; an unbounded CONTRIBUTING.md must not crowd the diff out of
 // the window.

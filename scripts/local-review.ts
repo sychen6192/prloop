@@ -10,8 +10,10 @@
 import * as fs from "node:fs";
 import { buildLocalReviewContext } from "../git/intake";
 import { anchorAndDedupe, finalize } from "../gates/aggregate";
+import { FINDER_SEED } from "../config";
 import { buildFinderPrompt, FINDER_SYSTEM } from "../prompts/finder";
-import { loadRules, renderRules, selectRules } from "../libs/rules";
+import { newRunSeed, seedFor } from "../libs/prng";
+import { loadRules, renderRules, ruleHeadings, selectRules } from "../libs/rules";
 import { parseJsonObject } from "../libs/json";
 import { renderSummary } from "../publish/format";
 import type { FinderOutput } from "../gates/finder";
@@ -36,17 +38,22 @@ async function main() {
 
   if (mode === "prompt") {
     const rules = selectRules(loadRules(), ctx.files.map((f) => f.path));
+    // Same shape as a live run's finder 0: recap included, file order seeded. The seed is
+    // printed so the exact prompt can be regenerated with PRR_FINDER_SEED.
+    const runSeed = FINDER_SEED ?? newRunSeed();
     const { text } = buildFinderPrompt({
       pr: ctx.pr,
       files: ctx.files,
       iterationId: 1,
       compareTo: 0,
       rules: renderRules(rules),
+      ruleHeadings: rules.map((r) => ({ name: r.name, headings: ruleHeadings(r.body) })),
+      seed: seedFor(runSeed, 0),
     });
     const full = `${FINDER_SYSTEM}\n\n${"=".repeat(78)}\n\n${text}`;
     if (arg5) {
       fs.writeFileSync(arg5, full);
-      console.log(`Prompt written to ${arg5} (${full.length} chars, rules: ${rules.map((r) => r.name).join(", ")})`);
+      console.log(`Prompt written to ${arg5} (${full.length} chars, rules: ${rules.map((r) => r.name).join(", ")}, run seed ${runSeed})`);
     } else {
       console.log(full);
     }

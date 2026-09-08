@@ -130,10 +130,18 @@ export const LLM_STREAM = process.env.PRR_LLM_STREAM !== "0";
  * mysterious HTTP 400 on every single model call mid-run.
  */
 export function parseExtraBody(raw: string | undefined): Record<string, unknown> | undefined {
+  return parseObjectEnv(raw, '{"chat_template_kwargs":{"enable_thinking":false}}');
+}
+
+// Shared shape check for the JSON-object env vars: unset/blank = undefined, malformed JSON
+// throws, and anything that parses but is not an object (an array, a bare string) is
+// rejected with an example of the expected shape — a `[]` accepted here would surface as a
+// mysterious failure on every call, not at startup where the operator is looking.
+function parseObjectEnv(raw: string | undefined, example: string): Record<string, unknown> | undefined {
   if (raw === undefined || raw.trim() === "") return undefined;
   const parsed: unknown = JSON.parse(raw); // throws on malformed JSON
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error('must be a JSON object, e.g. {"chat_template_kwargs":{"enable_thinking":false}}');
+    throw new Error(`must be a JSON object, e.g. ${example}`);
   }
   return parsed as Record<string, unknown>;
 }
@@ -192,6 +200,60 @@ export const LLM_EXTRA_BODY_BY_MODEL: Record<string, Record<string, unknown>> | 
 export function extraBodyFor(model: string): Record<string, unknown> | undefined {
   return resolveExtraBody(model, LLM_EXTRA_BODY_BY_MODEL, LLM_EXTRA_BODY);
 }
+
+// --- Finder prompt shaping ---
+/**
+ * Parses PRR_FINDER_PROMPT_SUFFIX_BY_MODEL: a JSON object mapping a finder model name to
+ * text appended to that finder's system prompt. Same fail-fast shape check as the extra-body
+ * knobs, but the values must be strings. Exported for tests.
+ */
+export function parseFinderPromptSuffixes(raw: string | undefined): Record<string, string> | undefined {
+  const parsed = parseObjectEnv(raw, '{"qwen3-coder":"Name the exact input or condition under which the quoted line fails."}');
+  if (parsed === undefined) return undefined;
+  for (const [model, text] of Object.entries(parsed)) {
+    if (typeof text !== "string") throw new Error(`entry "${model}" must be a string`);
+  }
+  return parsed as Record<string, string>;
+}
+// Per-model stance text, appended to that model's finder system prompt. Model families miss
+// the coverage brief in opposite directions: Claude/GPT-class finders self-censor (they
+// decide a weak finding is "not worth raising" and return an empty array), Qwen-class
+// finders over-report without ever naming the condition under which the code fails. One
+// shared prompt cannot lean against both at once, and the correction belongs with the fleet
+// configuration — next to PRR_FINDER_MODELS — not in a per-deployment fork of
+// prompts/finder.ts. Unknown model names are ignored: the map is consulted, never validated
+// against the fleet, so a stale entry costs nothing.
+export const FINDER_PROMPT_SUFFIX_BY_MODEL: Record<string, string> | undefined = (() => {
+  try {
+    return parseFinderPromptSuffixes(process.env.PRR_FINDER_PROMPT_SUFFIX_BY_MODEL);
+  } catch (e) {
+    console.error(`FATAL: PRR_FINDER_PROMPT_SUFFIX_BY_MODEL ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
+
+/**
+ * Parses PRR_FINDER_SEED: unset/blank = a fresh random seed per run; otherwise a
+ * non-negative integer. Exported for tests.
+ */
+export function parseFinderSeed(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`${raw} is not a non-negative integer`);
+  return n;
+}
+// Run seed for the per-finder file-order shuffle (libs/prng.ts). Every finder sees the same
+// set of files, each in its own order, so consensus cannot count shared position bias as
+// independent agreement — which is why the default is a fresh random seed per run. The
+// seed a run used is logged and saved in finder-outputs.json; set this to replay it exactly.
+export const FINDER_SEED: number | undefined = (() => {
+  try {
+    return parseFinderSeed(process.env.PRR_FINDER_SEED);
+  } catch (e) {
+    console.error(`FATAL: PRR_FINDER_SEED ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
 
 // --- Diff / token budget (PR-Agent style deterministic compression) ---
 export const MAX_DIFF_CHARS = numEnv("PRR_MAX_DIFF_CHARS", 240_000, 1000);
@@ -343,3 +405,13 @@ export const FINDING_CATEGORIES = [
   "req-mismatch",
 ] as const;
 export type FindingCategory = (typeof FINDING_CATEGORIES)[number];
+
+// What the code-axis finder may emit: everything except req-mismatch, which only the
+// requirement axis produces (gates/requirement.ts builds those findings itself, with the
+// acceptance criteria in hand). Offering it in the finder's schema invited the code axis to
+// guess at requirements it never saw — and the prompt then promised "nine" categories while
+// its table listed eight. Schema enum, validator and prompt all derive from this list.
+export const FINDER_CATEGORIES = FINDING_CATEGORIES.filter(
+  (c): c is Exclude<FindingCategory, "req-mismatch"> => c !== "req-mismatch",
+);
+export type FinderCategory = (typeof FINDER_CATEGORIES)[number];

@@ -4,10 +4,12 @@
 import { log } from "./log";
 import { MAX_DIFF_CHARS } from "../config";
 import { renderUnifiedDiff } from "./diff";
+import { mulberry32, shuffle } from "./prng";
 import type { FileDiff } from "./types";
 
 export interface DiffPayload {
   text: string;
+  // In the order the files appear in `text`.
   includedFiles: string[];
   omittedFiles: string[];
 }
@@ -16,7 +18,13 @@ function addedLineCount(f: FileDiff): number {
   return f.changedRightLines.size;
 }
 
-export function buildDiffPayload(files: FileDiff[], budget = MAX_DIFF_CHARS): DiffPayload {
+/**
+ * Selection is by budget in prevalence order and never depends on `seed`; the seed only
+ * permutes the order in which the SELECTED files are rendered. The two steps are kept apart
+ * on purpose: a per-finder shuffle must never change what a finder sees, or "two finders
+ * agreed" could mean "two finders were shown the same subset". No seed = prevalence order.
+ */
+export function buildDiffPayload(files: FileDiff[], budget = MAX_DIFF_CHARS, seed?: number): DiffPayload {
   // Language prevalence: the repo's dominant language goes first, so if anything gets
   // dropped it's the outlier file types.
   const prevalence = new Map<string, number>();
@@ -34,34 +42,33 @@ export function buildDiffPayload(files: FileDiff[], budget = MAX_DIFF_CHARS): Di
     return a.path.localeCompare(b.path);
   });
 
-  const chunks: string[] = [];
-  const includedFiles: string[] = [];
+  const selected: Array<{ path: string; rendered: string }> = [];
   const omittedFiles: string[] = [];
   let used = 0;
 
   for (const f of ordered) {
     const rendered = `### ${f.path}${f.originalPath && f.originalPath !== f.path ? ` (renamed from ${f.originalPath})` : ""} [${f.changeType}, ${f.language}]\n\`\`\`diff\n${renderUnifiedDiff(f.path, f.hunks)}\n\`\`\``;
-    if (used + rendered.length > budget && includedFiles.length > 0) {
+    if (used + rendered.length > budget && selected.length > 0) {
       omittedFiles.push(f.path);
       continue;
     }
     // The first file is always included so the payload is never empty — but a single
     // giant file can then blow far past the budget, and a backend that truncates the
     // prompt corrupts the very quotes anchoring depends on. Say so out loud.
-    if (includedFiles.length === 0 && rendered.length > budget) {
+    if (selected.length === 0 && rendered.length > budget) {
       log(
         `[WARN] ${f.path} alone renders ${rendered.length} chars against a ${budget} budget; ` +
           `sent anyway — if the backend truncates, anchoring will degrade`,
       );
     }
-    chunks.push(rendered);
-    includedFiles.push(f.path);
+    selected.push({ path: f.path, rendered });
     used += rendered.length;
   }
 
-  let text = chunks.join("\n\n");
+  const shown = seed === undefined ? selected : shuffle(selected, mulberry32(seed));
+  let text = shown.map((s) => s.rendered).join("\n\n");
   if (omittedFiles.length > 0) {
     text += `\n\n### Changed files omitted for size (${omittedFiles.length})\n${omittedFiles.map((p) => `- ${p}`).join("\n")}`;
   }
-  return { text, includedFiles, omittedFiles };
+  return { text, includedFiles: shown.map((s) => s.path), omittedFiles };
 }

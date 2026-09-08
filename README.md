@@ -62,8 +62,9 @@ the other's output.
   criteria) and gives each criterion a verdict: `satisfied / missing / partial /
   misunderstood / not-verifiable`, plus out-of-scope changes. It reports *how* it failed, not
   a percentage — a percentage is not actionable.
-- **Code axis** — 9 categories × 4 severities, severity from an ordered decision chain (key
-  split: is there a workaround?) rather than adjectives.
+- **Code axis** — 8 categories × 4 severities (`req-mismatch`, the ninth, belongs to the
+  requirement axis), severity from an ordered decision chain (key split: is there a
+  workaround?) rather than adjectives.
 
 ### Precision comes from filtering, not from asking nicely
 
@@ -76,7 +77,9 @@ do the filtering:
    assess it. A verifier asked "is this right?" agrees. It also **never sees the finder's
    reasoning**, only the claim and the code; shared reasoning creates an anchoring effect.
 3. **Consensus** — an inline comment needs corroboration: two finders found it independently,
-   or a skeptic actively cleared it. A lone unverified finding stays in the summary.
+   or a skeptic actively cleared it. A lone unverified finding stays in the summary. Each
+   finder reads the same files in its own seeded order, so agreement on a finding is not
+   agreement on where it sat in the prompt.
 
 A fourth filter answers to the team rather than to the models: categories this repo does not
 want (`PRR_EXCLUDE_CATEGORIES`) and findings a reviewer already closed as *wontFix* never
@@ -189,9 +192,11 @@ npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
 - **Clean PR → one quiet line.** Style and formatting never get a comment; that's the linter's job.
 
 Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the exact prompts
-(`finder-prompt.md`), each model's raw output (`finder-*-raw.txt`), per-finding skeptic
-verdicts (`skeptic.json`), and the anchoring outcome for everything including what was
-rejected and why (`findings.json`). Start there when a result looks wrong.
+(`finder-prompt.md` is finder 0's; `finder-<i>-<model>-prompt.md` is each finder's own, since
+every finder reads the files in its own seeded order), each model's raw output
+(`finder-*-raw.txt`), the run seed and per-finder seeds (`finder-outputs.json`), per-finding
+skeptic verdicts (`skeptic.json`), and the anchoring outcome for everything including what
+was rejected and why (`findings.json`). Start there when a result looks wrong.
 
 ## Settings
 
@@ -211,6 +216,8 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_LLM_STREAM` | `1` | stream completions (SSE) so a gateway's idle timeout can't 504 a long generation; `0` = buffered |
 | `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request — engine knobs prloop has no flag for; prloop's own fields win on conflict |
 | `PRR_LLM_EXTRA_BODY_BY_MODEL` | — | per-model override map ({} = send none): run a mixed fleet, e.g. thinking disabled globally but re-enabled for one deep finder and the skeptic |
+| `PRR_FINDER_PROMPT_SUFFIX_BY_MODEL` | — | JSON `model → text` appended to that finder's system prompt: a per-family stance (self-censoring and over-reporting families need opposite nudges) without forking the prompt |
+| `PRR_FINDER_SEED` | random per run | seed for the per-finder file-order shuffle; set it to replay a run exactly (the seed a run used is in `finder-outputs.json`) |
 | `PRR_MIN_INLINE_SEVERITY` | `medium` | below this → summary only |
 | `PRR_MAX_INLINE_COMMENTS` | `10` | code axis (requirement axis has its own budget of 3) |
 | `PRR_MAX_EXTRAS` | `5` | cap on reported out-of-scope changes; the model ranks, the gate slices |

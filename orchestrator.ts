@@ -206,11 +206,21 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   run.saveJson("static.json", staticResult);
 
   const { outputs, prompt, omitted, rules } = finderOut;
+  // finder-prompt.md stays finder 0's prompt, for tooling that reads that name. Every
+  // finder reads the files in its own seeded order, so each one's prompt is saved too:
+  // a wrong-line or missed finding from finder 2 cannot be debugged against finder 0's.
   run.save("finder-prompt.md", prompt);
   outputs.forEach((o, i) => {
-    run.save(`finder-${i}-${o.model.replace(/[^\w.-]/g, "_")}-raw.txt`, o.raw || `(error: ${o.error ?? "no output"})`);
+    const tag = `finder-${i}-${o.model.replace(/[^\w.-]/g, "_")}`;
+    run.save(`${tag}-raw.txt`, o.raw || `(error: ${o.error ?? "no output"})`);
+    if (o.prompt !== undefined) run.save(`${tag}-prompt.md`, o.prompt);
   });
-  run.saveJson("finder-outputs.json", outputs.map((o) => ({ ...o, raw: undefined })));
+  // The run seed replays the whole fleet (PRR_FINDER_SEED); each finder's own seed is on
+  // its entry. Prompts live in their own files above, raw output in *-raw.txt.
+  run.saveJson("finder-outputs.json", {
+    runSeed: finderOut.seed,
+    finders: outputs.map((o) => ({ ...o, raw: undefined, prompt: undefined })),
+  });
 
   banner("Step 3/4: anchor, adversarial verification and verdicts");
   const candidates = anchorAndDedupe(outputs, ctx.fileIndex);
