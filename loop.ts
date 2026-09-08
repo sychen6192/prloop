@@ -19,10 +19,11 @@ import { parsePrUrl } from "./ado/client";
 import { unmetCriteria } from "./gates/requirement";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
 import { buildResultSummary, openRunDir } from "./libs/artifacts";
-import { configWarnings, renderConfigTable, wantsConfigDump } from "./libs/configreport";
+import { parseArgs } from "./libs/cli";
+import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
 import { createRunner, tokenTotals } from "./models/runner";
-import { runReview } from "./orchestrator";
+import { exitCodeFor, runReview } from "./orchestrator";
 
 const USAGE = `Usage: prloop <PR URL> [options]
        npm run prloop -- <PR URL> [options]     (any OS, including Windows)
@@ -54,35 +55,25 @@ function usage(): never {
 
 async function main() {
   const args = process.argv.slice(2);
+  const cli = parseArgs(args, SHOW_CONFIG);
   // Checked before the URL is required: "which value is prloop actually using" is a
   // question you ask when a run went wrong, and it must not need a PR to answer.
-  if (wantsConfigDump(args, SHOW_CONFIG)) {
+  if (cli.showConfig) {
     console.log(renderConfigTable());
     process.exit(0);
   }
   // --help is a request, not a mistake. Exiting 1 to stderr made `prloop --help` look like a
   // failure to every caller that checks a status code, CI smoke tests included.
-  if (args.includes("-h") || args.includes("--help")) help();
+  if (cli.help) help();
   if (args.length === 0) usage();
+  if (cli.error) die(cli.error);
 
-  let compareTo = 0;
-  let sinceAuto = false;
-  const sinceIdx = args.indexOf("--since");
-  if (sinceIdx >= 0) {
-    const raw = args[sinceIdx + 1];
-    if (raw === "auto") sinceAuto = true;
-    else {
-      const n = Number(raw);
-      if (!Number.isInteger(n) || n < 0) die(`--since takes a non-negative integer or "auto", got: ${raw}`);
-      compareTo = n;
-    }
-  }
+  let compareTo = typeof cli.since === "number" ? cli.since : 0;
+  const sinceAuto = cli.since === "auto";
 
-  // The positional scan must skip --since's VALUE ("3" or "auto" doesn't start with "-"),
-  // or `prloop --since 3 <URL>` parses "3" as the PR URL.
-  const url = args.find((a, i) => !a.startsWith("-") && (sinceIdx < 0 || i !== sinceIdx + 1));
+  const url = cli.url;
   if (!url) usage();
-  if (args.includes("--dry-run")) process.env["PRR_DRY_RUN"] = "1";
+  if (cli.dryRun) process.env["PRR_DRY_RUN"] = "1";
 
   const ref = parsePrUrl(url);
   banner(`prloop: ${ref.org}/${ref.project}/${ref.repoId} PR !${ref.prId}`);
@@ -150,12 +141,9 @@ async function main() {
     );
   }
 
-  // Either axis can fail the run: an unimplemented requirement is as blocking as a bug.
-  // And a stage that crashed must not exit 0 — "nothing blocking was found" and "the check
-  // that would have found it never ran" are different facts, and only one of them justifies
-  // a green CI gate.
-  const highRisk = inline.filter((f) => f.severity === "critical" || f.severity === "high");
-  const exitCode = highRisk.length > 0 || unmet.length > 0 ? 2 : result.incomplete.length > 0 ? 3 : 0;
+  // Either axis can fail the run, and a crashed stage is not a clean one; exitCodeFor owns
+  // that policy (and the selftest pins it — importing this file would run the CLI).
+  const exitCode = exitCodeFor(result);
   if (exitCode === 3) {
     log(`[WARN] Review incomplete — ${result.incomplete.join("; ")}`);
     log("Exiting 3: no blocking findings, but the review did not fully run");

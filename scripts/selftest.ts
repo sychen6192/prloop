@@ -132,6 +132,7 @@ import { parseContextTokensByModel } from "../config";
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 
 function check(name: string, cond: boolean, detail?: string) {
   if (cond) {
@@ -141,6 +142,18 @@ function check(name: string, cond: boolean, detail?: string) {
     failed++;
     console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
   }
+}
+
+/**
+ * An assertion this environment cannot settle — a missing tool, a sandbox that refuses
+ * process-group signals. Counted apart from both columns on purpose: reporting an
+ * environment restriction as a failure trains everyone to read a red suite as normal, and
+ * a suite that is always red proves nothing when it goes red for a real reason.
+ * The condition is always probed, never assumed, and the reason is printed.
+ */
+function skip(name: string, reason: string) {
+  skipped++;
+  console.log(`  [SKIP] ${name} — ${reason}`);
 }
 
 function eq<T>(name: string, actual: T, expected: T) {
@@ -2271,10 +2284,48 @@ section("killing the process tree on timeout");
         return false;
       }
     };
+    const reap = (pid: number) => {
+      if (pid > 0 && alive(pid)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    };
+
+    // Reaping a grandchild needs the OS to actually deliver a signal to the process GROUP,
+    // and a sandboxed container may refuse to — which is an environment restriction, not a
+    // bug in killTree. Probed with a raw process.kill on the group, deliberately NOT through
+    // killTree: using the code under test as its own environment probe would turn a killTree
+    // that stopped working into a silent skip.
+    const probe = spawnChild("sh", ["-c", "sleep 30 & echo $!; wait"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      detached: true,
+    });
+    const probeGrandchild = await new Promise<number>((res) => {
+      probe.stdout.setEncoding("utf8");
+      probe.stdout.once("data", (d: string) => res(Number(d.trim())));
+    });
+    try {
+      // Guarded: process.kill(-0) would signal OUR OWN process group, i.e. the selftest.
+      if (probe.pid !== undefined && probe.pid > 0) process.kill(-probe.pid, "SIGKILL");
+    } catch {
+      /* EPERM/ESRCH: group signals are not available here at all */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    const groupSignalsDelivered = !alive(probeGrandchild);
+    reap(probe.pid ?? 0);
+    reap(probeGrandchild);
+
     check("precondition: the grandchild is running", alive(grandchild));
     killTree(wrapper, "SIGKILL");
     await new Promise((r) => setTimeout(r, 300));
-    check("killTree reaps the grandchild too", !alive(grandchild));
+    if (groupSignalsDelivered) {
+      check("killTree reaps the grandchild too", !alive(grandchild));
+    } else {
+      skip("killTree reaps the grandchild too", "this environment does not deliver process-group signals");
+    }
     check("killTree reaps the wrapper", wrapper.exitCode !== null || wrapper.signalCode !== null);
     check("killTree on an already-dead process does not throw", (() => {
       try {
@@ -2284,6 +2335,9 @@ section("killing the process tree on timeout");
         return false;
       }
     })());
+    // Whatever survived the group signal is ours to clean up: a leaked `sleep 30` outlives
+    // the selftest and holds the container busy long after it printed its result.
+    reap(grandchild);
   }
 }
 
@@ -3570,7 +3624,7 @@ section("static-tool subprocesses: the timeout kills the tree, not just the chil
     if (groupSignalsDelivered) {
       check("the grandchild is reaped along with the tree", !alive(grandchild));
     } else {
-      console.log("  [SKIP] grandchild reaping — this environment does not deliver process-group signals");
+      skip("the grandchild is reaped along with the tree", "this environment does not deliver process-group signals");
     }
     for (const pid of [grandchild, probeGrandchild]) {
       if (pid > 0 && alive(pid)) {
@@ -3663,7 +3717,7 @@ section("CLI entry points");
     }
   }
   if (tsxCli === undefined) {
-    console.log("  [SKIP] --help exit status — no installed tsx CLI found to run loop.ts with");
+    skip("--help exit status", "no installed tsx CLI found to run loop.ts with");
   } else {
     const helped = spawnSync(process.execPath, [tsxCli, path.join(PRLOOP_ROOT, "loop.ts"), "--help"], {
       encoding: "utf8",
@@ -4403,5 +4457,5 @@ section("redaction: credentials hidden inside a URL");
   eq("prose with a colon survives", redactSecrets("see //note: this"), "see //note: this");
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
+console.log(`\nResult: ${passed} passed, ${failed} failed${skipped > 0 ? `, ${skipped} skipped` : ""}`);
 process.exit(failed > 0 ? 1 : 0);

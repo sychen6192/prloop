@@ -62,6 +62,20 @@ interface OpenAIUsage {
   completion_tokens?: number;
 }
 
+/**
+ * Usage as ChatResponse spells it, or nothing when the endpoint reported none.
+ *
+ * Spread rather than assigned so an absent count stays ABSENT: a `promptTokens: undefined`
+ * key reaches calls.jsonl as an explicit "no counts", which is a different claim from a
+ * backend that never sends usage at all.
+ */
+function usageOf(usage: OpenAIUsage | undefined): Pick<ChatResponse, "promptTokens" | "completionTokens"> {
+  return {
+    ...(usage?.prompt_tokens !== undefined ? { promptTokens: usage.prompt_tokens } : {}),
+    ...(usage?.completion_tokens !== undefined ? { completionTokens: usage.completion_tokens } : {}),
+  };
+}
+
 interface OpenAIResponse {
   choices?: OpenAIChoice[];
   usage?: OpenAIUsage;
@@ -465,7 +479,11 @@ export class OpenAICompatRunner implements ModelRunner {
     const reasoned = (choice?.message?.reasoning ?? choice?.message?.reasoning_content ?? "").length;
 
     const bad = describeBadCompletion(choice, req.maxTokens ?? LLM_MAX_TOKENS);
-    if (bad) return { text: content, model: req.model, error: bad };
+    // The usage rides along even on the failure: this response ARRIVED, so the endpoint
+    // billed for it — and a completion truncated at the token limit is the most expensive
+    // failure there is. Dropping its counts made the one call that spent a full budget the
+    // one call that looked free, and withRetries' summation had nothing to sum.
+    if (bad) return { text: content, model: req.model, error: bad, ...usageOf(parsed.usage) };
     return this.accept(req, started, content, reasoned, parsed.usage, false);
   }
 
@@ -530,7 +548,9 @@ export class OpenAICompatRunner implements ModelRunner {
       // other transport failure; shape-class failures (truncation) keep the partial
       // content, like the buffered path.
       const transport = acc.streamError !== undefined || (!acc.done && acc.finishReason === undefined);
-      return { text: transport ? "" : acc.content, model: req.model, error: bad };
+      // Same rule as the buffered path: whatever the stats chunk had already reported was
+      // billed, whether or not the stream then died.
+      return { text: transport ? "" : acc.content, model: req.model, error: bad, ...usageOf(acc.usage) };
     }
     return this.accept(req, started, acc.content, acc.reasoningChars, acc.usage, true);
   }

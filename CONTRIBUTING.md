@@ -11,17 +11,35 @@ rejected, with reasons.
 ## Before every commit
 
 ```bash
-npm run check     # typecheck + both offline selftests
+npm run check     # typecheck + every offline selftest
 ```
 
-No test needs ADO credentials or a model endpoint; everything is offline. Three nets run, and
-they fail for different reasons: `scripts/selftest.ts` is anchoring and the pipeline — if you
-touched `libs/diff.ts` or `anchoring/locate.ts`, a failure there is a comment landing on the
-wrong line in production; `scripts/selftest-stream.ts` is the SSE transport; and
-`scripts/selftest-docs.ts` pins the claims the documentation makes about the code (an
-undefined symbol in the README's model-call arithmetic, a Node version pinned in two places
-that disagree, a link to a path that was renamed). A doc that has quietly stopped being true
-is the one failure nothing else notices.
+No test needs ADO credentials or a model endpoint; everything is offline. Several nets run, and
+they fail for different reasons:
+
+- `scripts/selftest.ts` — anchoring and the pipeline. If you touched `libs/diff.ts` or
+  `anchoring/locate.ts`, a failure here is a comment landing on the wrong line in production.
+- `scripts/selftest-stream.ts` — SSE assembly and the failure taxonomy around it.
+- `scripts/selftest-runner.ts` — the HTTP model transport, against a fake OpenAI-compatible
+  endpoint: which failures earn a retry, the buffered fallback sticking for the rest of a run,
+  the per-call deadline, and token accounting.
+- `scripts/selftest-publish.ts` — what `publish()` actually WRITES to a PR, against a fake
+  Azure DevOps: the summary edited rather than duplicated, dedupe by fingerprint and by
+  position, a failed post that must not read as a clean review, and a dry run writing nothing.
+- `scripts/selftest-ado.ts` — intake's edges: paged changes, the Task → parent PBI walk-up,
+  and conventions (a sign-in page served with a 200, a 401 that must be reported).
+- `scripts/selftest-cli.ts` — the argument grammar and the exit code, which is the only part
+  of a run CI reads.
+- `scripts/selftest-docs.ts` — the claims the documentation makes about the code (an undefined
+  symbol in the README's model-call arithmetic, a Node version pinned in two places that
+  disagree, a link to a path that was renamed, a selftest nobody runs). A doc that has quietly
+  stopped being true is the one failure nothing else notices.
+
+The runner, publish and ADO nets drive the real code against fake servers in `scripts/fakes/`,
+built from `node:http` and plain objects — test infrastructure, never a dependency. If you add
+one: bind port 0, never a fixed port, and close the server in a `finally`. Add new test files
+rather than growing `selftest.ts`, and wire them into `npm run check` (`selftest-docs.ts` fails
+if you forget).
 
 There is no build step. `tsx` runs the TypeScript directly and `tsc --noEmit` is typecheck
 only, so nothing is compiled and nothing is published.

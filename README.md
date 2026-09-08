@@ -433,6 +433,13 @@ still yields a report. Pass a directory to point it somewhere other than `PRR_RU
 `libs/diff.ts` or `anchoring/locate.ts`**. Its assertions map directly onto the causes of
 "comment on the wrong line".
 
+`npm run check` runs it alongside the other nets: the SSE transport (`selftest-stream.ts`), the
+HTTP model transport (`selftest-runner.ts`), what publishing writes to a PR
+(`selftest-publish.ts`), ADO intake's edges (`selftest-ado.ts`), the CLI's argument grammar and
+exit codes (`selftest-cli.ts`), and the claims the documentation makes about the code
+(`selftest-docs.ts`). The three that talk to a network drive the real code against fake
+`node:http` servers in `scripts/fakes/` — no credentials, no endpoint, no fixed ports.
+
 `fixtures/seeded-pr.ts` is a realistic 3-language PR with seeded defects, every expected line
 verified against the real file with `grep -n`. It pins four boundaries: a duplicated line with
 no context **must be ruled ambiguous rather than guessed**; the same duplicate with differing

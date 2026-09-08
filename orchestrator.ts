@@ -11,7 +11,7 @@ import { fetchRepoConventions } from "./ado/conventions";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
-import { runRequirementGate, toRequirementFindings } from "./gates/requirement";
+import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
 import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
 import { createRunDir } from "./libs/artifacts";
@@ -67,6 +67,23 @@ export function coverageGaps(
   const tooLarge = skipped.filter((s) => s.reason === "too large").length;
   if (tooLarge > 0) out.push(`${tooLarge} files skipped by intake as too large`);
   return out;
+}
+
+/**
+ * The process exit status a finished review earns. Exported for the selftest, and extracted
+ * from loop.ts's main() for the same reason coverageGaps is here: importing loop.ts runs the
+ * CLI, so the one line CI actually acts on could not be asserted at all.
+ *
+ * Either axis can fail the run — an unimplemented requirement is as blocking as a bug — and
+ * a stage that crashed must not exit 0: "nothing blocking was found" and "the check that
+ * would have found it never ran" are different facts, and only one of them justifies a green
+ * gate. Blocking findings win over incompleteness when both are true: 2 is the stronger
+ * statement, and the incomplete stages are named in the log either way.
+ */
+export function exitCodeFor(result: Pick<ReviewRunResult, "agg" | "req" | "incomplete">): 0 | 2 | 3 {
+  const highRisk = result.agg.inline.filter((f) => f.severity === "critical" || f.severity === "high");
+  const unmet = result.req ? unmetCriteria(result.req) : [];
+  return highRisk.length > 0 || unmet.length > 0 ? 2 : result.incomplete.length > 0 ? 3 : 0;
 }
 
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {

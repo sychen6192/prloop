@@ -12,7 +12,7 @@
 //
 // Kept separate from selftest.ts (the anchoring net) and selftest-stream.ts (the transport
 // net) so each can grow without inflating the others. Wired into `npm run check` after both.
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
 
@@ -83,6 +83,20 @@ console.log("\nStated versions match the ones that ship");
   const hardcoded = /prloop\/\d/.exec(trouble);
   check("no doc pins a literal prloop/<number> User-Agent", hardcoded === null, hardcoded?.[0]);
   check("libs/proxy.ts still derives it from the package version", read("libs/proxy.ts").includes("`prloop/${pkgVersion}`"));
+}
+
+console.log("\nEvery net is actually run");
+{
+  // A selftest nobody runs is worse than no selftest: it is a green `npm run check` with a
+  // whole module's regression net sitting unexecuted next to it. The nets are separate files
+  // on purpose (each can grow without inflating the others), which is exactly what makes
+  // forgetting to wire one up easy and invisible.
+  const scripts = Object.values(pkg.scripts ?? {}).join(" ");
+  for (const file of readdirSync(path.join(root, "scripts")).sort()) {
+    if (!/^selftest.*\.ts$/.test(file)) continue;
+    check(`scripts/${file} is wired into npm run check`, scripts.includes(`scripts/${file}`));
+  }
+  check("...and check runs the whole set", (pkg.scripts?.["check"] ?? "").includes("npm run selftest"));
 }
 
 console.log("\nEntry points the selftests cannot reach");

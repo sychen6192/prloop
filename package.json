@@ -8,8 +8,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "selftest": "tsx scripts/selftest.ts && tsx scripts/selftest-stream.ts",
-    "check": "tsc --noEmit && tsx scripts/selftest.ts && tsx scripts/selftest-stream.ts && tsx scripts/selftest-docs.ts",
+    "selftest": "tsx scripts/selftest.ts && tsx scripts/selftest-stream.ts && tsx scripts/selftest-runner.ts && tsx scripts/selftest-publish.ts && tsx scripts/selftest-ado.ts && tsx scripts/selftest-cli.ts && tsx scripts/selftest-docs.ts",
+    "check": "tsc --noEmit && npm run selftest",
     "doctor": "tsx scripts/doctor.ts",
     "probe": "tsx scripts/probe.ts",
     "tlsfix": "tsx scripts/tlsfix.ts",

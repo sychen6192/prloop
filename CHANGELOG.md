@@ -44,8 +44,11 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   model output, skeptic verdicts, anchoring outcomes, `run.log`, `calls.jsonl`, `result.json`,
   and `config.json` recording where every setting's value came from.
 - `prloop --config` / `PRR_SHOW_CONFIG`: every setting, its value, and its source.
-- Offline selftests for anchoring, the pipeline and the SSE transport; `scripts/demo.ts` and
-  `scripts/local-review.ts` for running without ADO credentials or a model endpoint.
+- Offline selftests for anchoring, the pipeline, the SSE transport, the HTTP model transport,
+  publishing, ADO intake, and the CLI's argument grammar and exit codes — the last four driven
+  against fake OpenAI-compatible and Azure DevOps servers (`scripts/fakes/`, `node:http` and
+  plain objects) so the side-effecting paths are covered, not just their pure helpers.
+  `scripts/demo.ts` and `scripts/local-review.ts` run without ADO credentials or a model endpoint.
 
 ### Changed
 
@@ -74,6 +77,10 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   and linters never run over a `PRR_WORKDIR` that is not the code under review.
 - Raw control characters inside JSON string literals are repaired instead of failing the parse.
 - Truncated and reasoning-only completions are named as themselves, not as unparseable output.
+- Token accounting no longer loses the usage of a completion that arrived but was unusable. A
+  truncated response is the most expensive failure there is — the endpoint billed a full
+  budget for it — and it was the one call that reported nothing, so a retrying run looked
+  cheaper than it was and a truncated one looked free.
 - The opencode runner works on Windows, receives its prompt over stdin rather than argv, and
   has its whole process tree killed on timeout.
 - Certificate handling: a leaf certificate is no longer exported as if it were a CA, the missing
