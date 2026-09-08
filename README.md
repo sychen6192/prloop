@@ -203,6 +203,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_SKEPTIC_MODELS` | — | empty = no verification runs |
 | `PRR_SKEPTIC_ROUNDS` | `1` | 3 gives a majority vote worth the name |
 | `PRR_MAX_SKEPTIC_FINDINGS` | `30` | fan-out ceiling; worst findings verified first, overflow logged |
+| `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |
 | `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size |
 | `PRR_LLM_RETRIES` | `1` | retries on transient model failures (never on 4xx) |
