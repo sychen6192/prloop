@@ -47,6 +47,47 @@ function extractBalanced(raw: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Escapes raw control characters that sit INSIDE string literals — a literal newline or
+ * tab where JSON demands `\\n` / `\\t`. Lossless: outside strings nothing changes, and
+ * inside one a raw newline can only ever have meant the escape (the grammar has no other
+ * reading), so the parsed value is exactly what the model wrote.
+ *
+ * Why this exists: without engine-level guided decoding (PRR_LLM_STRUCTURED=0, or a
+ * backend that cannot enforce a schema) a model hand-writing JSON puts real newlines into
+ * multi-line `quote` and `suggested_fix` values. Seen live on Claude through a gateway:
+ * "Bad control character in string literal at position 1848" — one character cost the
+ * finder its entire output. Exported for the selftest.
+ */
+export function escapeControlCharsInStrings(s: string): string {
+  let out = "";
+  let inStr = false;
+  let escaped = false;
+  for (const c of s) {
+    if (inStr) {
+      if (escaped) {
+        escaped = false;
+      } else if (c === "\\") {
+        escaped = true;
+      } else if (c === '"') {
+        inStr = false;
+      } else {
+        const code = c.charCodeAt(0);
+        if (code < 0x20) {
+          out +=
+            c === "\n" ? "\\n" : c === "\r" ? "\\r" : c === "\t" ? "\\t" : c === "\b" ? "\\b" : c === "\f" ? "\\f"
+              : `\\u${code.toString(16).padStart(4, "0")}`;
+          continue;
+        }
+      }
+    } else if (c === '"') {
+      inStr = true;
+    }
+    out += c;
+  }
+  return out;
+}
+
 export function parseJsonObject<T = unknown>(raw: string): ParseResult<T> {
   if (!raw || raw.trim() === "") return { ok: false, error: "model returned an empty string" };
 
@@ -60,7 +101,12 @@ export function parseJsonObject<T = unknown>(raw: string): ParseResult<T> {
   const direct = tryParse<T>(cleaned);
   if (direct.ok) return direct;
 
-  const balanced = extractBalanced(cleaned);
+  // Strictly more accepting, never less: on valid JSON the repair is the identity.
+  const repaired = escapeControlCharsInStrings(cleaned);
+  const repairedDirect = tryParse<T>(repaired);
+  if (repairedDirect.ok) return repairedDirect;
+
+  const balanced = extractBalanced(repaired);
   if (!balanced) return { ok: false, error: "no complete JSON object found in output" };
   return tryParse<T>(balanced);
 }
