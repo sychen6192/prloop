@@ -1,6 +1,10 @@
-// The single deterministic control flow. Models are called at exactly one point (the finder
-// stage); every other decision — what to review, where a finding lives, what gets posted —
-// is made by code here (design principle: the loop never hands control to a model).
+// The single deterministic control flow. Models are consulted at five fixed points — finder
+// fan-out, requirement axis, the requirement axis's dispute pass over its own accusations,
+// the skeptic, and static-analysis triage — and at every one of them a model answers a
+// question and returns. It never chooses the next step: what to review, which stages run,
+// where a finding lives and what gets posted are decided by code here (design principle: the
+// loop never hands control to a model). Adding a sixth call site is fine; adding one whose
+// answer selects the next action is not.
 import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, STRICT_COVERAGE, excludedCategories, isDryRun } from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
 import { fetchRepoConventions } from "./ado/conventions";

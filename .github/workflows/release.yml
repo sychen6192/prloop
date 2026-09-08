@@ -1,0 +1,33 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+# The one workflow that needs write: creating the release is the whole job.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # --generate-notes diffs against the previous tag; a shallow clone has no previous tag.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      # A tag that cannot pass the same check as main is not a release.
+      - run: npm run check
+      # --verify-tag: refuse to invent a release for a tag that is not actually pushed.
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

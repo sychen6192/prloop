@@ -526,7 +526,8 @@ function parseObjectEnv(raw: string | undefined, example: string): Record<string
 // The motivating case: a Qwen3-family finder on vLLM burning its entire token budget on
 // chain of thought — {"chat_template_kwargs":{"enable_thinking":false}} switches thinking
 // off at the engine. Applies to EVERY call (finder, skeptic, requirement, triage alike);
-// per-model behaviour belongs in the endpoint's own per-alias config (LiteLLM extra_body).
+// PRR_LLM_EXTRA_BODY_BY_MODEL overrides it per model, and PRR_REASONING_BY_MODEL says the
+// same thing portably — neither needs the endpoint's own per-alias config any more.
 // On a key conflict prloop's own fields always win — every field prloop manages already
 // has its own PRR_ knob, so a collision is always a mistake.
 export const LLM_EXTRA_BODY: Record<string, unknown> | undefined = (() => {

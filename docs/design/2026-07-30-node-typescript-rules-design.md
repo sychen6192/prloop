@@ -1,7 +1,9 @@
 # TypeScript, Node server, and Playwright review rules
 
 Date: 2026-07-30
-Status: approved, ready for planning
+Status: **implemented** 2026-07-30 in `38ec0f1` (rules/typescript.md, rules/node-server.md,
+rules/playwright.md). Kept as the design record for why those packs are shaped this way;
+the rule files themselves are the current text.
 
 ## Problem
 

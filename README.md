@@ -20,16 +20,19 @@ outer one: re-run per PR iteration with `--since auto`.
 ```
 Step 1  fetch PR changes            ADO REST → blob bytes → Myers diff        0 model calls
 Step 2  ┌ static analysis           linters over PRR_WORKDIR                  0
-        ├ requirement axis          work items vs diff                        1
+        ├ requirement axis          work items vs diff, then a dispute pass   1 + A
+        │                           over its own accusations
         └ code axis                 N finders, same prompt, in parallel       N
-Step 3  anchor → filter → skeptic    quote → line number, then refutation      M×R + 1
+Step 3  anchor → filter → skeptic   quote → line number, then refutation      M×R + T
         → triage                    excluded/dismissed drop before the skeptic
 Step 4  publish                     sticky summary + inline threads           0
 ```
 
-`N` = finder models, `R` = `PRR_SKEPTIC_ROUNDS`, `M` = anchored findings **that survive the
-noise filter** — exclusions and prior dismissals cost no verification tokens. All model calls
-share one concurrency pool (`PRR_LLM_CONCURRENCY`) and retry on transient failures.
+`N` = finder models · `R` = `PRR_SKEPTIC_ROUNDS` · `M` = anchored findings **that survive the
+noise filter** (exclusions and prior dismissals cost no verification tokens) · `A` = criteria
+the requirement axis accused of being `missing` or `misunderstood`, each disputed once ·
+`T` = triage batches, ten tool findings each. All model calls share one concurrency pool
+(`PRR_LLM_CONCURRENCY`) and retry on transient failures.
 
 The requirement axis is not part of the step-2 barrier — its result is only needed at publish
 time, and the gate is non-fatal, so it must not be able to hold the pipeline. Step 3 starts as
@@ -62,6 +65,17 @@ the other's output.
   criteria) and gives each criterion a verdict: `satisfied / missing / partial /
   misunderstood / not-verifiable`, plus out-of-scope changes. It reports *how* it failed, not
   a percentage — a percentage is not actionable.
+
+  It gets **its own verification**, deliberately narrower than the code axis's. The two
+  verdicts that accuse the author — `missing` and `misunderstood` — are refutable claims about
+  the diff, so each gets one attempt from the first skeptic model: one round, not a majority
+  vote, because every call here re-reads the finder-sized diff and is priced like an extra
+  finder. A refutation never flips a verdict to `satisfied`; it demotes it to
+  `not-verifiable` with the refuter's evidence, taking the accusation out of the unmet count
+  while leaving the disagreement visible. `satisfied` — the one verdict that closes a
+  criterion — is held to the same quote contract as a code finding: its evidence quote is
+  anchored in the diff, and a quote that isn't there is demoted too. Same asymmetries as the
+  code skeptic: only downward, and fails open.
 - **Code axis** — 8 categories × 4 severities (`req-mismatch`, the ninth, belongs to the
   requirement axis), severity from an ordered decision chain (key split: is there a
   workaround?) rather than adjectives.
@@ -136,9 +150,13 @@ Needs Node 20+, an OpenAI-compatible endpoint (LiteLLM / vLLM / Ollama `/v1`), a
 either a PAT with **Code (Read & Write) + Work Items (Read)** (the requirement axis reads the
 linked work item, and a Code-only PAT fails there), or just `az login`.
 
+**Not on npm.** Clone it and run it in place — there is no build step: `tsx` executes the
+TypeScript directly and `tsc --noEmit` is typecheck-only, so nothing is ever compiled or
+published. `npm ci` (dev dependencies included) is what installs `tsx`.
+
 ```bash
 git clone <repo> prloop && cd prloop
-npm install
+npm ci
 cp .env.example .env
 npm run check                                  # typecheck + offline selftest (count printed by the run)
 npx tsx scripts/doctor.ts '<PR URL>' --smoke   # preflight + one live model call
@@ -255,7 +273,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_MAX_SKEPTIC_FINDINGS` | `30` | fan-out ceiling; worst findings verified first, overflow logged |
 | `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |
-| `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size |
+| `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size. `0` = no cap |
 | `PRR_LLM_RETRIES` | `1` | **EXTRA** attempts on transient model failures — `1` = up to two calls, `0` = never retry (never on 4xx) |
 | `PRR_LLM_MAX_TOKENS` | `8192` | **raise to 16384+ for thinking models** — reasoning is billed to this budget |
 | `PRR_LLM_STREAM` | `1` | stream completions (SSE) so a gateway's idle timeout can't 504 a long generation; `0` = buffered |
@@ -430,5 +448,11 @@ M1–M6 complete: REST + quote anchoring → requirement axis → multi-model ad
 verification → rules + static analysis → incremental review and comment lifecycle →
 dismissal learnings and category exclusions.
 Runs end-to-end on real PRs.
+
+## Contributing
+
+[CONTRIBUTING.md](./CONTRIBUTING.md) — invariants, the four places a new knob lives, and how to
+run a review with no ADO credentials. [SECURITY.md](./SECURITY.md) covers what the tool handles
+and how to report a vulnerability privately; [CHANGELOG.md](./CHANGELOG.md) is the history.
 
 MIT.

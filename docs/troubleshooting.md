@@ -67,8 +67,8 @@ probe flags this.
   looks like "this host is blocked", but the host is fine — the client identity is what got rejected.
 
   Section 4b of `probe` tests five header combinations and tells you which one this proxy allows. prloop
-  honestly sends `prloop/0.1` by default; if your proxy only allows specific strings, it's your call
-  whether to play along:
+  honestly sends `prloop/<version>` by default, reading the version out of `package.json` at startup; if
+  your proxy only allows specific strings, it's your call whether to play along:
   ```bash
   export PRR_USER_AGENT="git/2.34.1"
   ```
@@ -195,8 +195,11 @@ probe flags this.
   - Or switch thinking off at the engine for every call:
     `PRR_LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}` (vLLM / Qwen3 syntax; note it
     applies to the skeptic too).
-  - To disable thinking for the finders while keeping it on the skeptic, do it per alias in the
-    endpoint's own config (e.g. LiteLLM `extra_body` on the finder alias) instead.
+  - To disable thinking for the finders while keeping it on the skeptic, do it per model —
+    `PRR_REASONING_BY_MODEL={"qwen3-coder":"none","claude-sonnet":"medium"}` is the portable
+    spelling, `PRR_LLM_EXTRA_BODY_BY_MODEL={"coder":{},"architect":{}}` the engine-level one
+    (an entry replaces the global for that model; `{}` sends nothing). Neither needs a
+    per-alias endpoint config.
 - **`HTTP 400` naming the schema — `output_config.format.schema`, `json_schema`, "not supported", or a
   keyword like `minimum` / `maxItems`.** The backend enforces a narrower JSON Schema dialect than the one
   that validated the request in front of it (seen live: LiteLLM → Bedrock, which rejects numeric ranges).

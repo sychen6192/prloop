@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a change to what prloop reviews, reports or exposes as a knob.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read the load-bearing invariants in `CLAUDE.md` first. Several
+        plausible-sounding features are deliberately absent — a model deciding control flow,
+        the two axes sharing a budget, the skeptic raising severity, prloop editing its own
+        config — and PROPOSAL.md §10 lists options already rejected, with reasons.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The review outcome you got, and the one you wanted
+      description: >-
+        Start from a real PR, not from the feature. "Findings in category X are always noise
+        here" is actionable; "add a config option" is not.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: >-
+        If it is a new knob: which of the four places it lands in (config.ts KNOWN_KEYS,
+        .env.example, the README table, and the code that reads it — all four or none).
+        If it is a new stage or gate: which existing gate could not be made to do it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Which invariant it touches, if any
+      description: >-
+        Deterministic control loop, quote-only anchoring, the two blind axes, the skeptic
+        asymmetries, config SSOT, one runtime dependency. Say so plainly — a proposal that
+        needs one relaxed is worth discussing, one that quietly breaks it is not.

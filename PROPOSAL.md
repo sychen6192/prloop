@@ -331,6 +331,10 @@ files must cover them explicitly.
 
 ## 8. Project Structure (one size up from the prior tool, same philosophy)
 
+> **Historical.** This is the tree as designed, kept as the design record. It is not the
+> current one — several files here were never written under these names, and others were
+> split since. `CLAUDE.md`'s layout table and the repository itself are the live answer.
+
 ```
 prloop/
   loop.ts                 # entry: argument validation, startup guard, runs/ creation

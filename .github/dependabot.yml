@@ -1,0 +1,20 @@
+version: 2
+# One runtime dependency and a three-package dev toolchain. Weekly bumps on that surface are
+# noise; grouping keeps a round of updates to one PR, which runs the matrix once instead of
+# four times.
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
