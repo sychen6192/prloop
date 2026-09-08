@@ -32,9 +32,53 @@ import { log, logVerbose, startHeartbeat } from "../libs/log";
 import { inlineSchema } from "./schemas";
 import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
 
-interface Acc {
+export interface Acc {
   text: string;
   lastText: string;
+  // The last in-band error event's message: the CLI's own account of why a run produced
+  // nothing (provider auth, rate limit), which its exit code alone does not carry.
+  lastError?: string;
+}
+
+/** First `message` string in an error event, wherever this CLI version nested it. */
+function errorMessage(node: unknown, depth = 0): string | undefined {
+  if (typeof node !== "object" || node === null || depth > 4) return undefined;
+  const o = node as Record<string, unknown>;
+  if (typeof o["message"] === "string" && o["message"].trim()) return o["message"].trim();
+  for (const v of Object.values(o)) {
+    const m = errorMessage(v, depth + 1);
+    if (m) return m;
+  }
+  return undefined;
+}
+
+/**
+ * The error a finished opencode run reports, or undefined for a completion the caller's
+ * parse should judge. Exported for the selftest.
+ *
+ * A timed-out or crashed run used to resolve `{ text, model }` with no error at all, so the
+ * failure surfaced two stages later as "output unparseable" or "model returned an empty
+ * string" — deterministic-looking failures the transient retry deliberately never fires
+ * on. Naming the real cause here is what lets the retry, and the operator, act on it.
+ * `text` still travels alongside: the artifacts want the partial output, and the caller's
+ * parse is fail-closed regardless.
+ */
+export function runFailure(run: {
+  timedOut: boolean;
+  timeoutMs: number;
+  code: number | null;
+  signal: string | null;
+  lastError?: string;
+  text: string;
+}): string | undefined {
+  const detail = run.lastError ? `: ${run.lastError}` : "";
+  if (run.timedOut) return `timeout (${run.timeoutMs}ms)${detail}`;
+  // The CLI produced an answer; a non-zero exit next to real output (a warning treated as
+  // fatal at shutdown, say) is for the schema parse to judge, not for this to discard.
+  if (run.text.trim()) return undefined;
+  if (run.code !== null && run.code !== 0) return `opencode exited ${run.code}${detail}`;
+  if (run.signal) return `opencode killed by ${run.signal}${detail}`;
+  return run.lastError;
 }
 
 // Parses one JSONL event. The real event kind lives in part.type (hyphenated); the outer
@@ -64,6 +108,7 @@ export function traceEvent(line: string, prefix: string, acc: Acc): void {
       logVerbose(`${prefix} -- step finished (output tokens=${String(tokens["output"])})`);
     }
   } else if (kind === "error") {
+    acc.lastError = errorMessage(ev) ?? JSON.stringify(ev).slice(0, 300);
     logVerbose(`${prefix} [WARN] ${JSON.stringify(ev).slice(0, 300)}`);
   }
 }
@@ -189,6 +234,15 @@ function runOnce(label: string, model: string, prompt: string): Promise<ChatResp
       }
     }, AGENT_TIMEOUT_MS);
 
+    // How the child ended, for the failure message. Recorded from whichever of 'exit' and
+    // 'close' fires first; both carry the same pair.
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    const recordExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      exitCode = code;
+      exitSignal = signal;
+    };
+
     let finished = false;
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
     const finish = () => {
@@ -206,14 +260,25 @@ function runOnce(label: string, model: string, prompt: string): Promise<ChatResp
         resolve({ text: "", model, error: spawnError });
         return;
       }
-      // A killed run is not a completed one; say so, but still hand back what arrived — the
-      // caller's schema parse is fail-closed and decides whether the partial output is usable.
+      // A killed or crashed run is not a completed one: it resolves WITH an error (so the
+      // transient retry can fire and the stage is reported as failed) and still hands back
+      // what arrived, for the artifacts.
+      const error = runFailure({
+        timedOut,
+        timeoutMs: AGENT_TIMEOUT_MS,
+        code: exitCode,
+        signal: exitSignal,
+        lastError: acc.lastError,
+        text,
+      });
       log(
         timedOut
           ? `[${label}] timed out (elapsed ${secs}s, ${text.length} chars kept)`
-          : `[${label}] done (elapsed ${secs}s, ${text.length} chars)`,
+          : error
+            ? `[${label}] [FAIL] ${error} (elapsed ${secs}s)`
+            : `[${label}] done (elapsed ${secs}s, ${text.length} chars)`,
       );
-      resolve({ text, model });
+      resolve(error === undefined ? { text, model } : { text, model, error });
     };
 
     // 'close' waits for the stdio pipes to close as well as for the process to exit, so any
@@ -221,13 +286,17 @@ function runOnce(label: string, model: string, prompt: string): Promise<ChatResp
     // Windows timeout into a permanent hang. 'exit' always fires; let the pipes drain briefly,
     // then finish regardless. finish() is idempotent, so the usual ordering ('close' first,
     // promptly) is unaffected.
-    child.on("exit", () => {
+    child.on("exit", (code, signal) => {
+      recordExit(code, signal);
       drainTimer = setTimeout(() => {
         logVerbose(`[${label}] process exited but its output pipes are still open; not waiting`);
         finish();
       }, EXIT_DRAIN_MS);
     });
-    child.on("close", finish);
+    child.on("close", (code, signal) => {
+      recordExit(code, signal);
+      finish();
+    });
     child.on("error", (err) => {
       // The old message blamed a missing install for every errno, which is wrong for the
       // two failures that actually bite on Windows (EINVAL on a .cmd, and an oversized

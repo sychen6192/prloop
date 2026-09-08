@@ -217,6 +217,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_EXCLUDE_CATEGORIES` | — | categories never reported (e.g. `performance,maintainability`) |
 | `PRR_LEARN_FROM_DISMISSALS` | `1` | `0` = re-post findings humans dismissed as wontFix/byDesign |
 | `PRR_REQUIRE_CORROBORATION` | `1` | `0` publishes unverified single-source findings |
+| `PRR_STRICT_COVERAGE` | `1` | files the finder never saw (over `PRR_MAX_DIFF_CHARS`, or too large to fetch) make the run incomplete (exit 3); `0` = a partial review can still exit 0 |
 | `PRR_WORKDIR` | — | checkout at the iteration's `sourceRefCommit`; unset = static analysis skips. Files whose content differs from the iteration under review are skipped, not analysed |
 | `PRR_TRIAGE_MODEL` | — | unset = high-FP tool findings are dropped |
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |

@@ -201,6 +201,13 @@ export const HUNK_CONTEXT_BEFORE = numEnv("PRR_HUNK_CONTEXT_BEFORE", 6);
 export const HUNK_CONTEXT_AFTER = numEnv("PRR_HUNK_CONTEXT_AFTER", 3);
 // Files bigger than this are diffed but never sent whole.
 export const MAX_FILE_BYTES = numEnv("PRR_MAX_FILE_BYTES", 2_000_000, 1);
+// Files the finder never saw make the review incomplete (exit 3): one left out of the
+// finder context because the diff ran past PRR_MAX_DIFF_CHARS, or skipped by intake as
+// too large to fetch, was not reviewed — and a run that read 30 of 31 files used to exit
+// 0 as though it had read all 31. "Nothing found" and "never looked" are different facts;
+// only one of them justifies a green gate. 0 = a partial review may still pass. Binary
+// files are never counted: there is nothing in them to review.
+export const STRICT_COVERAGE = process.env.PRR_STRICT_COVERAGE !== "0";
 
 // --- Adversarial verification (M3) ---
 // Skeptics should be a DIFFERENT model family from the finders. Same-family verifiers share

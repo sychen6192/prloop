@@ -176,9 +176,29 @@ export async function runSkeptic(
 }
 
 /**
- * Applies surviving verdicts back onto findings: a skeptic that accepts a finding but argues
- * the severity was inflated gets to lower it (never raise it — the finder owns the ceiling,
- * and letting a verifier escalate reintroduces the agreeableness it exists to counter).
+ * The severity a finding ends up with after its verifiers voted. Exported for the selftest.
+ *
+ * Each answered verdict is one vote: its suggested severity, or the current severity when
+ * it suggested none (accepting the finding as rated is a vote for that rating). The median
+ * vote wins, and only when it is milder than the current severity — a verifier may lower,
+ * never raise. Previously the mildest suggestion from ANY verdict won outright, so in a
+ * three-round setup one dissenting "low" outvoted two verifiers who agreed with the finder,
+ * while killing the same finding would have taken a majority. An even count takes the more
+ * severe of the two middle votes, so a tie never downgrades; a single verifier is the whole
+ * electorate and its suggestion stands.
+ */
+export function votedSeverity(current: Severity, votes: Array<Severity | undefined>): Severity {
+  if (votes.length === 0) return current;
+  const ranks = votes.map((v) => severityRank(v ?? current)).sort((a, b) => a - b);
+  const median = ranks.length % 2 === 1 ? ranks[(ranks.length - 1) / 2]! : ranks[ranks.length / 2 - 1]!;
+  return median > severityRank(current) ? SEVERITIES[median]! : current;
+}
+
+/**
+ * Applies surviving verdicts back onto findings: a skeptic majority that accepts a finding
+ * but argues the severity was inflated gets to lower it (never raise it — the finder owns
+ * the ceiling, and letting a verifier escalate reintroduces the agreeableness it exists to
+ * counter). Majority, not any single voice: see votedSeverity.
  */
 export function applyVerdicts(outcomes: SkepticOutcome[]): AnchoredFinding[] {
   const survivors: AnchoredFinding[] = [];
@@ -191,13 +211,13 @@ export function applyVerdicts(outcomes: SkepticOutcome[]): AnchoredFinding[] {
     f.skepticVerdicts = answered.filter((v) => !v.refuted).length;
     f.skepticRefuted = answered.filter((v) => v.refuted).length;
 
-    const downgrades = answered
-      .map((v) => v.suggestedSeverity)
-      .filter((s): s is Severity => s !== undefined && severityRank(s) > severityRank(f.severity));
-    if (downgrades.length > 0) {
-      const mildest = downgrades.reduce((a, b) => (severityRank(a) > severityRank(b) ? a : b));
-      logVerbose(`  severity downgraded: ${f.file}:${f.anchor?.startLine} ${f.severity} → ${mildest}`);
-      f.severity = mildest;
+    const voted = votedSeverity(f.severity, answered.map((v) => v.suggestedSeverity));
+    if (voted !== f.severity) {
+      logVerbose(
+        `  severity downgraded: ${f.file}:${f.anchor?.startLine} ${f.severity} → ${voted} ` +
+          `(median of ${answered.length} verdicts)`,
+      );
+      f.severity = voted;
     }
     survivors.push(f);
   }

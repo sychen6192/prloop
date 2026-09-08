@@ -76,6 +76,10 @@ export function renderFindingComment(f: AnchoredFinding): string {
   const conf = Math.round(f.confidence * 100);
   const bits: string[] = [`confidence ${conf}%`];
   bits.push(f.sources.length > 1 ? `found independently by ${f.sources.length} models` : f.sources[0] ?? "");
+  // Named so the reader knows the line was busy, worded so it cannot be read as agreement.
+  if (f.overlapping?.length) {
+    bits.push(`${f.overlapping.join(", ")} flagged these lines with a different claim (not counted as corroboration)`);
+  }
   if (f.skepticVerdicts) {
     bits.push(
       f.skepticRefuted
@@ -208,7 +212,10 @@ export function renderSummary(input: SummaryInput): string {
     lines.push(detailsOpen(`Other findings, not commented (${agg.belowBar.length})`), "");
     for (const f of agg.belowBar) {
       const loc = f.anchor ? `${f.file}:${f.anchor.startLine}` : f.file;
-      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}`, `  <sub>${SUPPRESSED_LABEL[f.suppressedBy ?? ""] ?? "below the reporting threshold"}</sub>`);
+      const overlap = f.overlapping?.length
+        ? `; ${f.overlapping.join(", ")} flagged the same lines with a different claim`
+        : "";
+      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}`, `  <sub>${SUPPRESSED_LABEL[f.suppressedBy ?? ""] ?? "below the reporting threshold"}${overlap}</sub>`);
     }
     lines.push("", "</details>", "");
   }

@@ -180,6 +180,15 @@ export interface Anchor {
 export interface AnchoredFinding extends RawFinding {
   // Which model produced it (M3: how many independently did).
   sources: string[];
+  // Models whose finding shared these lines but made a DIFFERENT claim (findingsAgree in
+  // gates/aggregate.ts). Kept apart from `sources` so the summary can say the line was
+  // busy without the consensus gate reading "someone else said something here" as
+  // "someone else found this bug".
+  overlapping?: string[];
+  // Static-tool findings only: the tier of the tool that produced it. Decides whether a
+  // merge may raise a model finding's severity (mergeInto) — a triage-tier tool rating an
+  // error-level lint rule "high" is a policy, not a measurement of impact.
+  tier?: "fact" | "triage";
   anchor?: Anchor;
   anchorFailure?: AnchorFailure;
   // Stable identity across pushes, for dedup against already-posted threads.
@@ -213,7 +222,9 @@ export interface ChatResponse {
   model: string;
   promptTokens?: number;
   completionTokens?: number;
-  // Set when the call failed after retries; text is then empty.
+  // Set when the call failed after retries. `text` is usually empty, but a call that died
+  // mid-output (a truncated completion, a timed-out CLI run) keeps what arrived so the
+  // artifacts show it — the pair is still a failure, never an answer to parse.
   error?: string;
 }
 

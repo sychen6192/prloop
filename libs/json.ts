@@ -88,6 +88,19 @@ export function escapeControlCharsInStrings(s: string): string {
   return out;
 }
 
+/**
+ * The array under `key` of a parsed object, or undefined when there is none — a top-level
+ * array, a scalar, or an object keyed some other way. Callers treat undefined as an error,
+ * never as an empty list: "the model listed nothing" and "the model answered in a shape we
+ * did not ask for" look identical once both become `[]`, and only the first is a clean
+ * result.
+ */
+export function arrayField(value: unknown, key: string): unknown[] | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const v = (value as Record<string, unknown>)[key];
+  return Array.isArray(v) ? v : undefined;
+}
+
 export function parseJsonObject<T = unknown>(raw: string): ParseResult<T> {
   if (!raw || raw.trim() === "") return { ok: false, error: "model returned an empty string" };
 

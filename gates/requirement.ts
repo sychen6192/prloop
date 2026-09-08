@@ -103,6 +103,8 @@ export interface RequirementGateInput {
   ref: PrRef;
   pr: PrInfo;
   files: FileDiff[];
+  // Anchors the evidence quote behind every "satisfied" verdict (verifySatisfiedEvidence).
+  fileIndex: FileIndex;
   runner: ModelRunner;
 }
 
@@ -198,6 +200,10 @@ export async function runRequirementGate(
     .slice(0, MAX_EXTRAS);
 
   await disputeAccusations(input, criteria);
+  const demoted = verifySatisfiedEvidence(criteria, input.fileIndex);
+  if (demoted > 0) {
+    log(`requirement axis: ${demoted} satisfied verdicts demoted → not-verifiable (evidence quote not found in the diff)`);
+  }
 
   const counts = new Map<string, number>();
   for (const c of criteria) counts.set(c.verdict, (counts.get(c.verdict) ?? 0) + 1);
@@ -218,8 +224,9 @@ export async function runRequirementGate(
  *
  * One round, first skeptic model only — deliberately narrower than the code axis's
  * majority vote: every call here re-reads the finder-sized diff payload, so rounds are
- * priced like extra finders, not like 25-line verdicts. "partial" and "satisfied" are not
- * verified: partial names its own gap with a quote, satisfied is anchored downstream.
+ * priced like extra finders, not like 25-line verdicts. "partial" and "satisfied" get no
+ * skeptic: partial names its own gap with a quote, and satisfied must anchor its evidence
+ * quote in the diff (verifySatisfiedEvidence, right after this pass).
  *
  * Same asymmetries as the code skeptic: fails open (an unanswered challenge changes
  * nothing), and a refutation never flips a verdict to satisfied — it demotes it to
@@ -269,6 +276,48 @@ export function applyReqSkepticVerdicts(accused: CriterionCheck[], verdicts: Ver
     disputed++;
   }
   return disputed;
+}
+
+export const UNVERIFIED_SATISFIED_NOTE = "claimed satisfied, but the evidence quote was not found in the diff";
+
+/**
+ * Holds every "satisfied" verdict to the same quote contract as a code finding, in place.
+ * Returns how many were demoted. Exported for the selftest.
+ *
+ * "satisfied" is the one verdict that closes a criterion, and it was the one verdict
+ * nothing checked: accusations get a skeptic, "partial" names its own gap with a quote,
+ * but a satisfied verdict's quote was never anchored — the comment above used to say it
+ * was "anchored downstream", and downstream only ever anchored the unmet ones. A model
+ * that hallucinated the implementing line, or cited none, closed the criterion anyway,
+ * and the summary read "all criteria implemented". Now the quote must locate in the diff;
+ * otherwise the verdict demotes to not-verifiable, which keeps the criterion out of the
+ * all-implemented verdict without turning a missing quote into an accusation.
+ */
+export function verifySatisfiedEvidence(criteria: CriterionCheck[], index: FileIndex): number {
+  let demoted = 0;
+  for (const c of criteria) {
+    if (c.verdict !== "satisfied") continue;
+    const quote = c.quote ?? "";
+    const anchored =
+      quote.trim() !== "" &&
+      anchorFinding(
+        {
+          category: "req-mismatch",
+          severity: "low",
+          confidence: 1,
+          file: c.file ?? "",
+          quote,
+          side: "right",
+          claim: c.criterion,
+        },
+        index,
+      ).anchor !== undefined;
+    if (anchored) continue;
+    c.verdict = "not-verifiable";
+    c.note = `${UNVERIFIED_SATISFIED_NOTE}${c.note ? ` — original note: ${c.note}` : ""}`;
+    demoted++;
+  }
+  return demoted;
 }
 
 /** Verdicts that mean the PR does not yet do what was asked. */

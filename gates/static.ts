@@ -24,7 +24,7 @@ import {
 } from "../config";
 import { splitLines } from "../ado/blobs";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
-import { parseJsonObject } from "../libs/json";
+import { arrayField, parseJsonObject } from "../libs/json";
 import { log, logVerbose } from "../libs/log";
 import { commandExists, run } from "../libs/shell";
 import { filesForProfile, selectProfiles } from "../profiles";
@@ -476,19 +476,62 @@ export async function runStaticGate(
   return { facts, needsTriage, suppressedCount, ranTools, skipped, staleFiles: stale, unresolved };
 }
 
+export interface TriageVerdict {
+  keep: boolean;
+  reason: string;
+  severity?: Severity;
+}
+
+/**
+ * Parses the triage model's answer into per-index verdicts. Exported for the selftest.
+ *
+ * Fails closed with a NAMED error: unparseable text and a parseable object with no
+ * `results` array are different failures from "the model kept nothing", and only the last
+ * one is a verdict. Both used to collapse into an empty verdict map, which the caller read
+ * as "nothing justified" — every triage-tier finding deleted, and nothing to say so.
+ */
+export function parseTriageVerdicts(text: string): { verdicts: Map<number, TriageVerdict>; error?: string } {
+  const verdicts = new Map<number, TriageVerdict>();
+  const parsed = parseJsonObject<{ results?: unknown }>(text);
+  if (!parsed.ok) return { verdicts, error: `output unparseable: ${parsed.error}` };
+  const results = arrayField(parsed.value, "results");
+  if (!results) return { verdicts, error: "response has no results array" };
+  for (const r of results) {
+    if (typeof r !== "object" || r === null) continue;
+    const o = r as Record<string, unknown>;
+    const idx = Number(o["index"]);
+    if (!Number.isInteger(idx)) continue;
+    const sev = typeof o["severity"] === "string" ? o["severity"].toLowerCase() : "";
+    verdicts.set(idx, {
+      keep: o["keep"] === true,
+      reason: typeof o["reason"] === "string" ? o["reason"] : "",
+      severity: (SEVERITIES as readonly string[]).includes(sev) ? (sev as Severity) : undefined,
+    });
+  }
+  return { verdicts };
+}
+
 /**
  * LLM triage of the high-false-positive tier, then conversion of everything that survives
  * into review findings. Tool findings carry real line numbers already, so they bypass the
  * quote-anchoring path entirely — a linter does not hallucinate a location.
+ *
+ * `error` is set when the triage call failed or its answer was unusable. The batch is still
+ * dropped (fail closed: un-triaged high-FP findings are noise), but the caller reports the
+ * stage as incomplete — before, a dead triage model only bumped `dropped`, the run exited
+ * 0, and every triage-tier finding had been deleted with nothing to say so.
  */
 export async function triageAndConvert(
   runner: ModelRunner,
   result: StaticResult,
   index: FileIndex,
-): Promise<{ findings: AnchoredFinding[]; triaged: number; dropped: number; excluded: number }> {
+  // Parameterised for the selftest, which cannot set PRR_TRIAGE_MODEL after config loaded.
+  model: string = TRIAGE_MODEL,
+): Promise<{ findings: AnchoredFinding[]; triaged: number; dropped: number; excluded: number; error?: string }> {
   const kept: ToolFinding[] = [...result.facts];
   let dropped = 0;
   let triaged = 0;
+  let error: string | undefined;
 
   const batch = result.needsTriage.slice(0, MAX_TRIAGE_ITEMS);
   if (batch.length < result.needsTriage.length) {
@@ -498,7 +541,7 @@ export async function triageAndConvert(
     );
   }
 
-  if (batch.length > 0 && TRIAGE_MODEL) {
+  if (batch.length > 0 && model) {
     const items: TriageItem[] = batch.map((f, i) => ({
       index: i,
       tool: f.tool,
@@ -509,7 +552,7 @@ export async function triageAndConvert(
       severity: f.severity,
     }));
     const res = await runner.chat({
-      model: TRIAGE_MODEL,
+      model,
       system: TRIAGE_SYSTEM,
       user: buildTriagePrompt(items, index, TRIAGE_CONTEXT_LINES),
       schema: TRIAGE_SCHEMA,
@@ -520,25 +563,15 @@ export async function triageAndConvert(
       // Fail closed: an un-triaged high-FP finding is noise, so it does not get posted.
       log(`[WARN] static triage failed (${res.error}); ${batch.length} findings awaiting verdict will not be commented`);
       dropped += batch.length;
+      error = res.error;
     } else {
-      const parsed = parseJsonObject<{ results?: unknown }>(res.text);
-      if (!parsed.ok) {
-        log(`[WARN] static triage output unparseable (${parsed.error}); ${batch.length} findings will not be commented`);
+      const parsed = parseTriageVerdicts(res.text);
+      if (parsed.error) {
+        log(`[WARN] static triage ${parsed.error}; ${batch.length} findings will not be commented`);
         dropped += batch.length;
+        error = parsed.error;
       } else {
-        const verdicts = new Map<number, { keep: boolean; reason: string; severity?: Severity }>();
-        for (const r of (Array.isArray(parsed.value.results) ? parsed.value.results : []) as unknown[]) {
-          if (typeof r !== "object" || r === null) continue;
-          const o = r as Record<string, unknown>;
-          const idx = Number(o["index"]);
-          if (!Number.isInteger(idx)) continue;
-          const sev = typeof o["severity"] === "string" ? o["severity"].toLowerCase() : "";
-          verdicts.set(idx, {
-            keep: o["keep"] === true,
-            reason: typeof o["reason"] === "string" ? o["reason"] : "",
-            severity: (SEVERITIES as readonly string[]).includes(sev) ? (sev as Severity) : undefined,
-          });
-        }
+        const { verdicts } = parsed;
         batch.forEach((f, i) => {
           const v = verdicts.get(i);
           // No verdict means the model skipped it; treat that as "not justified".
@@ -587,6 +620,9 @@ export async function triageAndConvert(
       category,
       severity: f.severity,
       confidence: f.tier === "fact" ? 1 : 0.8,
+      // Carried so a later merge knows whether this tool's severity is a measurement or
+      // a policy (gates/aggregate.ts mergeInto). Suppress-tier never reaches this point.
+      tier: f.tier === "fact" ? "fact" : "triage",
       file: fd.path,
       quote: lineText,
       side: "right",
@@ -613,7 +649,7 @@ export async function triageAndConvert(
   if (excluded > 0) {
     log(`static: ${excluded} tool findings dropped, category excluded by config (${[...excludedCats].join(", ")})`);
   }
-  return { findings, triaged, dropped, excluded };
+  return error === undefined ? { findings, triaged, dropped, excluded } : { findings, triaged, dropped, excluded, error };
 }
 
 // Maps a tool rule to a review category so tool findings sit in the same taxonomy as

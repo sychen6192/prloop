@@ -1,7 +1,7 @@
 // The single deterministic control flow. Models are called at exactly one point (the finder
 // stage); every other decision — what to review, where a finding lives, what gets posted —
 // is made by code here (design principle: the loop never hands control to a model).
-import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, excludedCategories, isDryRun } from "./config";
+import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, STRICT_COVERAGE, excludedCategories, isDryRun } from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
 import { fetchRepoConventions } from "./ado/conventions";
 import { renderConventions } from "./libs/rules";
@@ -37,6 +37,31 @@ export interface ReviewRunResult {
    * the same exit code, and a CI check goes green on an unverified PR.
    */
   incomplete: string[];
+}
+
+/**
+ * Coverage gaps that make a review incomplete (PRR_STRICT_COVERAGE). Exported for the
+ * selftest.
+ *
+ * A file the finder never saw was not reviewed, whatever the finder said about the rest:
+ * left out of its context because the diff ran past PRR_MAX_DIFF_CHARS, or skipped by
+ * intake as too large to fetch. Both were logged and named in the summary, and the run
+ * still exited 0 — a green check over a PR whose largest file nobody read. Binary files
+ * are not counted: nothing in them is reviewable, so their absence hides nothing.
+ */
+export function coverageGaps(
+  omitted: string[],
+  skipped: Array<{ path: string; reason: string }>,
+  strict: boolean,
+): string[] {
+  if (!strict) return [];
+  const out: string[] = [];
+  if (omitted.length > 0) {
+    out.push(`${omitted.length} files omitted from the finder context (diff over PRR_MAX_DIFF_CHARS)`);
+  }
+  const tooLarge = skipped.filter((s) => s.reason === "too large").length;
+  if (tooLarge > 0) out.push(`${tooLarge} files skipped by intake as too large`);
+  return out;
 }
 
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {
@@ -99,7 +124,9 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
         runDir: run.dir,
       },
     );
-    const incomplete: string[] = [];
+    // "No reviewable code changes" can also mean "the only changed file was too large to
+    // fetch" — that is not a clean PR, and strict coverage says so.
+    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
     if (publishResult.summaryThreadId === undefined && !isDryRun()) {
       incomplete.push("summary comment failed to post");
     }
@@ -125,7 +152,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             skipped: "requirement check skipped by config",
           },
         })
-      : runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: ctx.files, runner: opts.runner })
+      : runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: ctx.files, fileIndex: ctx.fileIndex, runner: opts.runner })
   ).catch((e): Awaited<ReturnType<typeof runRequirementGate>> => {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[FAIL] requirement axis threw: ${msg}`);
@@ -223,17 +250,22 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
 
   // Tool findings join the code axis after triage. They carry real line numbers, so they
   // skip anchoring, and a deterministic tool counts as its own corroboration.
-  const toolOut = await triageAndConvert(opts.runner, staticResult, ctx.fileIndex).catch((e) => {
-    stageFailures.push(`triage stage (${e instanceof Error ? e.message : String(e)})`);
-    return { findings: [], triaged: 0, dropped: 0, excluded: 0 };
-  });
+  const toolOut = await triageAndConvert(opts.runner, staticResult, ctx.fileIndex).catch(
+    (e): Awaited<ReturnType<typeof triageAndConvert>> => {
+      stageFailures.push(`triage stage (${e instanceof Error ? e.message : String(e)})`);
+      return { findings: [], triaged: 0, dropped: 0, excluded: 0 };
+    },
+  );
+  // A triage model that failed or answered unusably deleted every triage-tier finding; the
+  // gate returns that as an error rather than throwing, so it lands here, not in the catch.
+  if (toolOut.error) stageFailures.push(`triage stage (${toolOut.error})`);
   run.saveJson("static-findings.json", toolOut);
 
   // knownDismissed re-enters here so finalize can route it into the summary with its
   // suppression reason — a suppressed finding must stay visible, never vanish.
   const agg = finalize(
     candidates,
-    mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings),
+    mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings, ctx.fileIndex),
     dismissedFps,
     outcomes.filter((o) => o.killed).length,
   );
@@ -307,6 +339,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   if (publishResult.summaryThreadId === undefined && !isDryRun()) {
     incomplete.push("summary comment failed to post");
   }
+  incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
 
   return { ctx, agg, req, reqFindings, publishResult, runDir: run.dir, durationSec, incomplete };
 }

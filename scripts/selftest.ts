@@ -6,14 +6,14 @@ import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
 import { buildHunks, diffLines, renderUnifiedDiff } from "../libs/diff";
-import { escapeControlCharsInStrings, parseJsonObject } from "../libs/json";
+import { arrayField, escapeControlCharsInStrings, parseJsonObject } from "../libs/json";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildDiffPayload } from "../libs/payload";
 import { htmlToText } from "../libs/html";
 import { globToRegExp, loadRules, renderConventions, selectRules } from "../libs/rules";
-import { finalize } from "../gates/aggregate";
+import { finalize, findingsAgree, mergeToolFindings } from "../gates/aggregate";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
-import { parseVerdict as parseVerdictForTest } from "../gates/skeptic";
+import { applyVerdicts, parseVerdict as parseVerdictForTest, votedSeverity, type SkepticOutcome, type Verdict } from "../gates/skeptic";
 import { environmentFailure, filterToChangedLines, matchesReviewedContent, projectDirsFor, rekeyToolFindings } from "../gates/static";
 import { renderFindingComment } from "../publish/format";
 import { parseToolOutput } from "../profiles/parsers";
@@ -27,7 +27,7 @@ import {
   loadDismissals,
   recordDismissals,
 } from "../libs/learnings";
-import { triageAndConvert } from "../gates/static";
+import { parseTriageVerdicts, triageAndConvert } from "../gates/static";
 import type { ToolFinding } from "../profiles/types";
 import type { PrRef } from "../libs/types";
 import type { ToolSpec } from "../profiles/types";
@@ -39,15 +39,16 @@ import { Semaphore } from "../libs/limit";
 import { describeBadCompletion, isTransientModelError } from "../models/runner";
 import { explainSpawnError, planSpawn, planKill, killTree } from "../libs/shell";
 import { spawn as spawnChild } from "node:child_process";
-import { buildInvocation } from "../models/opencode";
+import { buildInvocation, runFailure, traceEvent, type Acc } from "../models/opencode";
 import { anchorAndDedupe } from "../gates/aggregate";
 import type { FinderOutput } from "../gates/finder";
-import { validateFinding } from "../gates/finder";
-import { applyReqSkepticVerdicts, resolveJudgments } from "../gates/requirement";
+import { runFinders, validateFinding } from "../gates/finder";
+import { coverageGaps } from "../orchestrator";
+import { applyReqSkepticVerdicts, resolveJudgments, verifySatisfiedEvidence } from "../gates/requirement";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
 import type { CriterionCheck, ReqVerdict } from "../libs/types";
 import { FINDINGS_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
-import { PRLOOP_ROOT } from "../config";
+import { PRLOOP_ROOT, type Severity } from "../config";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -496,6 +497,25 @@ section("model output parsing (fail-closed)");
   check("empty string -> failure", !r.ok);
 }
 
+section("finder: an answer without a findings array is an error, not a clean PR");
+{
+  eq("arrayField reads the named array", arrayField({ findings: [1] }, "findings"), [1]);
+  eq("a top-level array is not the field", arrayField([1], "findings"), undefined);
+  eq("a missing key is not an empty list", arrayField({ items: [] }, "findings"), undefined);
+  eq("a non-array value is not a list", arrayField({ findings: "none" }, "findings"), undefined);
+
+  // End to end through the finder stage with a fake runner: these shapes used to come back
+  // as "0 findings" with no error — indistinguishable from a clean PR.
+  const files = [mkFile("/src/a.ts", ["x();"], [1])];
+  const pr = { title: "t", description: "", sourceBranch: "s", targetBranch: "t", createdBy: "a", status: "active" };
+  const input = { pr, files, iterationId: 1, compareTo: 0 };
+  const answering = (text: string) => ({ chat: async () => ({ text, model: "m" }) });
+  eq("a top-level array is an error", (await runFinders(answering("[]"), input, ["m"])).outputs[0]?.error, "response has no findings array");
+  eq("a list under another key is an error", (await runFinders(answering('{"items":[]}'), input, ["m"])).outputs[0]?.error, "response has no findings array");
+  const clean = (await runFinders(answering('{"findings":[]}'), input, ["m"])).outputs[0];
+  check("an explicit empty findings array is a clean result", clean?.error === undefined && clean?.findings.length === 0);
+}
+
 // --- language / noise ---
 section("language detection and noise filtering");
 eq("python", detectLanguage("/src/a.py"), "python");
@@ -526,6 +546,23 @@ section("diff budget");
   check("over budget still keeps at least one file", p.includedFiles.length >= 1);
   check("skipped files are recorded", p.includedFiles.length + p.omittedFiles.length === 2);
   if (p.omittedFiles.length > 0) check("skip list appears in payload", p.text.includes("omitted"));
+}
+
+section("coverage: files the finder never saw make the review incomplete");
+{
+  // Both were logged and named in the summary while the run still exited 0.
+  const skipped = [
+    { path: "/big.ts", reason: "too large" },
+    { path: "/logo.png", reason: "binary" },
+    { path: "/package-lock.json", reason: "generated/lock/vendor" },
+  ];
+  const gaps = coverageGaps(["/a.ts", "/b.ts"], skipped, true);
+  eq("omitted and oversized files are both reported", gaps.length, 2);
+  check("finder-context omission names the count and the knob",
+    gaps[0]!.startsWith("2 files omitted from the finder context") && gaps[0]!.includes("PRR_MAX_DIFF_CHARS"));
+  eq("intake skips count only too-large files, never binaries or lockfiles", gaps[1], "1 files skipped by intake as too large");
+  eq("nothing unread -> no gap", coverageGaps([], [{ path: "/logo.png", reason: "binary" }], true), []);
+  eq("PRR_STRICT_COVERAGE=0 reports none", coverageGaps(["/a.ts"], skipped, false), []);
 }
 
 // --- work item HTML ---
@@ -834,6 +871,21 @@ const spec = (format: string): ToolSpec =>
     <error line="7" severity="error" source="com.puppycrawl.tools.checkstyle.NeedBracesCheck" message="m"/>
   </file></checkstyle>`;
   eq("checkstyle still uses plain line", parseToolOutput(cs, spec("checkstyle-xml"), "/w")[0]?.line, 7);
+
+  // PMD priority runs 1 (most severe) to 5. It went through the shared numeric mapping,
+  // where "2" is high and "1" medium — every P1 violation filed as medium, every P2 as high.
+  const atPriority = (n: number) =>
+    parseToolOutput(
+      `<pmd><file name="src/A.java"><violation beginline="1" rule="R" priority="${n}">m</violation></file></pmd>`,
+      spec("checkstyle-xml"),
+      "/w",
+    )[0];
+  eq("PMD priority 1 is high", atPriority(1)?.severity, "high");
+  eq("PMD priority 2 is medium", atPriority(2)?.severity, "medium");
+  eq("PMD priority 3 is low", atPriority(3)?.severity, "low");
+  eq("PMD priority 5 is low", atPriority(5)?.severity, "low");
+  eq("...and the raw priority is kept for the report", atPriority(1)?.rawSeverity, "priority 1");
+  eq("checkstyle's severity word is mapped as before", parseToolOutput(cs, spec("checkstyle-xml"), "/w")[0]?.severity, "high");
 }
 {
   // A tool may be declared more than once — one job, several ways to invoke it. Declaration
@@ -1206,7 +1258,52 @@ section("excluded categories (PRR_EXCLUDE_CATEGORIES)");
   eq("bandit (security) finding excluded", res.findings.length, 1);
   eq("tool exclusion is counted", res.excluded, 1);
   eq("mypy (correctness) finding kept", res.findings[0]?.category, "correctness");
+  eq("a converted tool finding carries its tier", res.findings[0]?.tier, "fact");
   delete process.env["PRR_EXCLUDE_CATEGORIES"];
+}
+
+section("static triage: a dead or unusable triage model is a failed stage, not a clean one");
+{
+  // Before, a failed call or an unparseable answer only bumped `dropped`: every triage-tier
+  // finding deleted, exit 0, nothing to say so.
+  const f = mkFile("/src/a.py", ["x = eval(y)", "z = f(1)"], [1, 2]);
+  const idx = new FileIndex([f]);
+  const tool = (t: string, line: number, tier: "fact" | "triage"): ToolFinding =>
+    ({ tool: t, tier, ruleId: "R1", message: "m", file: "src/a.py", line, severity: "high" });
+  const staticResult = {
+    facts: [tool("mypy", 2, "fact")],
+    needsTriage: [tool("bandit", 1, "triage")],
+    suppressedCount: 0, ranTools: ["bandit", "mypy"], skipped: [], staleFiles: [], unresolved: 0,
+  };
+  const answering = (res: { text: string; error?: string }) => ({ chat: async () => ({ model: "t", ...res }) });
+
+  const dead = await triageAndConvert(answering({ text: "", error: "timeout (180s)" }), staticResult, idx, "triage-model");
+  eq("a failed triage call is returned as an error", dead.error, "timeout (180s)");
+  eq("...its batch is dropped, not posted unjudged", dead.dropped, 1);
+  eq("...and fact-tier findings still convert", dead.findings.map((x) => x.sources[0]), ["mypy"]);
+
+  const garbage = await triageAndConvert(answering({ text: "no json here" }), staticResult, idx, "triage-model");
+  check("unparseable triage output is an error", (garbage.error ?? "").startsWith("output unparseable"));
+
+  const wrongShape = await triageAndConvert(answering({ text: '{"verdicts":[]}' }), staticResult, idx, "triage-model");
+  eq("an answer without a results array is an error, not zero verdicts", wrongShape.error, "response has no results array");
+
+  const good = await triageAndConvert(
+    answering({ text: '{"results":[{"index":0,"keep":true,"reason":"eval on request data","severity":"medium"}]}' }),
+    staticResult, idx, "triage-model",
+  );
+  check("a usable verdict carries no error", good.error === undefined);
+  eq("...keeps the justified finding", good.triaged, 1);
+  const kept = good.findings.find((x) => x.sources[0] === "bandit");
+  eq("...at the triage model's (lower) severity", kept?.severity, "medium");
+  eq("...tagged triage-tier", kept?.tier, "triage");
+  eq("fact-tier findings are tagged fact", good.findings.find((x) => x.sources[0] === "mypy")?.tier, "fact");
+
+  const none = await triageAndConvert(answering({ text: '{"results":[]}' }), staticResult, idx, "triage-model");
+  check("an explicit empty results array is a verdict, not an error", none.error === undefined && none.dropped === 1);
+
+  eq("parseTriageVerdicts names the missing array", parseTriageVerdicts("[]").error, "response has no results array");
+  check("parseTriageVerdicts names unparseable text", parseTriageVerdicts("nope").error?.startsWith("output unparseable") === true);
 }
 
 section("dismissal suppression (learnings)");
@@ -1586,6 +1683,118 @@ section("aggregate: dedupe pools and ranking");
   eq("...and counts both sources", cands2.merged[0]?.sources.length, 2);
 }
 
+section("aggregate: overlap is not agreement");
+{
+  const lines = [
+    "function tally(items) {",     // 1
+    "  let total = 0;",            // 2
+    "  for (const it of items) {", // 3
+    "    counter += it.n;",        // 4
+    "    total += it.n;",          // 5
+    "  }",                         // 6
+    "  log(total);",               // 7
+    "  return counter;",           // 8
+    "}",                           // 9
+    "export { tally };",           // 10
+  ];
+  const file = mkFile("/src/tally.ts", lines, lines.map((_, i) => i + 1));
+  const idx = new FileIndex([file]);
+  const out = (model: string, quote: string, claim: string): FinderOutput => ({
+    model,
+    findings: [mkFinding({ file: "/src/tally.ts", quote, claim })],
+    rejected: 0,
+    raw: "",
+  });
+  const eightLines = lines.slice(0, 8).join("\n");
+
+  // The defect: an 8-line "race" and a 1-line "unused variable" in the same category share
+  // a line, merged, and the second model was recorded as having found the race — which the
+  // consensus gate then published as two independent sightings.
+  const busy = anchorAndDedupe(
+    [
+      out("a", eightLines, "shared counter incremented without a lock, races under load"),
+      out("b", "    counter += it.n;", "unused variable total is never read"),
+    ],
+    idx,
+  );
+  eq("overlapping but disagreeing findings still dedupe to one", busy.merged.length, 1);
+  eq("...with a single source", busy.merged[0]?.sources, ["a"]);
+  eq("...and the other model recorded as overlapping, not corroborating", busy.merged[0]?.overlapping, ["b"]);
+  check("the comment names the overlap without counting it",
+    renderFindingComment(busy.merged[0]!).includes("b flagged these lines with a different claim"));
+
+  // Two tight spans sharing a changed line: both models pointed at the same new code.
+  const tight = anchorAndDedupe(
+    [
+      out("a", "    counter += it.n;\n    total += it.n;", "counter is not atomic"),
+      out("b", "    total += it.n;\n  }", "total accumulates floats and drifts"),
+    ],
+    idx,
+  );
+  eq("two spans of three lines or fewer overlapping on a changed line agree", tight.merged[0]?.sources.length, 2);
+
+  // Different quotes and spans, but claims with enough vocabulary in common.
+  const similar = anchorAndDedupe(
+    [
+      out("a", eightLines, "shared counter incremented without a lock"),
+      out("b", "    counter += it.n;", "counter incremented without lock, concurrent callers race"),
+    ],
+    idx,
+  );
+  eq("similar claims (token Jaccard) agree", similar.merged[0]?.sources.length, 2);
+  check("...and nothing is left as merely overlapping", similar.merged[0]?.overlapping === undefined);
+
+  // The predicate itself, on the pieces.
+  const af = (over: Partial<AnchoredFinding>): AnchoredFinding => ({
+    category: "correctness", severity: "high", confidence: 0.8, file: "/src/tally.ts", quote: "q",
+    claim: "c", sources: ["m"], fingerprint: "f",
+    anchor: { side: "right", startLine: 1, endLine: 1, startOffset: 1, endOffset: 2 },
+    ...over,
+  });
+  const at = (startLine: number, endLine: number) => ({ side: "right" as const, startLine, endLine, startOffset: 1, endOffset: 2 });
+  check("same quote agrees whatever the claims", findingsAgree(af({ claim: "x" }), af({ claim: "y" })));
+  check("a long span never agrees by position alone",
+    !findingsAgree(af({ quote: "a", claim: "one thing", anchor: at(1, 8) }), af({ quote: "b", claim: "another matter" }), file.changedRightLines));
+  check("tight spans overlapping only on an unchanged line do not agree",
+    !findingsAgree(af({ quote: "a", claim: "one thing", anchor: at(2, 3) }), af({ quote: "b", claim: "another matter", anchor: at(3, 4) }), new Set([9])));
+  check("shared vocabulary below the threshold does not agree",
+    !findingsAgree(af({ quote: "a", claim: "null deref when cache misses" }), af({ quote: "b", claim: "cache key collision when tenant ids clash" })));
+}
+
+section("tool merges: only a fact-tier tool may raise severity");
+{
+  const line1 = { side: "right" as const, startLine: 1, endLine: 1, startOffset: 1, endOffset: 5 };
+  const model = (): AnchoredFinding => ({
+    category: "correctness", severity: "low", confidence: 0.6, file: "src/a.ts", quote: "x();",
+    claim: "x may be undefined here", sources: ["m1"], fingerprint: "f1", skepticVerdicts: 1, anchor: line1,
+  });
+  const tool = (tier: "fact" | "triage", over: Partial<AnchoredFinding> = {}): AnchoredFinding => ({
+    category: "correctness", severity: "high", confidence: tier === "fact" ? 1 : 0.8, file: "src/a.ts",
+    quote: "x();", claim: "'x' is possibly undefined", sources: [tier === "fact" ? "tsc" : "eslint"],
+    fingerprint: "t1", skepticVerdicts: 1, skepticRefuted: 0, tier, anchor: line1, ...over,
+  });
+
+  // The skeptic just argued this finding down to low; eslint rating an error-level rule
+  // "high" is policy, not evidence, and must not undo that.
+  const triage = mergeToolFindings([model()], [tool("triage")]);
+  eq("an agreeing triage-tier tool merges", triage.length, 1);
+  eq("...corroborates", triage[0]?.sources, ["m1", "eslint"]);
+  eq("...but cannot re-escalate", triage[0]?.severity, "low");
+
+  const fact = mergeToolFindings([model()], [tool("fact")]);
+  eq("a fact-tier tool raises", fact[0]?.severity, "high");
+
+  // A tool that overlaps with a different message saw a different problem: it stays a
+  // finding of its own instead of corroborating a claim it never made.
+  const other = mergeToolFindings(
+    [{ ...model(), quote: "x();\ny();", claim: "loop never terminates", anchor: { ...line1, endLine: 2 }, skepticVerdicts: 0 }],
+    [tool("fact", { claim: "Argument of type 'string' is not assignable to parameter of type 'number'" })],
+  );
+  eq("a disagreeing tool finding is kept separately", other.length, 2);
+  eq("...and the model finding stays single-source", other[0]?.sources, ["m1"]);
+  eq("...uncleared by the tool's sighting", other[0]?.skepticVerdicts, 0);
+}
+
 section("strict-mode schema invariant");
 {
   // OpenAI-strict json_schema: `required` must list every key in properties, at every
@@ -1647,6 +1856,32 @@ section("skeptic verdict semantics");
   check("a verdict without a refuted field is an error, not an answer", empty.error !== undefined);
   const good = parseVerdictForTest('{"refuted": false, "reason": "holds", "confidence": 0.8, "suggested_severity": null}', "m");
   check("null suggested_severity parses", good.error === undefined && good.suggestedSeverity === undefined);
+}
+
+section("skeptic severity vote: a downgrade takes the median, not one dissenting voice");
+{
+  const vote = (s?: Severity, error?: string): Verdict =>
+    ({ refuted: false, reason: "", confidence: 0.8, model: "s", suggestedSeverity: s, ...(error ? { error } : {}) });
+  const outcome = (severity: Severity, verdicts: Verdict[]): SkepticOutcome => ({
+    finding: {
+      category: "correctness", severity, confidence: 0.8, file: "/a.ts", quote: "x();", claim: "c",
+      sources: ["m1"], fingerprint: "f",
+      anchor: { side: "right", startLine: 1, endLine: 1, startOffset: 1, endOffset: 5 },
+    },
+    verdicts,
+    killed: false,
+  });
+  const after = (severity: Severity, verdicts: Verdict[]) => applyVerdicts([outcome(severity, verdicts)])[0]?.severity;
+
+  // Killing a finding takes a majority; lowering it used to take one voice.
+  eq("3 rounds, one low: the finder's rating stands", after("high", [vote("low"), vote(), vote()]), "high");
+  eq("3 rounds, two low: the median lowers it", after("high", [vote("low"), vote("low"), vote()]), "low");
+  eq("3 rounds, low/medium/none: the median is medium", after("high", [vote("low"), vote("medium"), vote()]), "medium");
+  eq("1 round low: a single verifier is the whole vote", after("high", [vote("low")]), "low");
+  eq("a suggestion above the current severity never raises it", after("medium", [vote("critical")]), "medium");
+  eq("2 rounds split: a tie never downgrades", after("high", [vote("low"), vote()]), "high");
+  eq("errored verdicts do not vote", after("high", [vote("low"), vote("low", "timeout (180s)"), vote()]), "high");
+  eq("no votes keeps the rating", votedSeverity("high", []), "high");
 }
 
 section("Windows process spawning");
@@ -1748,6 +1983,30 @@ section("opencode invocation: prompt delivery");
 
   // Whatever the prompt looks like, a flags-only argv cannot hit the cmd.exe limit.
   check("flags-only argv is always within the cmd.exe limit", planSpawn("opencode.cmd", args, "win32").error === undefined);
+}
+
+section("opencode: a killed or crashed run is a named failure, not an empty answer");
+{
+  // Both used to resolve { text, model } with no error and surface downstream as "output
+  // unparseable" / "empty string" — the deterministic class the transient retry skips.
+  const base = { timedOut: false, timeoutMs: 900_000, code: 0, signal: null, text: "" };
+  eq("a timeout is named with the knob's value",
+    runFailure({ ...base, timedOut: true, code: null, signal: "SIGTERM", text: '{"findings":[' }), "timeout (900000ms)");
+  check("...and the transient retry fires on it", isTransientModelError(runFailure({ ...base, timedOut: true })!));
+  eq("a non-zero exit with no output is named", runFailure({ ...base, code: 1 }), "opencode exited 1");
+  eq("...carrying the CLI's own error event",
+    runFailure({ ...base, code: 1, lastError: "ProviderAuthError: no API key" }), "opencode exited 1: ProviderAuthError: no API key");
+  eq("an error event with a clean exit and no output is the error", runFailure({ ...base, lastError: "rate limited" }), "rate limited");
+  eq("a signal death is named", runFailure({ ...base, code: null, signal: "SIGKILL" }), "opencode killed by SIGKILL");
+  eq("a completed run with output has no error", runFailure({ ...base, text: '{"findings":[]}' }), undefined);
+  eq("a non-zero exit next to real output is left to the parser", runFailure({ ...base, code: 1, text: '{"findings":[]}' }), undefined);
+  eq("a clean, silent exit is not this layer's error (the parser names the empty answer)", runFailure(base), undefined);
+
+  const acc: Acc = { text: "", lastText: "" };
+  traceEvent('{"type":"error","error":{"name":"ProviderError","data":{"message":"401 unauthorized"}}}', "[t]", acc);
+  eq("the error event's message is kept for the failure", acc.lastError, "401 unauthorized");
+  traceEvent('{"type":"text","part":{"type":"text","text":"{}"}}', "[t]", acc);
+  eq("...and text events leave it alone", acc.lastError, "401 unauthorized");
 }
 
 section("unusable completions are named, not left to the JSON parser");
@@ -1871,6 +2130,32 @@ section("requirement criteria: the pipeline owns the denominator, not the model"
   eq("skipped criteria surface as not-verifiable", skipped.criteria.map((c) => c.verdict), ["not-verifiable", "not-verifiable"]);
   eq("...and are counted", skipped.unjudged, 2);
   check("...with an honest note", (skipped.criteria[0]?.note ?? "").includes("not judged"));
+}
+
+section("requirement axis: a satisfied verdict must anchor its evidence");
+{
+  // "satisfied" closes a criterion, and it was the one verdict nothing checked: an invented
+  // (or absent) evidence quote still counted as implemented.
+  const f = mkFile("/src/audit.ts", ["export function write(e) {", "  auditLog.append(e);", "}"], [1, 2, 3]);
+  const idx = new FileIndex([f]);
+  const mk = (over: Partial<CriterionCheck>): CriterionCheck =>
+    ({ workItemId: 1, criterion: "writes an audit entry", verdict: "satisfied", note: "n", ...over });
+  const cs = [
+    mk({ quote: "  auditLog.append(e);", file: "/src/audit.ts" }),
+    mk({ quote: "  metrics.increment(e);", file: "/src/audit.ts" }),
+    mk({}),
+    mk({ quote: "  auditLog.append(e);", file: "/src/other.ts" }),
+    mk({ verdict: "missing", quote: "nowhere();", file: "/src/audit.ts", note: "no audit call" }),
+  ];
+  eq("the unanchorable satisfied verdicts are demoted", verifySatisfiedEvidence(cs, idx), 3);
+  eq("a quote that locates in the diff keeps the verdict", cs[0]!.verdict, "satisfied");
+  eq("a quote absent from the diff demotes to not-verifiable", cs[1]!.verdict, "not-verifiable");
+  check("...saying why, with the original note kept",
+    cs[1]!.note.startsWith("claimed satisfied, but the evidence quote was not found in the diff") && cs[1]!.note.endsWith("original note: n"));
+  eq("no quote at all demotes", cs[2]!.verdict, "not-verifiable");
+  eq("a quote in a file outside the change demotes", cs[3]!.verdict, "not-verifiable");
+  eq("other verdicts are not touched", cs[4]!.verdict, "missing");
+  eq("...nor their notes", cs[4]!.note, "no audit call");
 }
 
 section("model call concurrency cap");

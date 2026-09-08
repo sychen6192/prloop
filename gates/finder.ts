@@ -4,7 +4,7 @@
 // heterogeneous fleet running in parallel — the only thing that changes is the fan-out,
 // not the parsing or validation.
 import { FINDER_MODELS, FINDING_CATEGORIES, SEVERITIES, severityRank, type Severity } from "../config";
-import { parseJsonObject } from "../libs/json";
+import { arrayField, parseJsonObject } from "../libs/json";
 import { log } from "../libs/log";
 import { loadRules, renderRules, selectRules } from "../libs/rules";
 import type { ModelRunner, RawFinding } from "../libs/types";
@@ -100,7 +100,14 @@ async function runOne(
     return { model, findings: [], error: parsed.error, rejected: 0, raw: res.text };
   }
 
-  const arr = Array.isArray(parsed.value?.findings) ? (parsed.value.findings as unknown[]) : [];
+  const arr = arrayField(parsed.value, "findings");
+  if (!arr) {
+    // Parseable, but not the shape asked for — a top-level array, or the list under some
+    // other key. That used to read as "0 findings", the same result as a clean PR, with no
+    // error to say the model never answered the question. Fail closed, and say why.
+    log(`[FAIL] finder ${model} response has no findings array`);
+    return { model, findings: [], error: "response has no findings array", rejected: 0, raw: res.text };
+  }
   const findings: RawFinding[] = [];
   let rejected = 0;
   // The keys of the first dropped item. "4 dropped for incomplete fields" alone sent a
