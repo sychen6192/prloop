@@ -3,6 +3,7 @@
 // (azure-devops-mcp #793 / #868 — see PROPOSAL §2).
 import { ADO_API_VERSION, ADO_BASE_URL, ADO_MAX_RETRIES, ADO_TIMEOUT_MS } from "../config";
 import { logVerbose } from "../libs/log";
+import { redactSecrets } from "../libs/redact";
 import type { PrRef } from "../libs/types";
 import { authHeader } from "./auth";
 import { USER_AGENT, dispatcherFor } from "../libs/proxy";
@@ -16,6 +17,29 @@ export class AdoError extends Error {
     super(message);
     this.name = "AdoError";
   }
+}
+
+/**
+ * The quotable part of a rejected ADO response, for the error message itself.
+ *
+ * ADO answers with JSON whose `message` says WHY ("TF401232: the thread context is not
+ * valid", "the pull request is completed"); the status line alone left a rejected thread
+ * POST as an unexplained "400 Bad Request" because `body` was captured on the error and
+ * never surfaced. Redacted and capped: error bodies have echoed credentials before, and a
+ * message is a line, not a page.
+ */
+export function adoErrorDetail(body: string): string {
+  let text = "";
+  try {
+    const parsed: unknown = JSON.parse(body);
+    const message = (parsed as { message?: unknown } | null)?.message;
+    if (typeof message === "string") text = message;
+  } catch {
+    // A sign-in page or a proxy's HTML error page carries nothing worth quoting; plain text does.
+    if (!/^\s*</.test(body)) text = body;
+  }
+  text = redactSecrets(text.replace(/\s+/g, " ").trim());
+  return text.length > 300 ? `${text.slice(0, 299)}…` : text;
 }
 
 /**
@@ -161,10 +185,11 @@ async function request(url: string, opts: RequestOpts = {}): Promise<Buffer> {
       }
       if (!res.ok) {
         const body = await res.text().catch(() => "");
+        const detail = adoErrorDetail(body);
         throw new AdoError(
-          `ADO ${method} ${u.pathname} failed: ${res.status} ${res.statusText}`,
+          `ADO ${method} ${u.pathname} failed: ${res.status} ${res.statusText}${detail ? ` — ${detail}` : ""}`,
           res.status,
-          body.slice(0, 2000),
+          redactSecrets(body.slice(0, 2000)),
         );
       }
       // Body read happens here, while the abort timer is still armed.
@@ -189,7 +214,7 @@ async function request(url: string, opts: RequestOpts = {}): Promise<Buffer> {
     }
   }
   if (lastErr instanceof AdoError) throw lastErr;
-  throw new AdoError(`Connection to ${u.origin} failed: ${diagnose(lastErr)}`);
+  throw new AdoError(`Connection to ${u.origin} failed: ${redactSecrets(diagnose(lastErr))}`);
 }
 
 /**

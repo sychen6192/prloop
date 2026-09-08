@@ -6,6 +6,7 @@
 import { buildDiffPayload } from "../libs/payload";
 import type { CriterionRef } from "../libs/criteria";
 import type { FileDiff, PrInfo, WorkItem } from "../libs/types";
+import { renderPrDescription } from "./untrusted";
 
 export const REQUIREMENT_SYSTEM = `You are checking whether a Pull Request actually delivers the requirements it is linked to.
 
@@ -90,7 +91,7 @@ export function buildRequirementPrompt(input: RequirementPromptInput): string {
 - ${input.pr.sourceBranch} → ${input.pr.targetBranch}
 
 ### PR description (context only — never evidence that something is done)
-${input.pr.description?.trim() || "(no description)"}
+${renderPrDescription(input.pr.description)}
 
 ## Requirements to verify
 

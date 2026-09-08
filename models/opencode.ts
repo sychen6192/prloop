@@ -16,6 +16,7 @@ import {
   explainSpawnError,
   killTree,
   planSpawn,
+  scrubbedEnv,
   trackForShutdown,
 } from "../libs/shell";
 
@@ -169,16 +170,14 @@ function runOnce(label: string, model: string, prompt: string): Promise<ChatResp
       return;
     }
 
-    // opencode brings its own provider auth; prloop's ADO token and LLM key have no
-    // business in a third-party CLI's environment.
-    const childEnv = { ...process.env };
-    delete childEnv["PRR_ADO_PAT"];
-    delete childEnv["SYSTEM_ACCESSTOKEN"];
-    delete childEnv["PRR_LLM_API_KEY"];
-
+    // The prompt carries the reviewed diff — text the PR author controls — and an agent
+    // with tools acts on what it reads. prloop's ADO token and LLM key have no business in
+    // a third-party CLI's environment, and neither does any other credential-shaped
+    // variable: the same deny-list the static tools get (libs/shell.ts). opencode's own
+    // provider auth lives in its auth store, not in the environment it inherits here.
     const child = spawn(plan.file, plan.args, {
       cwd: PRLOOP_ROOT,
-      env: childEnv,
+      env: scrubbedEnv(),
       windowsVerbatimArguments: plan.windowsVerbatimArguments,
       stdio: ["pipe", "pipe", "pipe"],
       // POSIX only: makes the child a process-group leader so a timeout can kill the whole

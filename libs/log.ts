@@ -1,5 +1,6 @@
 // Logging: every line carries [mm:ss] elapsed time so you can tell it's still alive.
 import { QUIET } from "../config";
+import { redactSecrets } from "./redact";
 
 const START_TS = Date.now();
 
@@ -10,12 +11,15 @@ export function elapsed(): string {
   return `${mm}:${ss}`;
 }
 
+// The log is an egress (terminal, CI log, pipeline artifacts): every line is scrubbed here,
+// once, rather than trusting each of a hundred call sites to remember that a gateway's
+// error body may echo the key it rejected.
 export function log(msg: string) {
-  console.log(`[${elapsed()}] ${msg}`);
+  console.log(`[${elapsed()}] ${redactSecrets(msg)}`);
 }
 
 export function logVerbose(msg: string) {
-  if (!QUIET) console.log(`[${elapsed()}] ${msg}`);
+  if (!QUIET) console.log(`[${elapsed()}] ${redactSecrets(msg)}`);
 }
 
 export function banner(title: string) {
@@ -23,7 +27,7 @@ export function banner(title: string) {
 }
 
 export function die(msg: string): never {
-  console.error(`[${elapsed()}] FATAL: ${msg}`);
+  console.error(`[${elapsed()}] FATAL: ${redactSecrets(msg)}`);
   process.exit(1);
 }
 

@@ -17,6 +17,7 @@ import {
 import { Semaphore } from "../libs/limit";
 import { logVerbose } from "../libs/log";
 import { USER_AGENT, dispatcherFor } from "../libs/proxy";
+import { redactSecrets } from "../libs/redact";
 import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
 import { inlineSchema } from "./schemas";
 
@@ -44,7 +45,8 @@ export function describeFetchError(e: unknown, timeoutMs: number): string {
     parts.push(code ? `${cur.message} [${code}]` : cur.message);
     cur = cur.cause;
   }
-  return parts.length > 0 ? parts.join(" ← ") : String(e);
+  // A proxy URL with credentials can ride along inside undici's messages.
+  return redactSecrets(parts.length > 0 ? parts.join(" ← ") : String(e));
 }
 
 interface OpenAIUsage {
@@ -277,7 +279,9 @@ export class OpenAICompatRunner implements ModelRunner {
       } as RequestInit);
       if (!res.ok) {
         const text = await res.text();
-        return { text: "", model: req.model, error: `HTTP ${res.status}: ${text.slice(0, 500)}` };
+        // Some gateways echo the presented key inside a 401 body; this string reaches the
+        // log, runs/, and the PR summary.
+        return { text: "", model: req.model, error: redactSecrets(`HTTP ${res.status}: ${text.slice(0, 500)}`) };
       }
       // A backend that ignores `stream` answers with a plain JSON completion; trust the
       // content type over what was asked for.
@@ -502,6 +506,21 @@ function throttled(inner: ModelRunner, limit: number): ModelRunner {
 }
 
 /**
+ * Every runner's error text is user-facing — it is logged, saved under runs/ and quoted in
+ * the PR summary — and a gateway's in-band error (a JSON `error.message`, an SSE error
+ * event, a non-JSON body) can echo the credential it rejected. Scrubbed once here, for
+ * every runner kind, so no adapter has to remember.
+ */
+export function redactingErrors(inner: ModelRunner): ModelRunner {
+  return {
+    async chat(req) {
+      const res = await inner.chat(req);
+      return res.error ? { ...res, error: redactSecrets(res.error) } : res;
+    },
+  };
+}
+
+/**
  * Runner factory. The opencode path is imported lazily so a missing opencode install never
  * affects the default HTTP path (and vice versa).
  */
@@ -514,5 +533,5 @@ export async function createRunner(): Promise<ModelRunner> {
   // a slot for its whole retry sequence. Counting sits outermost: one record per logical
   // call, with the usage of whichever attempt finally answered (failed attempts carry no
   // usage data to count).
-  return counted(withRetries(throttled(inner, LLM_CONCURRENCY), LLM_RETRIES));
+  return counted(withRetries(throttled(redactingErrors(inner), LLM_CONCURRENCY), LLM_RETRIES));
 }

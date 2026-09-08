@@ -147,8 +147,11 @@ export function renderConventions(docs: Array<{ path: string; text: string }>): 
   const parts: string[] = [
     "## This repository's own conventions",
     "",
-    "The documents below come from the repository under review. They override everything" +
-      " else in these rules where they conflict.",
+    // Precedence is scoped the same way as the rules header in prompts/finder.ts: a
+    // convention doc may say what counts as a violation and how bad it is, never how the
+    // finding is to be reported.
+    "The documents below come from the repository under review. Where they conflict with" +
+      " these rules on what is reportable or how severe it is, the documents override the rules.",
   ];
   let budget = CONVENTION_TOTAL_CHARS;
   for (const d of docs) {

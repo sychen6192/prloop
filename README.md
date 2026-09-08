@@ -110,6 +110,15 @@ matching can't see. Empirically the strongest hybrid available (Semgrep FPs 560 
 With `PRR_TRIAGE_MODEL` unset, triage-tier results are **dropped, not posted** — unjudged
 high-FP output is noise.
 
+`PRR_WORKDIR` is a checkout of the PR's **source branch**, and the tools execute that
+branch's code: an eslint config, a Maven plugin or a lint hook is a program the PR author
+wrote. The tools therefore run with a **secret-scrubbed environment** — every variable whose
+name looks like a credential (`*_PAT`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_API_KEY`,
+`*_ACCESS_KEY`, `*_PRIVATE_KEY`, `SYSTEM_ACCESSTOKEN`, prloop's own PAT and LLM key) is
+dropped, and everything else (`PATH`, `JAVA_HOME`, `M2_HOME`, `npm_config_*`, proxies, CA
+paths) passes through, because build tools legitimately need it. The `opencode` runner's
+child process gets the same treatment.
+
 ---
 
 ## Setup
@@ -159,7 +168,8 @@ URL format: `https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}`
 On-prem and `visualstudio.com` are derived from the URL itself, virtual directories included.
 
 Exit codes: `0` clean · `2` unmet criteria or critical/high findings · `3` **review
-incomplete** (a stage crashed — nothing blocking was found, but the check that would have
+incomplete** (a stage crashed, or the finder never saw part of the diff and
+`PRR_STRICT_COVERAGE` is on — nothing blocking was found, but the check that would have
 found it never ran) · `1` fatal.
 
 `--since auto` reads the last reviewed iteration back out of prloop's own summary comment —
@@ -225,7 +235,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_LEARN_FROM_DISMISSALS` | `1` | `0` = re-post findings humans dismissed as wontFix/byDesign |
 | `PRR_REQUIRE_CORROBORATION` | `1` | `0` publishes unverified single-source findings |
 | `PRR_STRICT_COVERAGE` | `1` | files the finder never saw (over `PRR_MAX_DIFF_CHARS`, or too large to fetch) make the run incomplete (exit 3); `0` = a partial review can still exit 0 |
-| `PRR_WORKDIR` | — | checkout at the iteration's `sourceRefCommit`; unset = static analysis skips. Files whose content differs from the iteration under review are skipped, not analysed |
+| `PRR_WORKDIR` | — | checkout at the iteration's `sourceRefCommit`; unset = static analysis skips. Files whose content differs from the iteration under review are skipped, not analysed. Tools execute the reviewed branch's code, with a secret-scrubbed environment |
 | `PRR_TRIAGE_MODEL` | — | unset = high-FP tool findings are dropped |
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |
 | `PRR_DRY_RUN` | — | `1` = compute, publish nothing |
@@ -250,7 +260,9 @@ loaded exactly once per run.
 decoding**, where the engine enforces the JSON schema at the token level. That is what keeps
 weak models emitting valid JSON. `opencode` reuses your existing provider config but **does
 not forward `response_format`**, dropping schemas to prompt-level only. Run `npm run setup`
-first to install its agent definition.
+first to install its agent definition. Like every child process it receives a
+secret-scrubbed environment (see static analysis), so its provider keys must live in
+opencode's own auth store (`opencode auth login`), not in `*_API_KEY` variables.
 
 ## Review rules
 

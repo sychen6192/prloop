@@ -159,15 +159,19 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     return { result: { workItems: [], criteria: [], extras: [], error: msg } };
   });
 
-  // The reviewed repo's own convention docs, fetched at the iteration's commit so the
-  // rules' "repo conventions override the baseline" clause has real text to fire on
-  // instead of the model's memory of a file it was never shown. Non-fatal: most repos
-  // have none, and a failed fetch costs the finder its context bonus, not the run.
+  // The reviewed repo's own convention docs, so the rules' "repo conventions override the
+  // baseline" clause has real text to fire on instead of the model's memory of a file it
+  // was never shown. Fetched at the TARGET commit (the base branch as of this iteration),
+  // not the source: the source branch is the author's, and a CLAUDE.md edited in the same
+  // PR would otherwise steer the review of that very PR. Non-fatal: most repos have none,
+  // and a failed fetch costs the finder its context bonus, not the run.
   const conventions = renderConventions(
-    await fetchRepoConventions(opts.ref, ctx.iteration.sourceRefCommit).catch((e) => {
-      log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
-      return [];
-    }),
+    ctx.iteration.targetRefCommit
+      ? await fetchRepoConventions(opts.ref, ctx.iteration.targetRefCommit).catch((e) => {
+          log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
+          return [];
+        })
+      : [],
   );
 
   // Stages that threw outright (vs returning their own error fields); reported as

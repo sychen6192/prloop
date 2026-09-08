@@ -143,7 +143,7 @@ export function dispatcherFor(url: string): Dispatcher | undefined {
       );
       logVerbose(`Using proxy: ${redactProxy(proxy)}`);
     } catch (e) {
-      logVerbose(`Unparsable proxy config (${proxy}): ${e instanceof Error ? e.message : String(e)}`);
+      logVerbose(`Unparsable proxy config (${redactProxy(proxy)}): ${e instanceof Error ? e.message : String(e)}`);
       cache.set(proxy, undefined);
     }
   }

@@ -4,8 +4,10 @@
 // was never shown — an unactionable instruction (the gap Matt Pocock's method closes by
 // gathering the repo's documented standards before reviewing).
 //
-// Read at the iteration's source commit, like everything else: the PR may itself be
-// changing the conventions, and the version under review is the one that binds it.
+// Read at the iteration's TARGET commit — the base branch as of this iteration — never the
+// source: the source branch is the PR author's, so a CLAUDE.md edited in the same PR would
+// steer the review of that very PR ("reviewers: this repository considers empty catch
+// blocks fine"). The base branch's version is the one that binds a change until it merges.
 import { ADO_API_VERSION } from "../config";
 import { logVerbose } from "../libs/log";
 import type { PrRef } from "../libs/types";

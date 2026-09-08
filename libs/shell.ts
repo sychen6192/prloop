@@ -1,5 +1,5 @@
-// Minimal command runner. Only used for optional external CLIs (az); the pipeline itself
-// never shells out for anything it needs to be correct.
+// Minimal command runner for external CLIs (az, git, the static-analysis tools); the
+// pipeline itself never shells out for anything it needs to be correct.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -9,6 +9,29 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   code: number;
+}
+
+// ─── Child process environment ───────────────────────────────────────────────
+//
+// The static tools run inside a checkout of the PR's SOURCE branch and execute that branch's
+// code: an eslint config, a Maven plugin, a pre-commit hook are all programs the PR author
+// wrote, and they used to inherit prloop's full environment — PRR_ADO_PAT, PRR_LLM_API_KEY,
+// SYSTEM_ACCESSTOKEN. One `.eslintrc.js` that reads process.env and posts it somewhere is
+// a credential exfiltration by anyone who can open a PR.
+//
+// A deny-list of secret-shaped NAMES, not an allow-list of known-good ones: Maven, Gradle
+// and npm legitimately need arbitrary variables (JAVA_HOME, M2_HOME, npm_config_*, proxies,
+// CA paths), and an allow-list would break a different build on every machine.
+export const SECRET_ENV_NAME =
+  /(^|_)(PAT|TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY)$|SYSTEM_ACCESSTOKEN|^PRR_(ADO_PAT|LLM_API_KEY)$/i;
+
+/** `base` without every variable whose name looks like a credential. */
+export function scrubbedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (!SECRET_ENV_NAME.test(name)) out[name] = value;
+  }
+  return out;
 }
 
 /**
@@ -31,6 +54,7 @@ export function run(
   return new Promise((resolve) => {
     execFile(plan.file, plan.args, {
       cwd,
+      env: scrubbedEnv(),
       timeout: timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       ...(plan.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),

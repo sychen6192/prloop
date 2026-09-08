@@ -2,6 +2,7 @@
 // own threads: the bot marker identifies authorship, the fingerprint identifies the issue.
 import { BOT_MARKER, MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "../config";
 import { detectLanguage } from "../libs/lang";
+import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
 import type { AggregateResult } from "../gates/aggregate";
 import type { CategoryHint } from "../libs/learnings";
@@ -305,7 +306,10 @@ export function renderSummary(input: SummaryInput): string {
   }
 
   lines.push(`<sub>prloop · this comment updates on every push</sub>`);
-  return lines.join("\n");
+  // The summary is posted to the PR: the run notes quote finder and requirement errors,
+  // which relay gateway bodies — "Model X produced no result: HTTP 401: …" once carried the
+  // rejected key to everyone who could read the repository.
+  return redactSecrets(lines.join("\n"));
 }
 
 function escapeCell(s: string): string {
