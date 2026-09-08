@@ -18,6 +18,7 @@ import { Semaphore } from "../libs/limit";
 import { logVerbose } from "../libs/log";
 import { USER_AGENT, dispatcherFor } from "../libs/proxy";
 import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
+import { inlineSchema } from "./schemas";
 
 interface OpenAIChoice {
   // `reasoning` (LiteLLM/OpenRouter) / `reasoning_content` (vLLM) is where thinking models
@@ -199,13 +200,17 @@ export function buildChatBody(
   req: ChatRequest,
   stream: boolean,
   extra?: Record<string, unknown>,
+  // Whether the backend enforces the schema (response_format). When it does not, the
+  // schema goes into the prompt text instead — a prompt saying "per the schema" must never
+  // reach a model that was shown no schema. Parameterised for the selftest.
+  structured: boolean = LLM_STRUCTURED_OUTPUT,
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     ...extra,
     model: req.model,
     messages: [
       { role: "system", content: req.system },
-      { role: "user", content: req.user },
+      { role: "user", content: structured ? req.user : inlineSchema(req) },
     ],
     temperature: req.temperature ?? LLM_TEMPERATURE,
     max_tokens: req.maxTokens ?? LLM_MAX_TOKENS,
@@ -214,7 +219,7 @@ export function buildChatBody(
   // Without this the stream carries no token counts. vLLM, LiteLLM and Ollama all honour
   // it; a backend that rejects it as unknown trips the buffered fallback in chat().
   if (stream) body["stream_options"] = { include_usage: true };
-  if (req.schema && LLM_STRUCTURED_OUTPUT) {
+  if (req.schema && structured) {
     body["response_format"] = {
       type: "json_schema",
       json_schema: { name: req.schemaName ?? "output", schema: req.schema, strict: true },

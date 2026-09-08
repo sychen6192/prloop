@@ -29,6 +29,7 @@ import {
   PRLOOP_ROOT,
 } from "../config";
 import { log, logVerbose, startHeartbeat } from "../libs/log";
+import { inlineSchema } from "./schemas";
 import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
 
 interface Acc {
@@ -67,20 +68,6 @@ export function traceEvent(line: string, prefix: string, acc: Acc): void {
   }
 }
 
-/** opencode can't enforce a schema, so it goes into the prompt instead. */
-export function inlineSchema(req: ChatRequest): string {
-  if (!req.schema) return req.user;
-  return `${req.user}
-
-## Output format (follow exactly)
-
-Output one JSON object matching the JSON Schema below. No explanatory text, no markdown
-code fence, nothing before or after the JSON.
-
-\`\`\`json
-${JSON.stringify(req.schema, null, 2)}
-\`\`\``;
-}
 
 /**
  * Builds the argv for one `opencode run`. The prompt is deliberately NOT in it — the caller

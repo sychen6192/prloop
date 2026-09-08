@@ -11,7 +11,7 @@
 // are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
 // live in descriptions and in the validators.
 import { FINDING_CATEGORIES, SEVERITIES } from "../config";
-import { REQ_VERDICTS } from "../libs/types";
+import { REQ_VERDICTS, type ChatRequest } from "../libs/types";
 
 export const FINDINGS_SCHEMA = {
   type: "object",
@@ -167,3 +167,24 @@ export const TRIAGE_SCHEMA = {
     },
   },
 } as const;
+
+/**
+ * The schema as prompt text, for paths that cannot enforce it at the token layer: the
+ * opencode runner (no response_format pass-through) and the HTTP runner with
+ * PRR_LLM_STRUCTURED=0. Without this, a prompt that ends "emit JSON per the schema" reaches
+ * a model that was never shown one — seen live: Claude invented its own field names and
+ * every finding was dropped as "incomplete fields".
+ */
+export function inlineSchema(req: ChatRequest): string {
+  if (!req.schema) return req.user;
+  return `${req.user}
+
+## Output format (follow exactly)
+
+Output one JSON object matching the JSON Schema below. No explanatory text, no markdown
+code fence, nothing before or after the JSON.
+
+\`\`\`json
+${JSON.stringify(req.schema, null, 2)}
+\`\`\``;
+}

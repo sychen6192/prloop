@@ -103,14 +103,25 @@ async function runOne(
   const arr = Array.isArray(parsed.value?.findings) ? (parsed.value.findings as unknown[]) : [];
   const findings: RawFinding[] = [];
   let rejected = 0;
+  // The keys of the first dropped item. "4 dropped for incomplete fields" alone sent a
+  // whole debugging session into the prompt; "…had: line, snippet, description" says at
+  // once that the model never saw the schema.
+  let droppedKeys: string | undefined;
   for (const item of arr) {
     const f = validateFinding(item);
     if (f) findings.push(f);
-    else rejected++;
+    else {
+      rejected++;
+      if (droppedKeys === undefined && typeof item === "object" && item !== null) {
+        droppedKeys = Object.keys(item).join(", ") || "(no keys)";
+      }
+    }
   }
   log(
     `finder ${model}: ${findings.length} findings` +
-      (rejected > 0 ? ` (${rejected} dropped for incomplete fields)` : ""),
+      (rejected > 0
+        ? ` (${rejected} dropped for incomplete fields — need file, quote, claim; first dropped had: ${droppedKeys ?? "(not an object)"})`
+        : ""),
   );
   return { model, findings, rejected, raw: res.text };
 }
