@@ -77,15 +77,60 @@ const EMPTY: StaticResult = {
  * line endings alone, which is not a content difference.
  */
 export function matchesReviewedContent(absPath: string, rightLines: string[]): boolean {
-  let onDisk: string[];
-  try {
-    onDisk = splitLines(fs.readFileSync(absPath));
-  } catch {
-    return false;
-  }
-  if (onDisk.length !== rightLines.length) return false;
+  return classifyWorkdirFile(absPath, rightLines) === "match";
+}
+
+/** What the workdir copy of a file is. The three cases have three different fixes. */
+export type WorkdirMatch = "match" | "differs" | "unreadable";
+
+/**
+ * Pure half of the check: `onDisk` is undefined when the file could not be read at all.
+ *
+ * "I could not read this file" is not evidence of a stale checkout, and folding the two
+ * together produced the worst possible message — a permission error on one file told the
+ * user their whole checkout was at the wrong commit and offered a git checkout that would
+ * change nothing.
+ */
+export function classifyWorkdirContent(onDisk: string[] | undefined, rightLines: string[]): WorkdirMatch {
+  if (onDisk === undefined) return "unreadable";
+  if (onDisk.length !== rightLines.length) return "differs";
   const bare = (s: string) => (s.endsWith("\r") ? s.slice(0, -1) : s);
-  return onDisk.every((l, i) => bare(l) === bare(rightLines[i] ?? ""));
+  return onDisk.every((l, i) => bare(l) === bare(rightLines[i] ?? "")) ? "match" : "differs";
+}
+
+/** The file's lines, or undefined when it cannot be read at all (permissions, not a file). */
+function readLinesOrUndefined(absPath: string): string[] | undefined {
+  try {
+    return splitLines(fs.readFileSync(absPath));
+  } catch {
+    return undefined;
+  }
+}
+
+export function classifyWorkdirFile(absPath: string, rightLines: string[]): WorkdirMatch {
+  return classifyWorkdirContent(readLinesOrUndefined(absPath), rightLines);
+}
+
+/** Where a changed file goes: analysed, or excluded for one of three different reasons. */
+export type WorkdirBucket = "analyse" | "not-fetched" | "unreadable" | "stale";
+
+/**
+ * Splits the reasons a changed file is not analysed, which used to be two buckets for three
+ * causes. `readOnDisk` is a thunk so a file we already know we will skip is never read.
+ *
+ * - not-fetched: prloop never had the blob (binary, or over PRR_MAX_FILE_BYTES), so there is
+ *   nothing to compare against. Not the checkout's fault.
+ * - unreadable: the file IS in the checkout but could not be read there. Also not the
+ *   checkout's fault — and counting it as a mismatch told users their commit was wrong.
+ * - stale: the content genuinely differs, which is the one case `git checkout <sha>` fixes.
+ */
+export function bucketWorkdirFile(
+  fd: { binary: boolean; truncated: boolean; rightLines: string[] },
+  readOnDisk: () => string[] | undefined,
+): WorkdirBucket {
+  if (fd.binary || fd.truncated) return "not-fetched";
+  const cls = classifyWorkdirContent(readOnDisk(), fd.rightLines);
+  return cls === "match" ? "analyse" : cls === "unreadable" ? "unreadable" : "stale";
 }
 
 /**
@@ -336,6 +381,10 @@ export async function runStaticGate(
   // Files prloop never read (binary, or past the blob size limit). Counted apart from stale
   // ones so the two are not confused: one is the checkout's problem, the other is not.
   let unreadable = 0;
+  // Files that ARE in the checkout but could not be read there (permissions, an I/O error).
+  // A third case again: nothing about the commit is wrong, so this must never feed the
+  // stale-checkout verdict below.
+  const unreadableOnDisk: string[] = [];
 
   for (const profile of profiles) {
     const targets = filesForProfile(profile, changedPaths).filter((p) => {
@@ -352,16 +401,20 @@ export async function runStaticGate(
       // is stale. Calling that a content mismatch accused the user's checkout of being wrong
       // when the truth was that prloop never read the file. It is still excluded: with no
       // hunks there are no changed lines, so any finding on it would be dropped downstream
-      // regardless.
-      if (fd.binary || fd.truncated) {
-        unreadable++;
-        return false;
+      // regardless. A file that is present but unreadable is a third case again.
+      switch (bucketWorkdirFile(fd, () => readLinesOrUndefined(abs))) {
+        case "not-fetched":
+          unreadable++;
+          return false;
+        case "unreadable":
+          unreadableOnDisk.push(p);
+          return false;
+        case "stale":
+          stale.push(p);
+          return false;
+        default:
+          return true;
       }
-      if (!matchesReviewedContent(abs, fd.rightLines)) {
-        stale.push(p);
-        return false;
-      }
-      return true;
     });
     if (targets.length === 0) continue;
 
@@ -426,7 +479,7 @@ export async function runStaticGate(
   // prloop never read are excluded from the denominator: they are not evidence either way,
   // and counting them was enough to stop this verdict from ever firing on a repo that
   // happens to contain one oversized file.
-  const checkable = analysable - unreadable;
+  const checkable = analysable - unreadable - unreadableOnDisk.length;
   if (checkable > 0 && stale.length === checkable) {
     return {
       ...EMPTY,
@@ -434,7 +487,10 @@ export async function runStaticGate(
       skippedReason:
         `PRR_WORKDIR does not contain the code under review: all ${stale.length} checkable ` +
         `files differ from iteration content` +
-        (unreadable > 0 ? ` (${unreadable} more could not be read at all)` : "") +
+        (unreadable > 0 ? ` (${unreadable} more were never fetched: binary or over the size limit)` : "") +
+        (unreadableOnDisk.length > 0
+          ? ` (${unreadableOnDisk.length} more exist there but could not be read — permissions?)`
+          : "") +
         `. ` +
         (sourceCommit
           ? `Run \`git checkout ${sourceCommit}\` there`
@@ -471,6 +527,15 @@ export async function runStaticGate(
   }
   if (unreadable > 0) {
     logVerbose(`static: ${unreadable} files not analysed, prloop could not read them (binary or over the size limit)`);
+  }
+  if (unreadableOnDisk.length > 0) {
+    // Deliberately not the stale-checkout message: the commit is fine, the file is not
+    // readable. Pointing this at `git checkout` sent people to fix the wrong thing.
+    log(
+      `[WARN] static: ${unreadableOnDisk.length} files exist in PRR_WORKDIR but could not be read ` +
+        `(permissions, or not a regular file) — not analysed, and not evidence of a stale checkout ` +
+        `(${unreadableOnDisk.slice(0, 5).join(", ")}${unreadableOnDisk.length > 5 ? ", ..." : ""})`,
+    );
   }
 
   return { facts, needsTriage, suppressedCount, ranTools, skipped, staleFiles: stale, unresolved };

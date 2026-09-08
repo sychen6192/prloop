@@ -24,8 +24,8 @@ import { banner, die, log } from "./libs/log";
 import { createRunner, tokenTotals } from "./models/runner";
 import { runReview } from "./orchestrator";
 
-function usage(): never {
-  console.error(`Usage: prloop <PR URL> [options]
+const USAGE = `Usage: prloop <PR URL> [options]
+       npm run prloop -- <PR URL> [options]     (any OS, including Windows)
 
   <PR URL>              https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}
 
@@ -38,7 +38,17 @@ Options:
 
 Exit codes: 0 clean | 2 blocking findings | 3 review incomplete (a stage failed) | 1 fatal
 
-Env vars: see .env.example`);
+Env vars: see .env.example`;
+
+/** Asked for help: that is a successful run, so stdout and exit 0. */
+function help(): never {
+  console.log(USAGE);
+  process.exit(0);
+}
+
+/** Called wrong: stderr and a non-zero status, because a pipeline must notice. */
+function usage(): never {
+  console.error(USAGE);
   process.exit(1);
 }
 
@@ -50,7 +60,10 @@ async function main() {
     console.log(renderConfigTable());
     process.exit(0);
   }
-  if (args.length === 0 || args.includes("-h") || args.includes("--help")) usage();
+  // --help is a request, not a mistake. Exiting 1 to stderr made `prloop --help` look like a
+  // failure to every caller that checks a status code, CI smoke tests included.
+  if (args.includes("-h") || args.includes("--help")) help();
+  if (args.length === 0) usage();
 
   let compareTo = 0;
   let sinceAuto = false;

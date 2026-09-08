@@ -124,7 +124,8 @@ child process gets the same treatment.
 ## Setup
 
 Needs Node 20+, an OpenAI-compatible endpoint (LiteLLM / vLLM / Ollama `/v1`), and ADO auth —
-either a PAT with **Code (Read & Write)**, or just `az login`.
+either a PAT with **Code (Read & Write) + Work Items (Read)** (the requirement axis reads the
+linked work item, and a Code-only PAT fails there), or just `az login`.
 
 ```bash
 git clone <repo> prloop && cd prloop
@@ -165,6 +166,22 @@ prloop '<PR URL>' --dry-run      # compute everything, post nothing — do this 
 prloop '<PR URL>'                # publish
 prloop '<PR URL>' --since auto   # incremental: only commits since the last review
 ```
+
+The wrapper is bash, so on **Windows** (and anywhere else without it) use the npm script,
+which runs the same entry point through the repo's own `tsx` — from the prloop directory:
+
+```powershell
+npm run prloop -- "<PR URL>" --dry-run
+npm run prloop -- "<PR URL>" --since auto
+```
+
+The `--` is required: without it npm swallows the arguments. `prloop --help` prints this
+usage to stdout and exits 0. Both paths need `npm ci` (dev dependencies included) to have
+run in the prloop directory — `npm ci --omit=dev` removes `tsx` and neither can start.
+
+prloop's own requests trust `PRR_CA_CERTS` either way (`libs/tls.ts` applies it in process).
+The bash wrapper additionally exports it as `NODE_EXTRA_CA_CERTS` for child processes; on the
+npm path, set that yourself if `az`, `git` or `opencode` need the corporate CA.
 
 URL format: `https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}`.
 On-prem and `visualstudio.com` are derived from the URL itself, virtual directories included.
@@ -230,7 +247,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |
 | `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size |
-| `PRR_LLM_RETRIES` | `1` | retries on transient model failures (never on 4xx) |
+| `PRR_LLM_RETRIES` | `1` | **EXTRA** attempts on transient model failures — `1` = up to two calls, `0` = never retry (never on 4xx) |
 | `PRR_LLM_MAX_TOKENS` | `8192` | **raise to 16384+ for thinking models** — reasoning is billed to this budget |
 | `PRR_LLM_STREAM` | `1` | stream completions (SSE) so a gateway's idle timeout can't 504 a long generation; `0` = buffered |
 | `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request — engine knobs prloop has no flag for; prloop's own fields win on conflict |
@@ -250,6 +267,9 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_TRIAGE_MODEL` | — | unset = high-FP tool findings are dropped |
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |
 | `PRR_DRY_RUN` | — | `1` = compute, publish nothing |
+| `PRR_ADO_MAX_RETRIES` | `3` | **TOTAL** attempts per ADO request, first try included — `1` = never retry. Opposite sense to `PRR_LLM_RETRIES`; both names are published, so neither was renamed |
+| `PRR_RUNS_KEEP` | `20` | iteration directories kept per PR under `runs/`, oldest deleted first; `0` = keep everything. Never touches `dismissals.jsonl` |
+| `PRR_RUNS_MAX_AGE_DAYS` | `0` | also delete iteration directories older than this; `0` = no age limit |
 
 Everything else prloop reads. `prloop --config` prints this same list with the value each
 one currently has and where it came from (`shell` / `.env` / `default`), which is the fast

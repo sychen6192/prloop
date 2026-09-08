@@ -130,6 +130,8 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
 
   { name: "PRR_QUIET", kind: "bool", section: S_DIAG, description: "1 = drop the verbose log lines" },
   { name: "PRR_RUNS_DIR", kind: "string", section: S_DIAG, description: "artifacts root (default: the tool's own runs/)" },
+  { name: "PRR_RUNS_KEEP", kind: "number", section: S_DIAG, description: "iteration dirs kept per PR; 0 = keep every one" },
+  { name: "PRR_RUNS_MAX_AGE_DAYS", kind: "number", section: S_DIAG, description: "also delete iteration dirs older than N days; 0 = off" },
   { name: "PRR_SHOW_CONFIG", kind: "bool", section: S_DIAG, description: "1 = print this table and exit, same as --config" },
 ];
 
@@ -350,6 +352,9 @@ export const AZ_BIN = strEnv("PRR_AZ_BIN", "az");
 export const ADO_BASE_URL = strEnv("PRR_ADO_BASE_URL", "");
 export const ADO_API_VERSION = strEnv("PRR_ADO_API_VERSION", "7.1");
 export const ADO_TIMEOUT_MS = numEnv("PRR_ADO_TIMEOUT_MS", 60_000, 1000);
+// TOTAL attempts per ADO request, not extra ones: 3 = the first try plus 2 retries, and 1
+// disables retrying. The opposite of PRR_LLM_RETRIES, which counts EXTRA attempts — both
+// published knobs, so the names stay and the semantics are spelled out in both places.
 export const ADO_MAX_RETRIES = numEnv("PRR_ADO_MAX_RETRIES", 3, 1);
 // Blob fetches in flight at once during intake (ADO rate-limits aggressive parallelism).
 export const ADO_CONCURRENCY = numEnv("PRR_ADO_CONCURRENCY", 6, 1);
@@ -405,9 +410,11 @@ export const LLM_STALL_TIMEOUT_MS = numEnv("PRR_LLM_STALL_TIMEOUT_MS", 120_000, 
 // anchored finding, so an uncapped run can put dozens of requests on a self-hosted endpoint
 // simultaneously; they then queue in the engine while their own timeouts run down. 0 = no cap.
 export const LLM_CONCURRENCY = numEnv("PRR_LLM_CONCURRENCY", 6);
-// Extra attempts for a model call that failed for a TRANSIENT reason (timeout, socket
-// error, 429, 5xx). Inference is a read-only operation, so a retry is always safe. A 4xx
-// schema or auth rejection is deterministic and is never retried. 0 disables.
+// EXTRA attempts on top of the first for a model call that failed for a TRANSIENT reason
+// (timeout, socket error, 429, 5xx): 1 = up to two calls in total, 0 disables retrying.
+// Note the asymmetry with PRR_ADO_MAX_RETRIES, which counts TOTAL attempts.
+// Inference is a read-only operation, so a retry is always safe. A 4xx schema or auth
+// rejection is deterministic and is never retried.
 // Without this, one flaky verifier call silently deletes an inline comment: its finding
 // stays single-source, fails the corroboration gate, and drops to the summary.
 export const LLM_RETRIES = numEnv("PRR_LLM_RETRIES", 1);
@@ -838,6 +845,14 @@ export const BOT_MARKER = "<!-- prloop -->";
 
 // Artifacts root.
 export const RUNS_DIR = strEnv("PRR_RUNS_DIR", path.join(PRLOOP_ROOT, "runs"));
+// Retention for those artifacts. One run writes the whole finder prompt (up to
+// PRR_MAX_DIFF_CHARS), every model's raw output and every skeptic prompt, and nothing used
+// to remove any of it — a cron box reviewing the same repo daily grew without bound.
+// Iteration directories per PR to keep, newest first; 0 = keep every iteration.
+export const RUNS_KEEP = numEnv("PRR_RUNS_KEEP", 20, 0);
+// Age ceiling for an iteration directory, in days. 0 = no age limit. Independent of
+// PRR_RUNS_KEEP: either rule alone is enough to delete a directory.
+export const RUNS_MAX_AGE_DAYS = numEnv("PRR_RUNS_MAX_AGE_DAYS", 0, 0);
 
 export const SEVERITIES = ["critical", "high", "medium", "low"] as const;
 export type Severity = (typeof SEVERITIES)[number];

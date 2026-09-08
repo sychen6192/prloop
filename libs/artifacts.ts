@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { RUNS_DIR } from "../config";
+import { RUNS_DIR, RUNS_KEEP, RUNS_MAX_AGE_DAYS } from "../config";
 import { attachLogSink } from "./log";
 import { redactSecrets } from "./redact";
 import type { PrRef } from "./types";
@@ -34,6 +34,81 @@ function timestamp(): string {
 }
 
 const safe = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_");
+
+// Only these are ever pruned. The learnings store (dismissals.jsonl) lives further up the
+// tree in runs/<org>/<project>/<repo>/ and is the one thing here that must survive: it is
+// the record of what humans rejected, not an audit trail of one run.
+const ITER_PREFIX = "iter-";
+
+export interface RunEntry {
+  name: string;
+  mtimeMs: number;
+}
+
+/**
+ * Which iteration directories to delete, newest kept first. Pure so the policy is testable
+ * without a disk — the impure half below only reads mtimes and removes what this names.
+ *
+ * The two rules are independent: a directory goes if it is past the keep count OR older
+ * than the age limit. 0 disables a rule rather than making it maximally aggressive; a
+ * PRR_RUNS_KEEP=0 that deleted every run (including the one being written) would be the
+ * worst possible reading of "keep 0".
+ */
+export function selectForPruning(
+  entries: RunEntry[],
+  opts: { keep: number; maxAgeDays: number; now: number },
+): string[] {
+  const iters = entries
+    .filter((e) => e.name.startsWith(ITER_PREFIX))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const doomed = new Set<string>();
+  if (opts.keep > 0) for (const e of iters.slice(opts.keep)) doomed.add(e.name);
+  if (opts.maxAgeDays > 0) {
+    const cutoff = opts.now - opts.maxAgeDays * 24 * 60 * 60 * 1000;
+    for (const e of iters) if (e.mtimeMs < cutoff) doomed.add(e.name);
+  }
+  return iters.filter((e) => doomed.has(e.name)).map((e) => e.name);
+}
+
+/**
+ * Applies the retention policy to one PR's directory, after the new run's directory exists.
+ *
+ * Best-effort throughout: a failure to prune is a disk-space problem, never a reason to
+ * lose a review that has already paid for its model calls.
+ */
+function pruneIterations(prDir: string, justCreated: string): void {
+  if (RUNS_KEEP <= 0 && RUNS_MAX_AGE_DAYS <= 0) return;
+  try {
+    const entries: RunEntry[] = [];
+    for (const e of fs.readdirSync(prDir, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      try {
+        entries.push({ name: e.name, mtimeMs: fs.statSync(path.join(prDir, e.name)).mtimeMs });
+      } catch {
+        // Vanished between readdir and stat (a concurrent run pruning the same PR). Not ours.
+      }
+    }
+    const doomed = selectForPruning(entries, {
+      keep: RUNS_KEEP,
+      maxAgeDays: RUNS_MAX_AGE_DAYS,
+      now: Date.now(),
+    });
+    let removed = 0;
+    for (const name of doomed) {
+      // Belt and braces: whatever the policy says, never the directory this run is about
+      // to write into.
+      if (name === justCreated) continue;
+      fs.rmSync(path.join(prDir, name), { recursive: true, force: true });
+      removed++;
+    }
+    // Deleting a run's artifacts is data loss, however welcome — say it happened.
+    if (removed > 0) {
+      console.log(`Pruned ${removed} old run director${removed === 1 ? "y" : "ies"} in ${prDir}`);
+    }
+  } catch (e) {
+    console.error(`[WARN] could not prune old runs in ${prDir}: ${e instanceof Error ? e.message : e}`);
+  }
+}
 
 // ─── Model call log ──────────────────────────────────────────────────────────
 // One line per model ATTEMPT, written by models/runner.ts. It cannot reach a run directory
@@ -113,6 +188,9 @@ export function buildResultSummary(input: ResultSummaryInput): Record<string, un
  */
 export function openRunDir(dir: string, tee = false): RunDir {
   fs.mkdirSync(dir, { recursive: true });
+  // Retention runs here, after the new directory exists, so the run being written is always
+  // the newest thing in the PR's directory and can never be the one deleted.
+  pruneIterations(path.dirname(dir), path.basename(dir));
   // Best-effort: a full disk or read-only runs/ must not kill a review that has already
   // paid for its model calls — the artifacts are an audit trail, not the product.
   //
@@ -169,7 +247,7 @@ export function createRunDir(ref: PrRef, iterationId: number): RunDir {
       safe(ref.project),
       safe(ref.repoId),
       `pr-${ref.prId}`,
-      `iter-${iterationId}-${timestamp()}`,
+      `${ITER_PREFIX}${iterationId}-${timestamp()}`,
     ),
     true,
   );

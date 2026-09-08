@@ -10,6 +10,16 @@ import { commandExists, run } from "../libs/shell";
 // resource, or every request comes back 203 with a sign-in page.
 const ADO_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798";
 
+/**
+ * The PAT scopes prloop actually needs, in the words the ADO PAT screen uses.
+ *
+ * Work Items (Read) is not optional and used to be missing from every message and document:
+ * the requirement axis reads the linked work item, so a Code-only PAT sails through intake
+ * and then fails on the one stage the operator cannot see into. One constant, quoted by the
+ * README and .env.example too, so the four places cannot drift apart again.
+ */
+export const AUTH_SCOPE_HINT = "Code (Read & Write) + Work Items (Read)";
+
 interface CachedToken {
   token: string;
   expiresAtMs: number;
@@ -21,6 +31,18 @@ export class AuthError extends Error {
     super(message);
     this.name = "AuthError";
   }
+}
+
+// Whether `az` is on PATH, asked once. authHeader() runs on EVERY request, so in `auto` mode
+// without a PAT this spawned a `which az` per ADO call — hundreds during intake at
+// PRR_ADO_CONCURRENCY=6, each one a process. The answer cannot change mid-run.
+// The promise itself is cached, so concurrent first callers share one probe.
+let azProbe: Promise<boolean> | undefined;
+
+/** `probe` is injectable for the selftest; production always uses commandExists. */
+export function azOnPath(probe: () => Promise<boolean> = () => commandExists(AZ_BIN)): Promise<boolean> {
+  azProbe ??= probe();
+  return azProbe;
 }
 
 interface AzTokenResponse {
@@ -89,10 +111,10 @@ export async function authHeader(): Promise<string> {
 
   // auto
   if (ADO_PAT) return `Basic ${Buffer.from(`:${ADO_PAT}`).toString("base64")}`;
-  if (await commandExists(AZ_BIN)) return `Bearer ${await getAzToken()}`;
+  if (await azOnPath()) return `Bearer ${await getAzToken()}`;
   throw new AuthError(
     "No usable auth: PRR_ADO_PAT unset and no az CLI on PATH. " +
-      "Set a PAT, or install the az CLI and run az login.",
+      `Set a PAT with ${AUTH_SCOPE_HINT}, or install the az CLI and run az login.`,
   );
 }
 
@@ -100,9 +122,9 @@ export async function authHeader(): Promise<string> {
 export async function describeAuthMode(): Promise<string> {
   if (ADO_AUTH_MODE === "pat") return ADO_PAT ? "pat (PAT set)" : "pat (PAT missing)";
   if (ADO_AUTH_MODE === "azcli") {
-    return (await commandExists(AZ_BIN)) ? "azcli (az available)" : "azcli (az not found)";
+    return (await azOnPath()) ? "azcli (az available)" : "azcli (az not found)";
   }
   if (ADO_PAT) return "auto → pat (PRR_ADO_PAT detected)";
-  if (await commandExists(AZ_BIN)) return "auto → azcli (no PAT, az CLI detected)";
+  if (await azOnPath()) return "auto → azcli (no PAT, az CLI detected)";
   return "auto → no usable auth";
 }

@@ -14,7 +14,8 @@
     "probe": "tsx scripts/probe.ts",
     "tlsfix": "tsx scripts/tlsfix.ts",
     "setup": "tsx scripts/setup.ts",
-    "demo": "tsx scripts/demo.ts"
+    "demo": "tsx scripts/demo.ts",
+    "prloop": "tsx loop.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

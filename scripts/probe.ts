@@ -53,7 +53,7 @@ async function rawGet(url: string, header: string): Promise<void> {
     if (res.status === 203 || ctype.includes("text/html")) {
       console.log(
         "  → Got a sign-in page, not JSON. Auth was rejected: PAT invalid, expired, " +
-          "or missing the Code (Read & Write) scope.",
+          "or missing scope (needs Code (Read & Write) + Work Items (Read)).",
       );
       return;
     }

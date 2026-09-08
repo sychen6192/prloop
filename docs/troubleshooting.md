@@ -148,8 +148,9 @@ probe flags this.
   To confirm the cause you can temporarily set `NODE_TLS_REJECT_UNAUTHORIZED=0`, but **don't leave it** —
   it disables all certificate verification, which means accepting any man-in-the-middle. Switch back to
   `PRR_CA_CERTS` as soon as you've confirmed.
-- **203 / login page error.** PAT invalid or missing scope (needs Code Read & Write). On az CLI, usually
-  an expired `az login` or the wrong tenant — rerun `az login`.
+- **203 / login page error.** PAT invalid or missing scope (needs Code (Read & Write) + Work Items
+  (Read) — the requirement axis reads the linked work item). On az CLI, usually an expired
+  `az login` or the wrong tenant — rerun `az login`.
 - **az errors.** `doctor` shows the current auth mode and az login identity. To force one auth method,
   set `PRR_AUTH_MODE=pat` or `azcli`. az tokens are cached in-process, not fetched per request.
 - **Comment landed on the wrong line.** This is the exact problem the tool exists to fix. If it still

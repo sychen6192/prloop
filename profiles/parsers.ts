@@ -1,6 +1,7 @@
 // Output parsers. Every tool gets normalized to ToolFinding so the rest of the pipeline
 // never knows which linter a finding came from.
 import { parseJsonObject } from "../libs/json";
+import { log } from "../libs/log";
 import type { Severity } from "../config";
 import type { OutputFormat, ToolFinding, ToolSpec } from "./types";
 
@@ -325,8 +326,15 @@ export function parseToolOutput(raw: string, spec: ToolSpec, workdir: string): T
   if (!raw.trim()) return [];
   try {
     return PARSERS[spec.format](raw, spec, workdir);
-  } catch {
-    // A parser blowing up must not take the review down with it.
+  } catch (e) {
+    // A parser blowing up must not take the review down with it — but it must not look like
+    // a clean tool run either. An empty array is exactly what a passing linter returns, so
+    // without this line a parser bug (or a tool that changed its output format) removes a
+    // whole tool from the review and nothing anywhere says so.
+    log(
+      `[WARN] ${spec.name}: could not parse ${spec.format} output, dropping its findings ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
     return [];
   }
 }

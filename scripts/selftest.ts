@@ -97,6 +97,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
+// Phase 2F: resource safety and operational edges.
+import { run } from "../libs/shell";
+import { selectForPruning } from "../libs/artifacts";
+import { bucketWorkdirFile, classifyWorkdirContent, classifyWorkdirFile } from "../gates/static";
+import { AdoError, AdoTooLargeError, diagnose, exceedsMaxBytes } from "../ado/client";
+import { AUTH_SCOPE_HINT, azOnPath } from "../ado/auth";
+import { isFileMissing } from "../ado/conventions";
 
 let passed = 0;
 let failed = 0;
@@ -3120,6 +3127,288 @@ section("config SSOT: registry, readers, .env.example and the README settings ta
   }
   eq("no PRR_ setting is read outside config.ts", strays, []);
   eq("the defaults the readers recorded are the ones the table shows", defaultOf("PRR_LLM_MAX_TOKENS"), "8192");
+}
+
+section("static-tool subprocesses: the timeout kills the tree, not just the child");
+{
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // Everything a caller already depends on, unchanged by the move from execFile to spawn.
+  const okRun = await run(process.execPath, ["-e", "process.stdout.write('hi')"], 10_000);
+  eq("a normal command still returns its stdout", okRun.stdout, "hi");
+  eq("...and exit code 0", okRun.code, 0);
+  const nonZero = await run(process.execPath, ["-e", "process.exit(3)"], 10_000);
+  eq("a tool's own non-zero exit status survives", nonZero.code, 3);
+  const missing = await run("prloop-no-such-binary", [], 10_000);
+  check("a command that does not exist is still a failure", missing.code !== 0);
+  check("...and now says which failure it was", missing.stderr.includes("not found"));
+
+  if (process.platform !== "win32") {
+    // The regression. Every TypeScript-profile tool is `npx <tool>`, which execs the real
+    // tool as a GRANDCHILD holding the inherited stdout pipe. execFile's timeout signalled
+    // only npx and its callback fires on 'close', which waits for those pipes — so the gate
+    // sat there long past PRR_STATIC_TIMEOUT_MS instead of giving up.
+    const started = Date.now();
+    const timedOut = await run("sh", ["-c", "sleep 30 & echo $!; wait"], 500);
+    const took = Date.now() - started;
+    const grandchild = Number(timedOut.stdout.trim());
+    check("a timed-out tool returns instead of waiting on a grandchild's pipe", took < 10_000, `${took}ms`);
+    check("the timeout is named, not left as a bare exit code", timedOut.stderr.includes("timed out after 500ms"));
+    check("...and flagged on the result", timedOut.timedOut === true);
+    check("...and is not reported as success", timedOut.code !== 0);
+
+    // Reaping the grandchild needs process-group signals to actually be delivered, which a
+    // sandboxed container may refuse (the same limitation the killTree test above hits).
+    // Probe it rather than reporting an environment restriction as a code failure.
+    const probe = spawnChild("sh", ["-c", "sleep 30 & echo $!; wait"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      detached: true,
+    });
+    const probeGrandchild = await new Promise<number>((res) => {
+      probe.stdout.setEncoding("utf8");
+      probe.stdout.once("data", (d: string) => res(Number(d.trim())));
+    });
+    killTree(probe, "SIGKILL");
+    await new Promise((r) => setTimeout(r, 300));
+    const groupSignalsDelivered = !alive(probeGrandchild);
+
+    if (groupSignalsDelivered) {
+      check("the grandchild is reaped along with the tree", !alive(grandchild));
+    } else {
+      console.log("  [SKIP] grandchild reaping — this environment does not deliver process-group signals");
+    }
+    for (const pid of [grandchild, probeGrandchild]) {
+      if (pid > 0 && alive(pid)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  }
+}
+
+section("runs/ retention");
+{
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.UTC(2026, 8, 8);
+  const at = (name: string, ageDays: number) => ({ name, mtimeMs: now - ageDays * day });
+  // Newest last on purpose: the policy must sort, not trust readdir order.
+  const dirs = [
+    at("iter-1-20260101-000000", 100),
+    at("iter-2-20260801-000000", 40),
+    at("iter-3-20260829-000000", 10),
+    at("iter-4-20260907-000000", 1),
+    at("iter-5-20260908-000000", 0),
+  ];
+
+  eq(
+    "keeps the newest N, oldest deleted first",
+    selectForPruning(dirs, { keep: 2, maxAgeDays: 0, now }),
+    ["iter-3-20260829-000000", "iter-2-20260801-000000", "iter-1-20260101-000000"],
+  );
+  eq(
+    "the age cutoff works on its own",
+    selectForPruning(dirs, { keep: 0, maxAgeDays: 30, now }),
+    ["iter-2-20260801-000000", "iter-1-20260101-000000"],
+  );
+  eq(
+    "with both, either rule alone is enough",
+    selectForPruning(dirs, { keep: 4, maxAgeDays: 30, now }),
+    ["iter-2-20260801-000000", "iter-1-20260101-000000"],
+  );
+  eq("0 disables the keep count rather than deleting everything", selectForPruning(dirs, { keep: 0, maxAgeDays: 0, now }), []);
+  eq("0 disables the age limit too", selectForPruning(dirs, { keep: 0, maxAgeDays: 0, now: now + 400 * day }), []);
+  eq("keeping more than exist deletes nothing", selectForPruning(dirs, { keep: 99, maxAgeDays: 0, now }), []);
+
+  // The learnings store is the one thing under runs/ that must outlive every run: it is the
+  // record of what humans rejected, and losing it re-posts findings they already dismissed.
+  const withStore = [
+    ...dirs,
+    { name: "dismissals.jsonl", mtimeMs: now - 400 * day },
+    { name: "pr-77", mtimeMs: now - 400 * day },
+    { name: "notes", mtimeMs: 0 },
+  ];
+  const doomed = selectForPruning(withStore, { keep: 1, maxAgeDays: 1, now });
+  check("the dismissals store is never selected", !doomed.includes("dismissals.jsonl"));
+  check("nothing outside iter-* is ever selected", doomed.every((n) => n.startsWith("iter-")));
+}
+
+section("CLI entry points");
+{
+  const wrapper = fs.readFileSync(path.join(PRLOOP_ROOT, "bin", "prloop"), "utf8");
+  // Commentary is allowed to name the old command; the executable lines are not.
+  const wrapperCode = wrapper
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("#"))
+    .join("\n");
+  // `npx tsx` resolved from the CALLER's directory: it ran whatever tsx that project had, or
+  // downloaded one mid-run — which on an air-gapped box is a hang, not an error.
+  check("the wrapper runs the repo's own tsx", wrapperCode.includes("node_modules/.bin/tsx"));
+  check("...and never fetches one at run time", !/npx\s+tsx/.test(wrapperCode) && wrapperCode.includes("--no-install"));
+  check("...and says what to run when tsx is missing", wrapperCode.includes("npm ci"));
+
+  const pkg = JSON.parse(fs.readFileSync(path.join(PRLOOP_ROOT, "package.json"), "utf8")) as {
+    scripts?: Record<string, string>;
+  };
+  // The only entry point that works on Windows, where bash is not a given but npm is.
+  eq("npm run prloop is wired up", pkg.scripts?.["prloop"], "tsx loop.ts");
+
+  // Not `spawnSync("npx", ...)`: on Windows that is npx.cmd, which Node refuses to spawn
+  // directly (CVE-2024-27980). Running the tsx CLI with the current node needs no shell.
+  // node_modules may sit above PRLOOP_ROOT (a git worktree shares its parent's install), so
+  // walk up for it rather than reporting a missing install as a code failure.
+  let tsxCli: string | undefined;
+  for (let dir = PRLOOP_ROOT, i = 0; i < 5; i++, dir = path.dirname(dir)) {
+    const candidate = path.join(dir, "node_modules", "tsx", "dist", "cli.mjs");
+    if (fs.existsSync(candidate)) {
+      tsxCli = candidate;
+      break;
+    }
+  }
+  if (tsxCli === undefined) {
+    console.log("  [SKIP] --help exit status — no installed tsx CLI found to run loop.ts with");
+  } else {
+    const helped = spawnSync(process.execPath, [tsxCli, path.join(PRLOOP_ROOT, "loop.ts"), "--help"], {
+      encoding: "utf8",
+      env: { ...process.env, PRR_QUIET: "1" },
+    });
+    // --help exited 1 to stderr, so every caller that checks a status code — a CI smoke test
+    // included — saw asking for help as a failed run.
+    eq("--help exits 0", helped.status, 0);
+    check("--help prints usage to stdout", (helped.stdout ?? "").includes("Usage: prloop"));
+    check("...including the OS-independent invocation", (helped.stdout ?? "").includes("npm run prloop"));
+    check("--help does not print usage to stderr", !(helped.stderr ?? "").includes("Usage: prloop"));
+  }
+}
+
+section("ADO and parser edges");
+{
+  // (a) Only a 404 means "this repo has no CONTRIBUTING.md". A 401 or a 5xx used to look
+  // exactly the same, so a scope-less PAT silently emptied the conventions of every review.
+  check("a 404 is a missing file", isFileMissing(new AdoError("nope", 404)));
+  check("a 401 is not", !isFileMissing(new AdoError("unauthorized", 401)));
+  check("a 500 is not", !isFileMissing(new AdoError("boom", 500)));
+  check("a transport failure with no status is not", !isFileMissing(new AdoError("Connection failed")));
+  check("a non-Ado error is not", !isFileMissing(new Error("socket hang up")));
+
+  // (b) A parser exception used to return [], which is byte-identical to a clean tool run.
+  const brokenSpec = {
+    name: "pretend-linter",
+    bin: "x",
+    args: () => [],
+    format: "no-such-format",
+    tier: "triage",
+  } as unknown as ToolSpec;
+  const capture = <T,>(fn: () => T): { value: T; lines: string[] } => {
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    };
+    try {
+      return { value: fn(), lines };
+    } finally {
+      console.log = realLog;
+    }
+  };
+  const { value: parsed, lines: logged } = capture(() => parseToolOutput("some output", brokenSpec, "/w"));
+  eq("a parser blowing up still returns no findings", parsed, []);
+  check(
+    "...but says so, with the tool's name",
+    logged.some((l) => l.includes("pretend-linter") && l.includes("[WARN]")),
+    logged.join(" | "),
+  );
+
+  // (c) authHeader() runs per request, so an uncached `which az` cost hundreds of processes
+  // during intake at PRR_ADO_CONCURRENCY=6.
+  let probes = 0;
+  const countingProbe = async () => {
+    probes++;
+    return true;
+  };
+  const [a1, a2, a3] = await Promise.all([azOnPath(countingProbe), azOnPath(countingProbe), azOnPath(countingProbe)]);
+  eq("az is probed once per process, not once per request", probes, 1);
+  check("...and every caller gets the answer", a1 === true && a2 === true && a3 === true);
+
+  // (d) The size limit is decided before the download now: an oversized blob used to be
+  // fetched whole, twice (once per side of the diff), only to be skipped.
+  check("a declared length over the limit is refused", exceedsMaxBytes("4000000", 2_000_000));
+  check("a length under the limit is not", !exceedsMaxBytes("1999999", 2_000_000));
+  check("exactly the limit is allowed", !exceedsMaxBytes("2000000", 2_000_000));
+  check("no content-length means read and cap instead", !exceedsMaxBytes(null, 2_000_000));
+  check("an unparseable content-length means read and cap instead", !exceedsMaxBytes("chunked", 2_000_000));
+  check("no limit means no refusal", !exceedsMaxBytes("999999999", undefined));
+  const tooLarge = new AdoTooLargeError(4_000_000, 2_000_000);
+  eq("the refusal carries a status the retry loop treats as final", tooLarge.status, 413);
+  check("...and is an AdoError, so callers' catch clauses still work", tooLarge instanceof AdoError);
+  eq("...and reports the size that broke the limit", tooLarge.bytes, 4_000_000);
+
+  // (e) The TLS hint pointed at NODE_EXTRA_CA_CERTS while libs/tls.ts, doctor and the README
+  // all read PRR_CA_CERTS — following it changed nothing and looked like a prloop bug.
+  const tlsHint = diagnose(Object.assign(new Error("unable to verify the first certificate"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" }));
+  check("the TLS hint names the knob prloop actually reads", tlsHint.includes("PRR_CA_CERTS"));
+  check("...and points at the tool that writes it", tlsHint.includes("tlsfix"));
+  check("...and no longer sends people to NODE_EXTRA_CA_CERTS", !tlsHint.includes("NODE_EXTRA_CA_CERTS"));
+
+  // (f) Same word, opposite meaning, in two published knob names. Neither can be renamed, so
+  // every place that documents them has to say which one it means.
+  const readme = fs.readFileSync(path.join(PRLOOP_ROOT, "README.md"), "utf8");
+  const envExample = fs.readFileSync(path.join(PRLOOP_ROOT, ".env.example"), "utf8");
+  const configSrc = fs.readFileSync(path.join(PRLOOP_ROOT, "config.ts"), "utf8");
+  const row = (knob: string) => readme.split("\n").find((l) => l.startsWith(`| \`${knob}\``)) ?? "";
+  check("README says PRR_ADO_MAX_RETRIES counts TOTAL attempts", row("PRR_ADO_MAX_RETRIES").includes("TOTAL"));
+  check("README says PRR_LLM_RETRIES counts EXTRA attempts", row("PRR_LLM_RETRIES").includes("EXTRA"));
+  check(".env.example states both senses", envExample.includes("TOTAL attempts") && envExample.includes("EXTRA attempts"));
+  check("the config registry states both senses", configSrc.includes("TOTAL attempts") && configSrc.includes("EXTRA attempts"));
+
+  // (g) A file prloop could not read is not evidence about the checkout's commit.
+  const reviewedLines = ["def run():", "    return compute()"];
+  eq("identical content matches", classifyWorkdirContent(["def run():", "    return compute()"], reviewedLines), "match");
+  eq("a CRLF-only difference still matches", classifyWorkdirContent(["def run():\r", "    return compute()\r"], reviewedLines), "match");
+  eq("changed content differs", classifyWorkdirContent(["def run():", "    return cached()"], reviewedLines), "differs");
+  eq("a different length differs", classifyWorkdirContent(["def run():"], reviewedLines), "differs");
+  eq("an unreadable file is its own answer, not a mismatch", classifyWorkdirContent(undefined, reviewedLines), "unreadable");
+  const unreadableDir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-unreadable-"));
+  eq("a path that cannot be read as a file is unreadable", classifyWorkdirFile(unreadableDir, reviewedLines), "unreadable");
+  check("...and the boolean wrapper still rejects it", !matchesReviewedContent(unreadableDir, reviewedLines));
+  fs.rmSync(unreadableDir, { recursive: true, force: true });
+  // The bucketing the stale-checkout verdict counts on. An unreadable file used to land in
+  // the stale list, so a permissions error produced "your checkout is at the wrong commit"
+  // and an instruction to check out a SHA that would have changed nothing.
+  const fetched = { binary: false, truncated: false, rightLines: reviewedLines };
+  eq("matching content is analysed", bucketWorkdirFile(fetched, () => reviewedLines), "analyse");
+  eq("differing content is stale", bucketWorkdirFile(fetched, () => ["other"]), "stale");
+  eq("an unreadable file is NOT stale", bucketWorkdirFile(fetched, () => undefined), "unreadable");
+  eq("a binary blob was never fetched", bucketWorkdirFile({ ...fetched, binary: true }, () => reviewedLines), "not-fetched");
+  eq("an oversized blob was never fetched", bucketWorkdirFile({ ...fetched, truncated: true }, () => reviewedLines), "not-fetched");
+  let reads = 0;
+  bucketWorkdirFile({ ...fetched, truncated: true }, () => {
+    reads++;
+    return reviewedLines;
+  });
+  eq("a file we already know we will skip is never read from disk", reads, 0);
+
+  // (h) The PAT scope is one string, quoted everywhere, because the requirement axis reads
+  // work items and a Code-only PAT fails there with no explanation.
+  eq("the scope hint names both scopes", AUTH_SCOPE_HINT, "Code (Read & Write) + Work Items (Read)");
+  check("the README documents both scopes", readme.includes(AUTH_SCOPE_HINT));
+  check(".env.example documents both scopes", envExample.includes(AUTH_SCOPE_HINT));
+
+  // The new retention knobs, documented in all three places like every other knob.
+  for (const knob of ["PRR_RUNS_KEEP", "PRR_RUNS_MAX_AGE_DAYS"]) {
+    check(`${knob} is in the config registry`, configSrc.includes(knob));
+    check(`${knob} is in .env.example`, envExample.includes(knob));
+    check(`${knob} is in the README table`, row(knob) !== "");
+  }
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);
