@@ -6,7 +6,7 @@ import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
 import { buildHunks, diffLines, renderUnifiedDiff } from "../libs/diff";
-import { parseJsonObject } from "../libs/json";
+import { escapeControlCharsInStrings, parseJsonObject } from "../libs/json";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildDiffPayload } from "../libs/payload";
 import { htmlToText } from "../libs/html";
@@ -469,6 +469,23 @@ section("model output parsing (fail-closed)");
 {
   const r = parseJsonObject<{ a: string }>('some prose\n{"a":"has } brace"}\ntrailer');
   check("braces inside strings do not break balancing", r.ok && r.value.a === "has } brace");
+}
+{
+  // Hand-written JSON (no guided decoding) with a real newline and tab inside a string —
+  // the multi-line quote / suggested_fix case. The repair must yield exactly the characters
+  // the model wrote, so anchoring still matches the source byte for byte.
+  const r = parseJsonObject<{ quote: string; fix: string }>('{"quote":"if (x) {\n\treturn;","fix":"a\r\nb"}');
+  check("raw newline/tab inside a string is repaired", r.ok, r.ok ? "" : r.error);
+  check("...to the characters the model wrote", r.ok && r.value.quote === "if (x) {\n\treturn;" && r.value.fix === "a\r\nb");
+}
+{
+  const r = parseJsonObject<{ a: string; b: string }>('{"a":"already\\nescaped","b":"quote \\" then\nnewline"}');
+  check("escaped sequences are left alone, raw ones after an escape still repaired", r.ok && r.value.a === "already\nescaped" && r.value.b === 'quote " then\nnewline');
+}
+{
+  const r = parseJsonObject<{ a: number }>('prose first\n{\n  "a": 1\n}\n');
+  check("newlines outside strings untouched, balancing still works", r.ok && r.value.a === 1);
+  check("valid JSON survives the repair unchanged", escapeControlCharsInStrings('{"a":"b\\n","c":[1,2]}') === '{"a":"b\\n","c":[1,2]}');
 }
 {
   const r = parseJsonObject("not JSON at all");
