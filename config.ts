@@ -86,6 +86,8 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_RULES_DIR", kind: "string", section: S_FINDER, description: "reviewer rules dir (default: the tool's own rules/)" },
 
   { name: "PRR_MAX_DIFF_CHARS", kind: "number", section: S_BUDGET, description: "ceiling on the diff sent to a finder" },
+  { name: "PRR_CONTEXT_TOKENS", kind: "number", section: S_BUDGET, description: "model context window; 0 = char ceiling only" },
+  { name: "PRR_CONTEXT_TOKENS_BY_MODEL", kind: "json", section: S_BUDGET, description: "JSON model -> that model's context window" },
   { name: "PRR_HUNK_CONTEXT_BEFORE", kind: "number", section: S_BUDGET, description: "context lines kept before each hunk" },
   { name: "PRR_HUNK_CONTEXT_AFTER", kind: "number", section: S_BUDGET, description: "context lines kept after each hunk" },
   { name: "PRR_MAX_FILE_BYTES", kind: "number", section: S_BUDGET, description: "files larger than this are diffed, never sent whole" },
@@ -719,6 +721,54 @@ export const RULES_DIR = strEnv("PRR_RULES_DIR", path.join(PRLOOP_ROOT, "rules")
 
 // --- Diff / token budget (PR-Agent style deterministic compression) ---
 export const MAX_DIFF_CHARS = numEnv("PRR_MAX_DIFF_CHARS", 240_000, 1000);
+
+// The model's context window, in TOKENS. 0 (the default) = off, and off is exactly what
+// every release before this one did: PRR_MAX_DIFF_CHARS counts characters OF THE DIFF
+// ONLY. The system prompt, the rules selected for this PR (up to ~29k chars), the reviewed
+// repo's injected conventions (12k), the PR description and — on a backend with no
+// response_format — the inlined JSON schema all share the window with the diff and were
+// never counted; neither was the output budget. Characters are not tokens either: CJK
+// costs roughly 2.7x more tokens per character than ASCII, so 240k "safe" characters can
+// be 60k+ tokens. Overrun does not raise an error anyone can read — the BACKEND truncates
+// the prompt, which cuts the diff mid-hunk and corrupts the very quotes anchoring depends
+// on, and the run shows up as findings that mysteriously will not anchor.
+export const CONTEXT_TOKENS = numEnv("PRR_CONTEXT_TOKENS", 0);
+
+/**
+ * Parses PRR_CONTEXT_TOKENS_BY_MODEL: JSON model -> context window in tokens. Exported for
+ * tests; the const below turns a parse failure into a startup fatal.
+ */
+export function parseContextTokensByModel(raw: string | undefined): Record<string, number> | undefined {
+  const parsed = parseObjectEnv(raw, '{"qwen3-coder":131072,"claude-sonnet":200000}');
+  if (parsed === undefined) return undefined;
+  const out: Record<string, number> = {};
+  for (const [model, v] of Object.entries(parsed)) {
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+      throw new Error(`entry "${model}" must be a non-negative whole number of tokens`);
+    }
+    out[model] = v;
+  }
+  return out;
+}
+
+// Per-model windows: the shape the global knob cannot express. A fleet whose point is
+// different model families is also a fleet of different context sizes, and budgeting all of
+// them to the smallest wastes the largest — while budgeting to the largest truncates the
+// smallest, silently.
+export const CONTEXT_TOKENS_BY_MODEL: Record<string, number> | undefined = (() => {
+  try {
+    return parseContextTokensByModel(strEnv("PRR_CONTEXT_TOKENS_BY_MODEL", ""));
+  } catch (e) {
+    console.error(`FATAL: PRR_CONTEXT_TOKENS_BY_MODEL ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
+
+/** The context window that applies to one model's calls. 0 = no token budget, chars only. */
+export function contextTokensFor(model: string): number {
+  return CONTEXT_TOKENS_BY_MODEL?.[model] ?? CONTEXT_TOKENS;
+}
+
 // Extra context lines around each hunk. Asymmetric on purpose: preceding context
 // carries more meaning for review than trailing context.
 export const HUNK_CONTEXT_BEFORE = numEnv("PRR_HUNK_CONTEXT_BEFORE", 6);

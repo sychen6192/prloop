@@ -113,6 +113,10 @@ import { bucketWorkdirFile, classifyWorkdirContent, classifyWorkdirFile } from "
 import { AdoError, AdoTooLargeError, diagnose, exceedsMaxBytes } from "../ado/client";
 import { AUTH_SCOPE_HINT, azOnPath } from "../ado/auth";
 import { isFileMissing } from "../ado/conventions";
+// Phase 3H: anchoring coverage and payload budgeting.
+import { MIN_DIFF_TOKENS, diffTokenBudget, estimateTokens } from "../libs/payload";
+import { isTestPath } from "../libs/lang";
+import { parseContextTokensByModel } from "../config";
 
 let passed = 0;
 let failed = 0;
@@ -2469,7 +2473,7 @@ section("diff budget: a per-finder order is a permutation of one fixed selection
   // bias. The shuffle must never touch WHAT is selected — only the sequence.
   const files = ["a", "b", "c", "d", "e"].map((n) => mkFile(`/${n}.ts`, [`${n}1();`, `${n}2();`], [1, 2]));
   const paths = (p: { includedFiles: string[] }) => p.includedFiles;
-  eq("no seed keeps prevalence order", paths(buildDiffPayload(files, 100_000)), files.map((f) => f.path));
+  eq("no seed keeps the deterministic selection order", paths(buildDiffPayload(files, 100_000)), files.map((f) => f.path));
   const s1 = buildDiffPayload(files, 100_000, 1);
   const s1again = buildDiffPayload(files, 100_000, 1);
   eq("same seed, same order", paths(s1), paths(s1again));
@@ -3682,6 +3686,335 @@ section("static triage runs in batches, and one bad batch loses only its own ite
   eq("...which is exactly what converts into findings", res.findings.length, 15);
   check("the failure is reported, named, and located", (res.error ?? "").includes("batch 2/3: timeout (180s)"));
   check("the raw answers of every batch are kept for debugging", (res.raw ?? "").includes("batch 2/3"));
+}
+
+section("anchoring: the reshapings a model applies to a quote (recovery, still fail-closed)");
+{
+  // (a) The model quoted the DIFF, `+` column and all. Raw first, always: these characters
+  // are ordinary source text too.
+  const plus = mkFile("/src/timer.ts", ["function run() {", "  const t = setTimeout(fn, 0);", "}"], [2]);
+  const r = anchorFinding(mkFinding({ file: "/src/timer.ts", quote: "+  const t = setTimeout(fn, 0);" }), [plus]);
+  eq("a quote that kept the diff's + column still anchors", r.anchor?.startLine, 2);
+
+  const doc = mkFile("/docs/example.md", [
+    "```diff",         // 1
+    "+  const x = 1;", // 2 ← the quote, which really does start with '+'
+    "```",             // 3
+    "  const x = 1;",  // 4
+  ], [1, 2, 3, 4]);
+  const rawFirst = anchorFinding(mkFinding({ file: "/docs/example.md", quote: "+  const x = 1;" }), [doc]);
+  eq("raw first: a line that really starts with + is not re-read as a diff prefix", rawFirst.anchor?.startLine, 2);
+
+  // A mixed +/- excerpt is two file versions at once. Stripping either side would anchor a
+  // deleted line onto the new file, so nothing is stripped and the finding degrades.
+  const mixed = mkFile("/src/mix.ts", ["const timeout = 30;"], [1]);
+  const rMixed = anchorFinding(
+    mkFinding({ file: "/src/mix.ts", quote: "-const timeout = 5;\n+const timeout = 30;" }),
+    [mixed],
+  );
+  eq("a mixed +/- excerpt is not silently half-stripped", rMixed.failure, "quote-not-found");
+}
+{
+  // (b) "..." on a line of its own means "these lines, then a gap, then these".
+  const f = mkFile("/src/svc.py", [
+    "def handler(req):",          // 1
+    "    conn = pool.get()",      // 2
+    "    rows = conn.query(req)", // 3
+    "    for r in rows:",         // 4
+    "        emit(r)",            // 5
+    "    return rows",            // 6  — conn is never returned to the pool
+  ], [1, 2, 3, 4, 5, 6]);
+  const r = anchorFinding(
+    mkFinding({ file: "/src/svc.py", quote: "    conn = pool.get()\n    ...\n    return rows" }),
+    [f],
+  );
+  eq("an elided quote matches its segments in order", r.anchor?.startLine, 2);
+  eq("...and the span reaches the last segment", r.anchor?.endLine, 6);
+
+  // The gap is bounded: an elision must never staple two unrelated regions together. Line 1
+  // is unique but untouched, so the last-resort path declines it too and this stays failed.
+  const far = mkFile("/src/far.py", [
+    "    conn = pool.get()",
+    ...Array.from({ length: 40 }, (_, i) => `    step${i}()`),
+    "    return rows",
+  ], [42]);
+  const rFar = anchorFinding(
+    mkFinding({ file: "/src/far.py", quote: "    conn = pool.get()\n    ...\n    return rows" }),
+    [far],
+  );
+  eq("segments further apart than the bound are not one quote", rFar.failure, "quote-not-found");
+}
+{
+  // (c) The model quoted a block and reflowed its body; only the opening line survived.
+  const f = mkFile("/src/api.ts", [
+    "export async function transfer(from: string, to: string, amount: number) {", // 1
+    "  const a = await load(from);",                                              // 2
+    "  a.balance -= amount;",                                                     // 3
+    "  await save(a);",                                                           // 4
+    "}",                                                                          // 5
+  ], [1, 2, 3, 4, 5]);
+  const r = anchorFinding(
+    mkFinding({
+      file: "/src/api.ts",
+      quote:
+        "export async function transfer(from: string, to: string, amount: number) {\n" +
+        "  const a = await load(from); a.balance -= amount; await save(a);",
+    }),
+    [f],
+  );
+  eq("a unique first line rescues a quote whose body drifted", r.anchor?.startLine, 1);
+
+  const dup = mkFile("/src/dup.ts", [
+    "try {", "  first();", "} catch {}", "try {", "  second();", "} catch {}",
+  ], [1, 2, 3, 4, 5, 6]);
+  const rDup = anchorFinding(mkFinding({ file: "/src/dup.ts", quote: "try {\n  somethingElse();" }), [dup]);
+  eq("a common first line stays failed rather than guessing", rDup.failure, "quote-not-found");
+  check("...and returns no anchor", rDup.anchor === undefined);
+
+  // The other half of the bargain: unique is not enough when the line is untouched code.
+  const untouched = mkFile("/src/audit.ts", [
+    "function audit(entry: Entry) {", // 1 — unique, but not a line this PR changed
+    "  log(entry);",                  // 2
+    "  persist(entry);",              // 3 ← the change
+    "}",                              // 4
+  ], [3]);
+  const rUn = anchorFinding(
+    mkFinding({ file: "/src/audit.ts", quote: "function audit(entry: Entry) {\n  log(entry); persist(entry);" }),
+    [untouched],
+  );
+  eq("a unique first line on untouched code is not evidence either", rUn.failure, "quote-not-found");
+}
+{
+  // (d) The model retyped ASCII punctuation as typographic punctuation. Folding is the
+  // loosest thing this module does, so it only counts when the context confirms it.
+  const f = mkFile("/src/i18n.ts", [
+    "function greet(name: string) {",
+    "  return t('hello', { name });",
+    "}",
+  ], [1, 2, 3]);
+  const smart = "  return t(‘hello’, { name });"; // curly single quotes
+  const r = anchorFinding(
+    mkFinding({ file: "/src/i18n.ts", quote: smart, context_before: "function greet(name: string) {" }),
+    [f],
+  );
+  eq("curly quotes fold to ASCII when the context confirms the line", r.anchor?.startLine, 2);
+  const unconfirmed = anchorFinding(mkFinding({ file: "/src/i18n.ts", quote: smart }), [f]);
+  eq("...and a folded match with nothing to confirm it stays failed", unconfirmed.failure, "quote-not-found");
+  check("...with no anchor", unconfirmed.anchor === undefined);
+
+  // NFKC also width-folds the full-width punctuation that comes back with CJK sources.
+  const wide = mkFile("/src/msg.ts", ["const msg = t('save failed');", "export default msg;"], [1, 2]);
+  const rWide = anchorFinding(
+    mkFinding({
+      file: "/src/msg.ts",
+      quote: "const msg = t（'save failed'）;", // full-width parentheses
+      context_after: "export default msg;",
+    }),
+    [wide],
+  );
+  eq("full-width punctuation folds too, with confirming context", rWide.anchor?.startLine, 1);
+}
+{
+  // (e) The model copied a line-number gutter out of a code viewer.
+  const f = mkFile("/src/db.ts", ["const rows = await q(sql);", "  return rows;"], [1, 2]);
+  eq(
+    "a copied line-number gutter is stripped (viewer spelling)",
+    anchorFinding(mkFinding({ file: "/src/db.ts", quote: "12 | const rows = await q(sql);" }), [f]).anchor?.startLine,
+    1,
+  );
+  eq(
+    "...and the grep -n spelling",
+    anchorFinding(mkFinding({ file: "/src/db.ts", quote: "12: const rows = await q(sql);" }), [f]).anchor?.startLine,
+    1,
+  );
+  // Raw first again: a port mapping is not a gutter, and its number is part of the code.
+  const yaml = mkFile("/deploy/ports.yaml", ["ports:", "  8080: backend"], [1, 2]);
+  eq(
+    "a YAML mapping keeps the number the gutter rule would have eaten",
+    anchorFinding(mkFinding({ file: "/deploy/ports.yaml", quote: "  8080: backend" }), [yaml]).anchor?.startLine,
+    2,
+  );
+}
+{
+  // (f) Context is scored at the LOOSEST tier, always. The quote is exact at tier 1 in two
+  // places and only the context separates them — but the model re-indented that context
+  // line, so scoring it at the quote's own tier gave both candidates 0 and the finding was
+  // ruled ambiguous although the answer was one normalisation away.
+  const f = mkFile("/src/tx.ts", [
+    "async function debit() {",  // 1
+    "      await save(acct);",   // 2 — deeply indented in the file
+    "  await commit();",         // 3 ← intended
+    "}",                         // 4
+    "async function credit() {", // 5
+    "  await log(acct);",        // 6
+    "  await commit();",         // 7 — identical to line 3 at every tier
+    "}",                         // 8
+  ], [1, 2, 3, 4, 5, 6, 7, 8]);
+  const r = anchorFinding(
+    mkFinding({ file: "/src/tx.ts", quote: "  await commit();", context_before: "await save(acct);" }),
+    [f],
+  );
+  eq("re-indented context still disambiguates a tier-1 duplicate", r.anchor?.startLine, 3);
+  // Context still cannot CREATE an anchor: it only chooses between candidates the quote found.
+  const invented = anchorFinding(
+    mkFinding({ file: "/src/tx.ts", quote: "  await rollback();", context_before: "await save(acct);" }),
+    [f],
+  );
+  eq("a quote that is not in the file is not rescued by its context", invented.failure, "quote-not-found");
+}
+{
+  // The recovery paths must not move a single existing expectation. Same fixture as "real PR
+  // anchoring" above, re-asserted here as one line so a regression in any path above fails
+  // in the section that caused it.
+  const seeded: FileDiff[] = SEEDED_FILES.map((f) => {
+    const leftLines = splitLines(Buffer.from(f.base, "utf8"));
+    const rightLines = splitLines(Buffer.from(f.head, "utf8"));
+    const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
+    return {
+      path: f.path,
+      changeType: "edit" as const,
+      hunks,
+      rightLines,
+      leftLines,
+      changedRightLines,
+      binary: false,
+      truncated: false,
+      language: f.language,
+    };
+  });
+  const moved = EXPECTED_ANCHORS.filter((e) => {
+    const r = anchorFinding(
+      mkFinding({ file: e.file, quote: e.quote, context_before: e.contextBefore, context_after: e.contextAfter }),
+      seeded,
+    );
+    return typeof e.expect === "number"
+      ? r.anchor?.startLine !== e.expect
+      : r.failure !== e.expect || r.anchor !== undefined;
+  }).map((e) => e.name);
+  eq("every seeded-PR expectation still holds exactly", moved, []);
+  check("...over the whole fixture, not an empty list", EXPECTED_ANCHORS.length >= 13, `${EXPECTED_ANCHORS.length}`);
+}
+
+section("payload budget: tokens, not just characters");
+{
+  const near = (name: string, actual: number, want: number, tol = 0.2) =>
+    check(`${name} (want ~${Math.round(want)}, got ${actual})`, Math.abs(actual - want) <= want * tol);
+
+  // 1. estimateTokens. Two regimes because they differ by nearly 3x, and PRR_MAX_DIFF_CHARS
+  //    could not tell them apart: 240k characters is ~69k tokens of TypeScript and ~240k
+  //    tokens of Japanese.
+  const ascii = "const refundTotal = order.items.reduce((a, b) => a + b.price, 0);\n".repeat(40);
+  const cjk = "支払処理に失敗しました".repeat(40); // ja: "payment processing failed"
+  near("ASCII source is about 3.5 characters per token", estimateTokens(ascii), ascii.length / 3.5);
+  near("CJK is about one token per character", estimateTokens(cjk), cjk.length);
+  near("mixed text is counted per character class", estimateTokens(ascii + cjk), ascii.length / 3.5 + cjk.length);
+  check(
+    "the same character count costs far more in CJK than in ASCII",
+    estimateTokens(cjk) > 2.5 * estimateTokens("a".repeat(cjk.length)),
+    `${estimateTokens(cjk)} vs ${estimateTokens("a".repeat(cjk.length))}`,
+  );
+  check("the estimate includes per-message framing", estimateTokens("") > 0);
+
+  // 2. The budget arithmetic: the diff gets what the output budget and the fixed parts of
+  //    the prompt leave. The fixed parts are what PRR_MAX_DIFF_CHARS never counted.
+  const fixed = "a".repeat(35_000); // system prompt + rules + conventions + schema, roughly
+  eq("no context given at all means no token budget", diffTokenBudget(undefined), 0);
+  eq("a zero window means no token budget (the knob is off)", diffTokenBudget({ fixed, contextTokens: 0 }), 0);
+  eq(
+    "the diff gets the window minus the output budget minus the fixed parts",
+    diffTokenBudget({ contextTokens: 128_000, outputTokens: 16_384, fixed }),
+    128_000 - 16_384 - estimateTokens(fixed),
+  );
+  eq(
+    "a window the fixed parts already fill floors instead of going negative",
+    diffTokenBudget({ contextTokens: 8_000, outputTokens: 8_192, fixed }),
+    MIN_DIFF_TOKENS,
+  );
+
+  // 3. Ordering: by added lines, tests last, whatever the language census says. The bug this
+  //    replaces: prevalence ordering dropped a 3000-line Java file first because three
+  //    20-line TypeScript files made TypeScript the majority language.
+  const lines = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `  ${tag}${i}(compute(${i}));`);
+  const all = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
+  const svc = mkFile("/src/main/java/shop/InventoryService.java", lines(60, "svc"), all(60));
+  const tests = mkFile("/src/test/java/shop/InventoryServiceTest.java", lines(90, "t"), all(90));
+  const small = ["a", "b", "c"].map((n) => mkFile(`/app/${n}.ts`, lines(5, n), all(5)));
+  const spread = [...small, tests, svc];
+  check("a test path is recognised across the layouts we support",
+    isTestPath("/src/test/java/shop/InventoryServiceTest.java") &&
+      isTestPath("/app/checkout/page.test.tsx") &&
+      isTestPath("/tests/test_refund.py") &&
+      !isTestPath("/src/main/java/shop/InventoryService.java") &&
+      !isTestPath("/app/latest/page.tsx"));
+  eq(
+    "biggest change first, tests last, whatever the language census says",
+    buildDiffPayload(spread, 1_000_000).includedFiles,
+    [
+      "/src/main/java/shop/InventoryService.java",
+      "/app/a.ts",
+      "/app/b.ts",
+      "/app/c.ts",
+      "/src/test/java/shop/InventoryServiceTest.java",
+    ],
+  );
+  const justSvc = buildDiffPayload([svc], 1_000_000).text.length;
+  const tight = buildDiffPayload(spread, justSvc + 100);
+  check("a tight budget keeps the biggest change", tight.includedFiles.includes(svc.path));
+  check("...and sheds the test file", tight.omittedFiles.includes(tests.path));
+  eq("...naming the ceiling that bound", tight.bound, "chars");
+  check("the omitted files are still named in the payload the model reads", tight.text.includes(tests.path));
+
+  // 4. Both ceilings, and which one bound. The token budget floors at MIN_DIFF_TOKENS, so
+  //    these files are sized to run into it.
+  const wide = ["a", "b", "c", "d", "e"].map((n) =>
+    mkFile(`/src/${n}.ts`, Array.from({ length: 40 }, (_, i) => `  const ${n}${i} = compute(${i}, "${n}");`), all(40)),
+  );
+  const byTokens = buildDiffPayload(wide, 1_000_000, undefined, { contextTokens: 1, outputTokens: 0 });
+  check("a token budget omits files a huge char ceiling would have kept", byTokens.omittedFiles.length > 0);
+  eq("...and says the tokens bound", byTokens.bound, "tokens");
+  const byChars = buildDiffPayload(wide, 3_000, undefined, { contextTokens: 200_000, outputTokens: 0 });
+  eq("the char ceiling still binds when it is the smaller of the two", byChars.bound, "chars");
+  check(
+    "...and the smaller ceiling really is the one that decided",
+    byChars.includedFiles.length < byTokens.includedFiles.length,
+  );
+
+  // 5. The seed contract is unchanged under a token budget: same selection, different order.
+  const seeded = [1, 2, 3].map((s) => buildDiffPayload(wide, 1_000_000, s, { contextTokens: 1, outputTokens: 0 }));
+  check(
+    "a token-bound selection is identical across seeds",
+    seeded.every((p) => [...p.includedFiles].sort().join() === [...seeded[0]!.includedFiles].sort().join()),
+  );
+  check(
+    "...and identical to the unseeded one",
+    [...seeded[0]!.includedFiles].sort().join() === [...byTokens.includedFiles].sort().join(),
+  );
+  check("...while the order still differs", new Set(seeded.map((p) => p.includedFiles.join())).size > 1);
+
+  // 6. Unset knob = exactly today's behaviour. PRR_CONTEXT_TOKENS is 0 in this process, so a
+  //    caller passing fixed parts and an output budget must still get the char-only payload.
+  const charOnly = buildDiffPayload(wide, 3_000);
+  const withFixed = buildDiffPayload(wide, 3_000, undefined, { fixed: "x".repeat(100_000), outputTokens: 8_192 });
+  eq("no window configured: byte-for-byte the char-only payload", withFixed.text, charOnly.text);
+  eq("...the same selection", withFixed.includedFiles, charOnly.includedFiles);
+  eq("...and the same omissions", withFixed.omittedFiles, charOnly.omittedFiles);
+
+  // 7. The knob itself.
+  const throwsWith = (fn: () => unknown) => {
+    try {
+      fn();
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  eq("unset context map is undefined", parseContextTokensByModel(undefined), undefined);
+  eq("blank context map is undefined", parseContextTokensByModel("  "), undefined);
+  eq("a model -> tokens map parses", parseContextTokensByModel('{"qwen3-coder":131072}'), { "qwen3-coder": 131072 });
+  check("malformed JSON is fatal", throwsWith(() => parseContextTokensByModel("{oops")));
+  check("an array is fatal", throwsWith(() => parseContextTokensByModel("[131072]")));
+  check("a non-numeric window is fatal", throwsWith(() => parseContextTokensByModel('{"m":"128k"}')));
+  check("a negative window is fatal", throwsWith(() => parseContextTokensByModel('{"m":-1}')));
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

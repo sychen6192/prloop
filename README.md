@@ -308,7 +308,9 @@ answer to "why did editing `.env` change nothing".
 | `PRR_OPENCODE_JSON` | `1` | `0` = drop `--format json` for builds without JSONL events; loses tracing |
 | `PRR_AGENT_TIMEOUT_MS` | `900000` | wall clock for one opencode session |
 | `PRR_RULES_DIR` | `rules/` | your team's rules as `.md` files with an `applyTo` glob |
-| `PRR_MAX_DIFF_CHARS` | `240000` | ceiling on the diff sent to a finder; overflow makes the run incomplete |
+| `PRR_MAX_DIFF_CHARS` | `240000` | ceiling on the diff sent to a finder, in characters of the diff alone; overflow makes the run incomplete |
+| `PRR_CONTEXT_TOKENS` | `0` (off) | the model's context window in tokens. Set it and the diff is budgeted as `window − PRR_LLM_MAX_TOKENS − (system prompt + rules + conventions + PR description + inlined schema)`, so the backend never truncates a prompt mid-hunk and corrupts the quotes anchoring depends on. Token counts are an estimate (±20%) |
+| `PRR_CONTEXT_TOKENS_BY_MODEL` | — | JSON `model → tokens`: a fleet of different families is also a fleet of different context sizes, and one number either wastes the largest or truncates the smallest |
 | `PRR_HUNK_CONTEXT_BEFORE` | `6` | context lines before each hunk (asymmetric: what precedes a change means more) |
 | `PRR_HUNK_CONTEXT_AFTER` | `3` | context lines after each hunk |
 | `PRR_MAX_FILE_BYTES` | `2000000` | bigger files are diffed, never sent whole |

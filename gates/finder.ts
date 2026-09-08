@@ -299,20 +299,36 @@ export async function runFinders(
   // order of the included files differs per finder (libs/prng.ts says why). The run seed
   // is logged so a result can be replayed with PRR_FINDER_SEED.
   const runSeed = opts.seed ?? FINDER_SEED ?? newRunSeed();
+  // The system prompt and the schema are handed to the prompt builder, not just to the
+  // runner: they share the model's context window with the diff, so the diff cannot be
+  // budgeted without them (libs/payload.ts).
+  const systems = models.map((m) => finderSystemFor(m, suffixes));
+  const schemaText = JSON.stringify(FINDINGS_SCHEMA);
   const promptFor = (i: number) =>
-    buildFinderPrompt({ ...input, rules, ruleHeadings: headings, seed: seedFor(runSeed, i) });
+    buildFinderPrompt({
+      ...input,
+      rules,
+      ruleHeadings: headings,
+      seed: seedFor(runSeed, i),
+      model: models[i],
+      system: systems[i],
+      schemaText,
+    });
   const prompts = models.map((_, i) => promptFor(i));
   const first = prompts[0] ?? promptFor(0);
   const omitted = first.omitted;
   if (omitted.length > 0) {
-    log(`[WARN] diff over budget; ${omitted.length} files left out of the finder context`);
+    // Which ceiling bound decides which knob is worth changing: raising PRR_MAX_DIFF_CHARS
+    // does nothing when the model's context window is what ran out.
+    const knob = first.bound === "tokens" ? "the model's context window (PRR_CONTEXT_TOKENS)" : "PRR_MAX_DIFF_CHARS";
+    log(`[WARN] diff over ${knob}; ${omitted.length} files left out of the finder context`);
   }
   log(`finder file order: run seed ${runSeed}${models.length > 1 ? `, one permutation per finder` : ""}`);
 
   // Parallel across models; each is an independent opinion (M3 relies on that independence).
   const outputs = await Promise.all(
     models.map((m, i) =>
-      runOne(runner, m, finderSystemFor(m, suffixes), prompts[i]!.text, seedFor(runSeed, i), knownCites),
+      runOne(runner, m, systems[i]!, prompts[i]!.text, seedFor(runSeed, i), knownCites),
     ),
   );
   return { outputs, prompt: first.text, omitted, rules: selected.map((r) => r.name), seed: runSeed };

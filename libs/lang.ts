@@ -68,3 +68,20 @@ const REVIEWABLE = new Set([
 export function isReviewable(filePath: string): boolean {
   return !isNoiseFile(filePath) && REVIEWABLE.has(detectLanguage(filePath));
 }
+
+// Tests and specs, in the layouts the four supported languages actually use. This is an
+// ORDERING signal only — a test file is still reviewed, and a defect in one is still a
+// defect. It decides who yields the context window when the diff does not fit: a 900-line
+// generated test file must not push the service it exercises out of the payload.
+const TEST_PATH = new RegExp(
+  [
+    "(^|/)(__tests__|__mocks__|tests?|specs?|testing)/", // dir: src/test/java/…, tests/…
+    "(^|/)(test|spec)_[^/]+$", // python: test_refund.py
+    "[._-](test|spec)s?\\.[A-Za-z0-9]+$", // foo.test.ts, foo_test.go, foo-spec.js
+    "(Test|Tests|IT|Spec)\\.(java|kt|scala|cs)$", // InventoryServiceTest.java
+  ].join("|"),
+);
+
+export function isTestPath(filePath: string): boolean {
+  return TEST_PATH.test(filePath);
+}

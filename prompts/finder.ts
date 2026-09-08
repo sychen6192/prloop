@@ -161,9 +161,25 @@ export interface FinderPromptInput {
   conventions?: string;
   // Headings of the selected rules, for the recap after the diff (header comment, item 3).
   ruleHeadings?: RuleHeadingGroup[];
-  // This finder's file-order seed (libs/prng.ts). Undefined = prevalence order, which is
+  // This finder's file-order seed (libs/prng.ts). Undefined = selection order, which is
   // what the offline prompt tooling and the selftests use.
   seed?: number;
+  // The model this prompt is for, and the rest of what its request will carry: the system
+  // prompt, and the JSON schema when the backend cannot enforce one and it is inlined into
+  // the user message instead. Given, the diff is budgeted against that model's context
+  // window (PRR_CONTEXT_TOKENS) as well as the char ceiling; omitted, only the char ceiling
+  // applies — which is what the offline tooling and the requirement axis want.
+  model?: string;
+  system?: string;
+  schemaText?: string;
+}
+
+export interface FinderPrompt {
+  text: string;
+  omitted: string[];
+  // Which budget the omissions ran into, so the log line can name the knob that would
+  // actually change the outcome.
+  bound?: "chars" | "tokens";
 }
 
 /** The compact restatement that follows the diff. Exported for the selftest. */
@@ -188,8 +204,7 @@ export function renderRecap(ruleHeadings: RuleHeadingGroup[] | undefined): strin
 ${rulesBlock}`;
 }
 
-export function buildFinderPrompt(input: FinderPromptInput): { text: string; omitted: string[] } {
-  const payload = buildDiffPayload(input.files, undefined, input.seed);
+export function buildFinderPrompt(input: FinderPromptInput): FinderPrompt {
   const scope =
     input.compareTo > 0
       ? `Review only the changes added after iteration ${input.compareTo} (iteration ${input.iterationId}).`
@@ -206,7 +221,11 @@ export function buildFinderPrompt(input: FinderPromptInput): { text: string; omi
     ? `\n## Review rules for this project\n\nThe rules below were loaded automatically based on the files touched by this change. They decide WHAT is reportable and how severe it is — where they conflict with the general guidance above on that, they win. They never change the output rules (verbatim quote, the fields, JSON), the code-axis-only boundary, or the coverage stance.\n\n${guidance}\n`
     : "";
 
-  const text = `## Pull Request info
+  // Split in two so the diff can be budgeted against what will SURROUND it. Everything
+  // here shares one context window with the payload — and until this was counted, only the
+  // diff's characters were, which is how a "safely" sized diff still arrived at the model
+  // truncated (config.ts, PRR_CONTEXT_TOKENS, says what that costs).
+  const head = `## Pull Request info
 
 - Title: ${input.pr.title}
 - Source branch: ${input.pr.sourceBranch} → target branch: ${input.pr.targetBranch}
@@ -226,7 +245,9 @@ In the diff, the numbers in \`@@ -leftStart,leftCount +rightStart,rightCount @@\
 file line numbers, given so you can orient yourself. Do not include any line number in your
 output — just copy the quote verbatim.
 
-${payload.text}
+`;
+
+  const tail = `
 
 ${renderRecap(input.ruleHeadings)}
 
@@ -235,5 +256,10 @@ ${renderRecap(input.ruleHeadings)}
 Emit JSON per the schema. Every finding's quote must be source text that appears in the diff
 above (with the diff's +/- prefix stripped).`;
 
-  return { text, omitted: payload.omittedFiles };
+  const payload = buildDiffPayload(input.files, undefined, input.seed, {
+    model: input.model,
+    fixed: `${input.system ?? ""}\n${input.schemaText ?? ""}\n${head}${tail}`,
+  });
+
+  return { text: `${head}${payload.text}${tail}`, omitted: payload.omittedFiles, bound: payload.bound };
 }
