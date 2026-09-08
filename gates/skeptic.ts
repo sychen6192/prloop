@@ -8,6 +8,7 @@
 import {
   MAX_SKEPTIC_FINDINGS,
   SKEPTIC_CONTEXT_LINES,
+  SKEPTIC_MAX_TOKENS,
   SKEPTIC_MODELS,
   SKEPTIC_ROUNDS,
   SKEPTIC_TIMEOUT_MS,
@@ -72,12 +73,17 @@ async function verifyOne(runner: ModelRunner, prompt: string, model: string): Pr
     user: prompt,
     schema: VERDICT_SCHEMA,
     schemaName: "verdict",
-    maxTokens: 2048,
+    maxTokens: SKEPTIC_MAX_TOKENS,
     timeoutMs: SKEPTIC_TIMEOUT_MS,
   });
   if (res.error) {
-    logVerbose(`skeptic ${model} call failed: ${res.error}`);
-    return { refuted: false, reason: "", confidence: 0, model, error: res.error };
+    // The runner names the global budget knob; this call has its own. And a truncated
+    // verdict's partial text is the only clue to WHAT overran (a thorough reason, or
+    // thinking billed as content) — log its head instead of discarding it.
+    const error = res.error.replace("raise PRR_LLM_MAX_TOKENS", "raise PRR_SKEPTIC_MAX_TOKENS");
+    const head = res.text.trim().replace(/\s+/g, " ").slice(0, 200);
+    logVerbose(`skeptic ${model} call failed: ${error}${head ? ` — partial output: ${head}` : ""}`);
+    return { refuted: false, reason: "", confidence: 0, model, error };
   }
   return parseVerdict(res.text, model);
 }

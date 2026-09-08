@@ -218,6 +218,12 @@ export const SKEPTIC_CONTEXT_LINES = numEnv("PRR_SKEPTIC_CONTEXT_LINES", 25);
 // reading a whole diff. Kept separate because a skeptic timeout fails open: one slow verifier
 // must not hold the run for the full finder timeout and then wave the finding through anyway.
 export const SKEPTIC_TIMEOUT_MS = numEnv("PRR_SKEPTIC_TIMEOUT_MS", 180_000, 1000);
+// Output budget for one verdict. Was a 2048 literal in the gate — small on purpose (a
+// refutation that needs a long JSON object is usually one the model is inventing) — but
+// a frontier model writing a thorough `reason`, or a gateway that bills thinking to the
+// same budget, overran it, and the truncation message then pointed at PRR_LLM_MAX_TOKENS,
+// which the skeptic never read. Separate knob, honest message.
+export const SKEPTIC_MAX_TOKENS = numEnv("PRR_SKEPTIC_MAX_TOKENS", 4096, 256);
 // Ceiling on findings sent to the skeptic per run. The fan-out is findings × rounds and
 // was previously unbounded — a pathological PR anchoring 200 findings issued 200
 // verification calls. The worst (highest-severity) findings get verified first; the
