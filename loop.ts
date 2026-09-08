@@ -18,9 +18,10 @@ import {
 import { parsePrUrl } from "./ado/client";
 import { unmetCriteria } from "./gates/requirement";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
+import { buildResultSummary, openRunDir } from "./libs/artifacts";
 import { configWarnings, renderConfigTable, wantsConfigDump } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
-import { createRunner } from "./models/runner";
+import { createRunner, tokenTotals } from "./models/runner";
 import { runReview } from "./orchestrator";
 
 function usage(): never {
@@ -137,18 +138,37 @@ async function main() {
   }
 
   // Either axis can fail the run: an unimplemented requirement is as blocking as a bug.
+  // And a stage that crashed must not exit 0 — "nothing blocking was found" and "the check
+  // that would have found it never ran" are different facts, and only one of them justifies
+  // a green CI gate.
   const highRisk = inline.filter((f) => f.severity === "critical" || f.severity === "high");
-  if (highRisk.length > 0 || unmet.length > 0) process.exit(2);
-
-  // A stage that crashed must not exit 0. "Nothing blocking was found" and "the check that
-  // would have found it never ran" are different facts, and only one of them justifies a
-  // green CI gate.
-  if (result.incomplete.length > 0) {
+  const exitCode = highRisk.length > 0 || unmet.length > 0 ? 2 : result.incomplete.length > 0 ? 3 : 0;
+  if (exitCode === 3) {
     log(`[WARN] Review incomplete — ${result.incomplete.join("; ")}`);
     log("Exiting 3: no blocking findings, but the review did not fully run");
-    process.exit(3);
   }
-  process.exit(0);
+
+  // The last thing written, on every outcome: one file that answers "what did this run
+  // actually do" — the exit code CI acted on included — without replaying the log or
+  // opening five other artifacts. Reopened rather than passed down because the run
+  // directory belongs to the orchestrator, and only this layer knows the exit code.
+  openRunDir(result.runDir).saveJson(
+    "result.json",
+    buildResultSummary({
+      exitCode,
+      incomplete: result.incomplete,
+      counts: {
+        raw: result.agg.stats.raw,
+        anchored: result.agg.stats.anchored,
+        survived: result.agg.stats.survived,
+        inline: result.agg.stats.inline,
+        degraded: degraded.length,
+      },
+      tokens: tokenTotals(),
+      durationSec: result.durationSec,
+    }),
+  );
+  process.exit(exitCode);
 }
 
 main().catch((e) => {

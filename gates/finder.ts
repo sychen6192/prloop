@@ -12,11 +12,12 @@ import {
   severityRank,
   type Severity,
 } from "../config";
-import { arrayField, parseJsonObject } from "../libs/json";
+import { arrayField, parseJsonObject, salvageArrayItems } from "../libs/json";
 import { log } from "../libs/log";
 import { newRunSeed, seedFor } from "../libs/prng";
 import { loadRules, renderRules, ruleHeadings, selectRules, type Rule } from "../libs/rules";
 import type { ModelRunner, RawFinding } from "../libs/types";
+import { isTruncation } from "../models/runner";
 import { FINDINGS_SCHEMA } from "../models/schemas";
 import { buildFinderPrompt, finderSystemFor, type FinderPromptInput, type RuleHeadingGroup } from "../prompts/finder";
 
@@ -170,6 +171,38 @@ export function validateFinding(v: unknown, knownCites?: ReadonlySet<string>): R
   return checkFinding(v, knownCites).finding;
 }
 
+/**
+ * Findings recoverable from a response that failed, validated exactly like a successful
+ * one. Called for the two failures that leave usable text: a completion cut at the token
+ * limit (the array is full of complete objects, only the last is a fragment) and one that
+ * would not parse at all while plainly containing the array. Everything else — an empty
+ * response, a transport error — has nothing to salvage, and asking would invent findings.
+ *
+ * This is a partial recovery, never a success: the caller keeps the error, so the stage
+ * still reports incomplete and the run still exits 3.
+ */
+function salvageFindings(
+  model: string,
+  text: string,
+  why: string,
+  knownCites: ReadonlySet<string>,
+): { findings: RawFinding[]; rejected: number } {
+  const findings: RawFinding[] = [];
+  let rejected = 0;
+  for (const item of salvageArrayItems(text, "findings")) {
+    const res = checkFinding(item, knownCites);
+    if (res.finding) findings.push(res.finding);
+    else rejected++;
+  }
+  if (findings.length > 0 || rejected > 0) {
+    log(
+      `finder ${model}: salvaged ${findings.length} findings from a ${why} response` +
+        (rejected > 0 ? ` (${rejected} dropped)` : ""),
+    );
+  }
+  return { findings, rejected };
+}
+
 async function runOne(
   runner: ModelRunner,
   model: string,
@@ -188,14 +221,23 @@ async function runOne(
 
   if (res.error) {
     log(`[FAIL] finder ${model} call failed: ${res.error}`);
-    return { model, findings: [], error: res.error, rejected: 0, raw: "", seed, prompt };
+    // The partial text is kept whatever the failure was: runs/ is where a failed call is
+    // diagnosed, and an empty *-raw.txt says nothing about what the model was doing.
+    const salvaged = isTruncation(res.error)
+      ? salvageFindings(model, res.text, "truncated", knownCites)
+      : { findings: [], rejected: 0 };
+    return { model, ...salvaged, error: res.error, raw: res.text, seed, prompt };
   }
 
   const parsed = parseJsonObject<{ findings?: unknown }>(res.text);
   if (!parsed.ok) {
-    // Fail closed: an unparseable response yields no findings rather than guessed ones.
+    // Fail closed: an unparseable response yields no findings rather than guessed ones —
+    // except the complete objects a scanner can prove are there (salvageArrayItems).
     log(`[FAIL] finder ${model} output unparseable: ${parsed.error}`);
-    return { model, findings: [], error: parsed.error, rejected: 0, raw: res.text, seed, prompt };
+    const salvaged = res.text.includes('"findings"')
+      ? salvageFindings(model, res.text, "unparseable", knownCites)
+      : { findings: [], rejected: 0 };
+    return { model, ...salvaged, error: parsed.error, raw: res.text, seed, prompt };
   }
 
   const arr = arrayField(parsed.value, "findings");

@@ -63,8 +63,13 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_LLM_TIMEOUT_MS", kind: "number", section: S_MODEL, description: "deadline for one model call" },
   { name: "PRR_LLM_CONCURRENCY", kind: "number", section: S_MODEL, description: "in-flight model calls across all stages; 0 = no cap" },
   { name: "PRR_LLM_RETRIES", kind: "number", section: S_MODEL, description: "retries on transient model failures (never on 4xx)" },
-  { name: "PRR_LLM_TEMPERATURE", kind: "number", section: S_MODEL, description: "sampling temperature for every call" },
+  { name: "PRR_LLM_TEMPERATURE", kind: "string", section: S_MODEL, description: "sampling temperature, or none to omit the field" },
+  { name: "PRR_LLM_TEMPERATURE_BY_MODEL", kind: "json", section: S_MODEL, description: "JSON model -> temperature (number or \"none\")" },
   { name: "PRR_LLM_MAX_TOKENS", kind: "number", section: S_MODEL, description: "output budget; thinking models need 16384+" },
+  { name: "PRR_REASONING", kind: "string", section: S_MODEL, description: "none | low | medium | high; unset = backend default" },
+  { name: "PRR_REASONING_BY_MODEL", kind: "json", section: S_MODEL, description: "JSON model -> reasoning level for that model" },
+  { name: "PRR_LLM_API_FLAVOR", kind: "string", section: S_MODEL, description: "auto | openai | anthropic | qwen | ollama" },
+  { name: "PRR_LLM_STALL_TIMEOUT_MS", kind: "number", section: S_MODEL, description: "abort a stream gone silent this long; 0 = off" },
   { name: "PRR_LLM_STRUCTURED", kind: "bool", section: S_MODEL, description: "0 = do not send response_format" },
   { name: "PRR_LLM_STREAM", kind: "bool", section: S_MODEL, description: "0 = buffered completions (a gateway may 504 them)" },
   { name: "PRR_LLM_EXTRA_BODY", kind: "json", section: S_MODEL, description: "JSON merged into every model request body" },
@@ -391,6 +396,11 @@ export const AGENT_TIMEOUT_MS = numEnv("PRR_AGENT_TIMEOUT_MS", 15 * 60 * 1000, 1
 export const LLM_BASE_URL = strEnv("PRR_LLM_BASE_URL", "http://localhost:4000/v1");
 export const LLM_API_KEY = strEnv("PRR_LLM_API_KEY", "dummy");
 export const LLM_TIMEOUT_MS = numEnv("PRR_LLM_TIMEOUT_MS", 900_000, 1000);
+// Silence a streamed response may go before the call is abandoned. The per-call deadline
+// above covers the WHOLE call, so an engine that dies without closing the socket costs the
+// full 900s — and the retry costs another 900s. Bytes arriving reset this timer, so a slow
+// generation is never cut; only a dead one is. 0 = disabled (rely on the deadline alone).
+export const LLM_STALL_TIMEOUT_MS = numEnv("PRR_LLM_STALL_TIMEOUT_MS", 120_000, 0);
 // Model calls in flight at once, across every stage. The skeptic fans out over every
 // anchored finding, so an uncapped run can put dozens of requests on a self-hosted endpoint
 // simultaneously; they then queue in the engine while their own timeouts run down. 0 = no cap.
@@ -409,7 +419,68 @@ export const FINDER_MODELS = strEnv("PRR_FINDER_MODELS", "qwen3-coder")
 // Requirement axis model. Defaults to the first finder model; set separately when you want
 // a stronger model on requirements (long acceptance criteria stress weak models).
 export const REQ_MODEL = strEnv("PRR_REQ_MODEL", FINDER_MODELS[0] ?? "");
-export const LLM_TEMPERATURE = numEnv("PRR_LLM_TEMPERATURE", 0.2);
+/**
+ * Sampling temperature, or the sentinel "none" meaning "do not send the field at all".
+ *
+ * The sentinel exists because `temperature` is not universally accepted any more: newer
+ * Anthropic models reject it outright, OpenAI's reasoning models reject it, and Anthropic
+ * extended thinking demands exactly 1. Before this, prloop always sent one (0.2, or a
+ * hard-coded 0 in the requirement gate) and its own fields overwrote PRR_LLM_EXTRA_BODY —
+ * so on those backends every single call was a 400 with no way to configure the field away.
+ * Exported for tests; throws on garbage so it fails at startup, not per call.
+ */
+export type Temperature = number | "none";
+
+export function parseTemperature(raw: string | undefined, def: Temperature): Temperature {
+  const s = (raw ?? "").trim();
+  if (s === "") return def;
+  if (s.toLowerCase() === "none") return "none";
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`${raw} is not a number or "none"`);
+  return n;
+}
+
+export function parseTemperatureByModel(raw: string | undefined): Record<string, Temperature> | undefined {
+  const parsed = parseObjectEnv(raw, '{"claude-sonnet":"none","qwen3-coder":0.2}');
+  if (parsed === undefined) return undefined;
+  const out: Record<string, Temperature> = {};
+  for (const [model, v] of Object.entries(parsed)) {
+    if (typeof v === "number") {
+      if (!Number.isFinite(v) || v < 0) throw new Error(`entry "${model}" must be a non-negative number or "none"`);
+      out[model] = v;
+    } else if (typeof v === "string" && v.trim().toLowerCase() === "none") {
+      out[model] = "none";
+    } else {
+      throw new Error(`entry "${model}" must be a number or "none"`);
+    }
+  }
+  return out;
+}
+
+export const LLM_TEMPERATURE: Temperature = (() => {
+  try {
+    return parseTemperature(strEnv("PRR_LLM_TEMPERATURE", "0.2"), 0.2);
+  } catch (e) {
+    console.error(`FATAL: PRR_LLM_TEMPERATURE ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
+
+// Per-model override: one Anthropic model in a fleet may need the field gone while the
+// rest keep sampling normally. An entry wins over the global for that model only.
+export const LLM_TEMPERATURE_BY_MODEL: Record<string, Temperature> | undefined = (() => {
+  try {
+    return parseTemperatureByModel(strEnv("PRR_LLM_TEMPERATURE_BY_MODEL", ""));
+  } catch (e) {
+    console.error(`FATAL: PRR_LLM_TEMPERATURE_BY_MODEL ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
+
+/** The temperature policy for one model's calls. */
+export function temperatureFor(model: string): Temperature {
+  return LLM_TEMPERATURE_BY_MODEL?.[model] ?? LLM_TEMPERATURE;
+}
 export const LLM_MAX_TOKENS = numEnv("PRR_LLM_MAX_TOKENS", 8192, 256);
 // 0 = don't send response_format (for backends whose schema support is broken).
 export const LLM_STRUCTURED_OUTPUT = switchEnv("PRR_LLM_STRUCTURED");
@@ -498,6 +569,88 @@ export const LLM_EXTRA_BODY_BY_MODEL: Record<string, Record<string, unknown>> | 
 export function extraBodyFor(model: string): Record<string, unknown> | undefined {
   return resolveExtraBody(model, LLM_EXTRA_BODY_BY_MODEL, LLM_EXTRA_BODY);
 }
+
+// --- Reasoning ---------------------------------------------------------------------
+/**
+ * How much thinking to ask for, as an intent rather than a backend field.
+ *
+ * The same intent is spelled four incompatible ways — OpenAI `reasoning_effort`, Anthropic
+ * `thinking.budget_tokens`, Qwen `chat_template_kwargs.enable_thinking`, Ollama `think` —
+ * and until now the only way to reach any of them was raw JSON in PRR_LLM_EXTRA_BODY.
+ * Getting that wrong is an HTTP 400 on every call of the run, not a degraded review, and
+ * the one shape that a mixed fleet cannot express at all is "thinking here, not there".
+ * models/runner.ts owns the translation; this is the vocabulary.
+ *
+ * Unset (not "none") sends nothing and leaves the backend's own default alone — the
+ * behaviour every prloop release so far had.
+ */
+export type ReasoningLevel = "none" | "low" | "medium" | "high";
+export const REASONING_LEVELS = ["none", "low", "medium", "high"] as const;
+
+/** Exported for tests. Throws on an unknown level; blank means unset. */
+export function parseReasoning(raw: string | undefined): ReasoningLevel | undefined {
+  const s = (raw ?? "").trim().toLowerCase();
+  if (s === "") return undefined;
+  if (!(REASONING_LEVELS as readonly string[]).includes(s)) {
+    throw new Error(`${raw} is not one of: ${REASONING_LEVELS.join(", ")}`);
+  }
+  return s as ReasoningLevel;
+}
+
+export function parseReasoningByModel(raw: string | undefined): Record<string, ReasoningLevel> | undefined {
+  const parsed = parseObjectEnv(raw, '{"claude-sonnet":"medium","qwen3-coder":"none"}');
+  if (parsed === undefined) return undefined;
+  const out: Record<string, ReasoningLevel> = {};
+  for (const [model, level] of Object.entries(parsed)) {
+    if (typeof level !== "string") throw new Error(`entry "${model}" must be a string`);
+    const parsedLevel = parseReasoning(level);
+    // "" would silently mean "the backend default" for that model, which is what LEAVING
+    // THE ENTRY OUT already says; an empty string here is a typo, not an intent.
+    if (parsedLevel === undefined) throw new Error(`entry "${model}" must be one of: ${REASONING_LEVELS.join(", ")}`);
+    out[model] = parsedLevel;
+  }
+  return out;
+}
+
+export const REASONING: ReasoningLevel | undefined = (() => {
+  try {
+    return parseReasoning(strEnv("PRR_REASONING", ""));
+  } catch (e) {
+    console.error(`FATAL: PRR_REASONING ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
+
+// Per-model level, for the fleet shape the global knob cannot express: deep thinking on
+// the skeptic, none on the finders that only have to quote code back. An entry wins over
+// the global for that model; PRR_LLM_EXTRA_BODY still wins over both (it is the escape
+// hatch for anything this vocabulary cannot say).
+export const REASONING_BY_MODEL: Record<string, ReasoningLevel> | undefined = (() => {
+  try {
+    return parseReasoningByModel(strEnv("PRR_REASONING_BY_MODEL", ""));
+  } catch (e) {
+    console.error(`FATAL: PRR_REASONING_BY_MODEL ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
+
+/** The reasoning level for one model's calls; undefined = send nothing. */
+export function reasoningFor(model: string): ReasoningLevel | undefined {
+  return REASONING_BY_MODEL?.[model] ?? REASONING;
+}
+
+// Which dialect the endpoint speaks, for the reasoning translation above. `auto` infers it
+// from the model name, which is right for a LiteLLM proxy fronting several vendors at once
+// (where no single answer applies to the whole endpoint); name it explicitly when the
+// aliases are house names that say nothing about the family behind them.
+export type ApiFlavor = "auto" | "openai" | "anthropic" | "qwen" | "ollama";
+export const LLM_API_FLAVOR = enumEnv("PRR_LLM_API_FLAVOR", "auto", [
+  "auto",
+  "openai",
+  "anthropic",
+  "qwen",
+  "ollama",
+] as const);
 
 // --- Finder prompt shaping ---
 /**

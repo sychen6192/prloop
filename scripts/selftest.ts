@@ -6,7 +6,7 @@ import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
 import { buildHunks, diffLines, renderUnifiedDiff } from "../libs/diff";
-import { arrayField, escapeControlCharsInStrings, parseJsonObject } from "../libs/json";
+import { arrayField, escapeControlCharsInStrings, parseJsonObject, salvageArrayItems } from "../libs/json";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildDiffPayload } from "../libs/payload";
 import { htmlToText } from "../libs/html";
@@ -14,8 +14,14 @@ import { globToRegExp, loadRules, renderConventions, renderRules, ruleHeadings, 
 import { finalize, findingsAgree, fingerprint, mergeToolFindings } from "../gates/aggregate";
 import { bypassesProxy, redactProxy } from "../libs/proxy";
 import { redactSecrets, secretValues } from "../libs/redact";
-import { log } from "../libs/log";
-import { openRunDir } from "../libs/artifacts";
+import { attachLogSink, detachLogSink, log } from "../libs/log";
+import {
+  buildResultSummary,
+  detachCallSink,
+  formatCallRecord,
+  openRunDir,
+  recordCall,
+} from "../libs/artifacts";
 import { adoErrorDetail } from "../ado/client";
 import { renderSummary } from "../publish/format";
 import { buildRequirementPrompt } from "../prompts/requirement";
@@ -551,6 +557,61 @@ section("finder: an answer without a findings array is an error, not a clean PR"
   eq("a list under another key is an error", (await runFinders(answering('{"items":[]}'), input, ["m"])).outputs[0]?.error, "response has no findings array");
   const clean = (await runFinders(answering('{"findings":[]}'), input, ["m"])).outputs[0];
   check("an explicit empty findings array is a clean result", clean?.error === undefined && clean?.findings.length === 0);
+}
+
+section("salvage: a response cut at the token limit still holds complete findings");
+{
+  const files = [mkFile("/src/a.ts", ["x();", "y();", "z();"], [1, 2, 3])];
+  const pr = { title: "t", description: "", sourceBranch: "s", targetBranch: "t", createdBy: "a", status: "active" };
+  const input = { pr, files, iterationId: 1, compareTo: 0 };
+
+  // The scanner. Everything complete before the cut is returned; the fragment is not.
+  const cut =
+    '{"findings":[{"file":"/src/a.ts","claim":"one"},{"file":"/src/b.ts","claim":"two"},{"file":"/src/c.ts","claim":"thr';
+  eq("two complete objects and one cut short → two", salvageArrayItems(cut, "findings").length, 2);
+  eq("...in order, whole", JSON.stringify(salvageArrayItems(cut, "findings")[1]), '{"file":"/src/b.ts","claim":"two"}');
+
+  // Braces and quotes inside VALUES must not be counted as structure — the reason this is a
+  // scanner and not a regex.
+  const tricky = '{"findings":[{"quote":"if (x) { y(); } // \\"}\\"","nested":{"a":[1,2]}},{"quote":"partial';
+  eq("braces, quotes and escapes inside values are not structure", salvageArrayItems(tricky, "findings").length, 1);
+  eq("...and the nested value survives whole", JSON.stringify((salvageArrayItems(tricky, "findings")[0] as { nested: unknown }).nested), '{"a":[1,2]}');
+
+  eq("no such field → nothing", salvageArrayItems('{"items":[{"a":1}]}', "findings"), []);
+  eq("not JSON at all → nothing", salvageArrayItems("the model apologised", "findings"), []);
+  eq("an empty array → nothing", salvageArrayItems('{"findings":[]}', "findings"), []);
+  eq("a complete response salvages everything in it", salvageArrayItems('{"findings":[{"a":1},{"b":2}]}', "findings").length, 2);
+  // A raw newline inside a value (a model hand-writing JSON) is repaired first, as it is
+  // for the ordinary parse.
+  eq("raw control characters inside values are repaired", salvageArrayItems('{"findings":[{"claim":"line\nbreak"}]}', "findings").length, 1);
+
+  // Through the finder stage: the recovery is partial, and the call is still a failure.
+  const finding = (q: string) =>
+    `{"file":"/src/a.ts","quote":"${q}","claim":"boom","severity":"high","category":"correctness","confidence":0.9}`;
+  const truncatedText = `{"findings":[${finding("x();")},${finding("y();")},{"file":"/src/a.ts","quote":"z`;
+  const truncated = {
+    chat: async () => ({
+      text: truncatedText,
+      model: "m",
+      error: "response truncated at the token limit (8192); raise PRR_LLM_MAX_TOKENS",
+    }),
+  };
+  const salvaged = (await runFinders(truncated, input, ["m"])).outputs[0];
+  eq("a truncated finder call still yields its complete findings", salvaged?.findings.length, 2);
+  check("...but the call remains a failure, so the run stays incomplete", (salvaged?.error ?? "").includes("truncated"));
+  eq("...and the partial text is kept for runs/", salvaged?.raw, truncatedText);
+
+  // Only failures with usable text are salvaged: a transport error has none, and asking
+  // would be inventing findings.
+  const dead = { chat: async () => ({ text: "", model: "m", error: "timeout (900s)" }) };
+  eq("a transport failure salvages nothing", (await runFinders(dead, input, ["m"])).outputs[0]?.findings.length, 0);
+  eq("...and still records the empty text", (await runFinders(dead, input, ["m"])).outputs[0]?.raw, "");
+
+  // Prose around a valid array: the ordinary parse recovers it, and the salvage path never
+  // runs — a complete response must be unaffected by any of this.
+  const wrapped = { chat: async () => ({ text: `Here you go:\n\`\`\`json\n{"findings":[${finding("x();")}]}\n\`\`\`` , model: "m" }) };
+  const ok = (await runFinders(wrapped, input, ["m"])).outputs[0];
+  check("a complete response parses normally, with no error", ok?.error === undefined && ok?.findings.length === 1);
 }
 
 // --- language / noise ---
@@ -2822,6 +2883,75 @@ section("aggregate: a disagreeing source lends neither its fix nor its evidence"
   eq("...and missing evidence", agree.merged[0]?.evidence, "two callers interleave");
 }
 
+
+section("run artifacts: a run has to be diagnosable from its own directory alone");
+{
+  // The log sink is attached when the run directory is created — after intake — but the
+  // interesting early failures (auth, proxy, config warnings) are logged before that, so
+  // those lines must be replayed rather than left in a terminal nobody kept.
+  const early = `early-line-${Date.now()}`;
+  log(early);
+  const lines: string[] = [];
+  attachLogSink((l) => lines.push(l));
+  check("lines logged before the sink existed are flushed into it", lines.some((l) => l.includes(early)));
+  const later = `later-line-${Date.now()}`;
+  log(later);
+  check("...and later lines go straight through", lines.some((l) => l.includes(later)));
+  // run.log is the file people attach to bug reports, so redaction has to happen BEFORE the
+  // sink, not on the way to the terminal.
+  log("HTTP 401: Bearer abcdefgh12345678");
+  check("the sink only ever sees redacted text", lines.some((l) => l.includes("Bearer [REDACTED]")));
+  detachLogSink();
+  const seen = lines.length;
+  log("after detach");
+  eq("a detached sink receives nothing more", lines.length, seen);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-artifacts-"));
+  try {
+    // Model calls are recorded through a module-level hook: models/runner.ts is built
+    // before the run directory exists, so it records unconditionally and this decides where.
+    recordCall({ ts: "2026-01-01T00:00:00.000Z", stage: "findings", model: "m", attempt: 0, ms: 1 });
+    check("recordCall is a no-op until a sink is installed", !fs.existsSync(path.join(dir, "calls.jsonl")));
+
+    openRunDir(dir, true);
+    log("teed into the run directory");
+    recordCall({ ts: "2026-01-01T00:00:01.000Z", stage: "verdict", model: "m", attempt: 1, ms: 900, promptTokens: 12, completionTokens: 34 });
+    detachLogSink();
+    detachCallSink();
+    check("run.log holds the run's own narration", fs.readFileSync(path.join(dir, "run.log"), "utf8").includes("teed into the run directory"));
+    const jsonl = fs.readFileSync(path.join(dir, "calls.jsonl"), "utf8").trim().split("\n");
+    eq("one calls.jsonl line per model attempt", jsonl.length, 1);
+    eq("...carrying stage, model, attempt and cost", jsonl[0], '{"ts":"2026-01-01T00:00:01.000Z","stage":"verdict","model":"m","attempt":1,"ms":900,"promptTokens":12,"completionTokens":34}');
+
+    const before = fs.readFileSync(path.join(dir, "calls.jsonl"), "utf8").length;
+    recordCall({ ts: "2026-01-01T00:00:02.000Z", stage: "findings", model: "m", attempt: 0, ms: 2 });
+    eq("a detached call sink drops records again", fs.readFileSync(path.join(dir, "calls.jsonl"), "utf8").length, before);
+  } finally {
+    detachLogSink();
+    detachCallSink();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  check(
+    "a call record is redacted like every other artifact",
+    formatCallRecord({ ts: "T", stage: "findings", model: "m", attempt: 0, ms: 5, error: "HTTP 401: Bearer abcdefgh12345678" }).includes("[REDACTED]"),
+  );
+
+  // result.json: the whole outcome in one file, including the exit code CI acted on.
+  const summary = buildResultSummary({
+    exitCode: 3,
+    incomplete: ["finder m (timeout (900s))"],
+    counts: { raw: 9, anchored: 7, survived: 5, inline: 2, degraded: 1 },
+    tokens: { calls: 4, promptTokens: 100, completionTokens: 200 },
+    durationSec: 42,
+  });
+  eq("result.json records the exit code", summary["exitCode"], 3);
+  eq("...and why the run was incomplete", JSON.stringify(summary["incomplete"]), '["finder m (timeout (900s))"]');
+  eq("...the counts down the funnel", JSON.stringify(summary["counts"]), '{"raw":9,"anchored":7,"survived":5,"inline":2,"degraded":1}');
+  eq("...what it cost", JSON.stringify(summary["tokens"]), '{"calls":4,"promptTokens":100,"completionTokens":200}');
+  eq("...how long it took", summary["durationSec"], 42);
+  check("...and which prloop produced it", /^\d+\.\d+/.test(String(summary["version"])), String(summary["version"]));
+}
 
 section("config: .env parsing (the two bugs that made a correct line configure the wrong thing)");
 {

@@ -527,11 +527,21 @@ export async function triageAndConvert(
   index: FileIndex,
   // Parameterised for the selftest, which cannot set PRR_TRIAGE_MODEL after config loaded.
   model: string = TRIAGE_MODEL,
-): Promise<{ findings: AnchoredFinding[]; triaged: number; dropped: number; excluded: number; error?: string }> {
+): Promise<{
+  findings: AnchoredFinding[];
+  triaged: number;
+  dropped: number;
+  excluded: number;
+  error?: string;
+  // The triage model's own words, saved as triage-raw.txt. A triage pass that dropped every
+  // tool finding is only debuggable against what it actually answered.
+  raw?: string;
+}> {
   const kept: ToolFinding[] = [...result.facts];
   let dropped = 0;
   let triaged = 0;
   let error: string | undefined;
+  let raw: string | undefined;
 
   const batch = result.needsTriage.slice(0, MAX_TRIAGE_ITEMS);
   if (batch.length < result.needsTriage.length) {
@@ -559,6 +569,7 @@ export async function triageAndConvert(
       schemaName: "triage",
     });
 
+    raw = res.text;
     if (res.error) {
       // Fail closed: an un-triaged high-FP finding is noise, so it does not get posted.
       log(`[WARN] static triage failed (${res.error}); ${batch.length} findings awaiting verdict will not be commented`);
@@ -649,7 +660,14 @@ export async function triageAndConvert(
   if (excluded > 0) {
     log(`static: ${excluded} tool findings dropped, category excluded by config (${[...excludedCats].join(", ")})`);
   }
-  return error === undefined ? { findings, triaged, dropped, excluded } : { findings, triaged, dropped, excluded, error };
+  return {
+    findings,
+    triaged,
+    dropped,
+    excluded,
+    ...(error === undefined ? {} : { error }),
+    ...(raw === undefined ? {} : { raw }),
+  };
 }
 
 // Maps a tool rule to a review category so tool findings sit in the same taxonomy as

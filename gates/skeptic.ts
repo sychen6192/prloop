@@ -28,6 +28,10 @@ export interface Verdict {
   suggestedSeverity?: Severity;
   model: string;
   error?: string;
+  // What the verifier actually said. Saved into skeptic.json, because a refutation that
+  // killed a real finding — or an "unparseable verdict" — cannot be argued with from a
+  // parsed boolean alone.
+  raw?: string;
 }
 
 export interface SkepticOutcome {
@@ -83,9 +87,9 @@ async function verifyOne(runner: ModelRunner, prompt: string, model: string): Pr
     const error = res.error.replace("raise PRR_LLM_MAX_TOKENS", "raise PRR_SKEPTIC_MAX_TOKENS");
     const head = res.text.trim().replace(/\s+/g, " ").slice(0, 200);
     logVerbose(`skeptic ${model} call failed: ${error}${head ? ` — partial output: ${head}` : ""}`);
-    return { refuted: false, reason: "", confidence: 0, model, error };
+    return { refuted: false, reason: "", confidence: 0, model, error, raw: res.text };
   }
-  return parseVerdict(res.text, model);
+  return { ...parseVerdict(res.text, model), raw: res.text };
 }
 
 export async function runSkeptic(

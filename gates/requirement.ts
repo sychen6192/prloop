@@ -165,9 +165,12 @@ export async function runRequirementGate(
 
   if (res.error) {
     log(`[FAIL] requirement axis model call failed: ${res.error}`);
+    // The partial text goes to requirement-raw.txt even on failure: a truncated or refused
+    // call is diagnosed from what the model managed to say, and an empty file says nothing.
     return {
       result: { workItems: withSpec, criteria: [], extras: [], error: res.error },
       prompt,
+      raw: res.text,
     };
   }
 

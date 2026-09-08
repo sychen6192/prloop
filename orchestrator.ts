@@ -279,7 +279,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // A triage model that failed or answered unusably deleted every triage-tier finding; the
   // gate returns that as an error rather than throwing, so it lands here, not in the catch.
   if (toolOut.error) stageFailures.push(`triage stage (${toolOut.error})`);
-  run.saveJson("static-findings.json", toolOut);
+  // Raw output to its own file, like every other model stage: a triage pass that dropped
+  // every tool finding is argued with from what it said, not from the count it produced.
+  if (toolOut.raw !== undefined) run.save("triage-raw.txt", toolOut.raw);
+  run.saveJson("static-findings.json", { ...toolOut, raw: undefined });
 
   // knownDismissed re-enters here so finalize can route it into the summary with its
   // suppression reason — a suppressed finding must stay visible, never vanish.

@@ -226,6 +226,10 @@ export interface ChatResponse {
   // mid-output (a truncated completion, a timed-out CLI run) keeps what arrived so the
   // artifacts show it — the pair is still a failure, never an answer to parse.
   error?: string;
+  // What the endpoint's `Retry-After` asked for on a 429/503, in ms. The retry layer waits
+  // at least this long: without it the backoff guesses, and usually retries straight back
+  // into the window the endpoint just told us was closed.
+  retryAfterMs?: number;
 }
 
 export interface ModelRunner {

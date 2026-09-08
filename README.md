@@ -207,9 +207,15 @@ Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the setti
 actually used and where each came from (`config.json`), the exact prompts
 (`finder-prompt.md` is finder 0's; `finder-<i>-<model>-prompt.md` is each finder's own, since
 every finder reads the files in its own seeded order), each model's raw output
-(`finder-*-raw.txt`), the run seed and per-finder seeds (`finder-outputs.json`), per-finding
-skeptic verdicts (`skeptic.json`), and the anchoring outcome for everything including what
-was rejected and why (`findings.json`). Start there when a result looks wrong.
+(`finder-*-raw.txt`, `requirement-raw.txt`, `triage-raw.txt` — kept on failure too, which is
+when it matters), the run seed and per-finder seeds (`finder-outputs.json`), per-finding
+skeptic verdicts with what each verifier actually said (`skeptic.json`), and the anchoring
+outcome for everything including what was rejected and why (`findings.json`). Three files
+make a run readable on its own: `run.log` (every log line, including the ones printed before
+the directory existed), `calls.jsonl` (one line per model *attempt* — stage, model, retry
+number, duration, tokens, error), and `result.json` (the outcome: exit code, what was
+incomplete, the counts down the funnel, tokens, duration, version). Start there when a
+result looks wrong.
 
 ## Settings
 
@@ -229,6 +235,8 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_LLM_STREAM` | `1` | stream completions (SSE) so a gateway's idle timeout can't 504 a long generation; `0` = buffered |
 | `PRR_LLM_EXTRA_BODY` | — | JSON object merged into every model request — engine knobs prloop has no flag for; prloop's own fields win on conflict |
 | `PRR_LLM_EXTRA_BODY_BY_MODEL` | — | per-model override map ({} = send none): run a mixed fleet, e.g. thinking disabled globally but re-enabled for one deep finder and the skeptic |
+| `PRR_REASONING` | — | how much thinking to ask for: `none` \| `low` \| `medium` \| `high`. Unset sends nothing and leaves the backend's default alone. Translated per dialect (`reasoning_effort` / `thinking.budget_tokens` / `enable_thinking` / `think`) |
+| `PRR_REASONING_BY_MODEL` | — | JSON `model → level`: no thinking on the finders that only quote code back, deep thinking on the skeptic. Precedence: `PRR_LLM_EXTRA_BODY` > this > `PRR_REASONING` |
 | `PRR_FINDER_PROMPT_SUFFIX_BY_MODEL` | — | JSON `model → text` appended to that finder's system prompt: a per-family stance (self-censoring and over-reporting families need opposite nudges) without forking the prompt |
 | `PRR_FINDER_SEED` | random per run | seed for the per-finder file-order shuffle; set it to replay a run exactly (the seed a run used is in `finder-outputs.json`) |
 | `PRR_MIN_INLINE_SEVERITY` | `medium` | below this → summary only |
@@ -259,8 +267,11 @@ answer to "why did editing `.env` change nothing".
 | `PRR_LLM_BASE_URL` | `http://localhost:4000/v1` | OpenAI-compatible endpoint |
 | `PRR_LLM_API_KEY` | `dummy` | key for that endpoint. Never logged or saved |
 | `PRR_REQ_MODEL` | first finder | requirement axis model; set it when acceptance criteria need a stronger one |
-| `PRR_LLM_TIMEOUT_MS` | `900000` | deadline for one model call |
-| `PRR_LLM_TEMPERATURE` | `0.2` | low on purpose: review is not a creative task |
+| `PRR_LLM_TIMEOUT_MS` | `900000` | deadline for one model call, first byte to last |
+| `PRR_LLM_STALL_TIMEOUT_MS` | `120000` | abort a *stream* that goes silent this long (every chunk resets it). Without it, an engine that dies without closing the socket costs the full deadline — twice, with the retry. `0` = disabled |
+| `PRR_LLM_TEMPERATURE` | `0.2` | low on purpose: review is not a creative task. `none` omits the field, for backends that reject it |
+| `PRR_LLM_TEMPERATURE_BY_MODEL` | — | JSON `model → number \| "none"` |
+| `PRR_LLM_API_FLAVOR` | `auto` | dialect for the reasoning translation: `auto` \| `openai` \| `anthropic` \| `qwen` \| `ollama`. `auto` infers per model from the name |
 | `PRR_LLM_STRUCTURED` | `1` | `0` = don't send `response_format`; the schema is inlined into the prompt instead |
 | `PRR_RUNNER` | `openai` | `openai` \| `opencode` |
 | `PRR_OPENCODE_BIN` | `opencode` | opencode executable |
@@ -301,8 +312,20 @@ unparseable output — those need different fixes.
 **Runaway reasoning** is the failure a bigger limit can't fix: reasoning length is random per
 call, and a model that burns the *entire* budget, however high, eats whatever it is given.
 Point the finders at a non-thinking variant (finding + verbatim quoting doesn't need
-long reasoning; verification is where it earns its cost), or switch thinking off at the
-engine: `PRR_LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}` (vLLM / Qwen3).
+long reasoning; verification is where it earns its cost), or turn thinking off with
+`PRR_REASONING=none` — `PRR_REASONING_BY_MODEL={"qwen3-coder":"none","claude-sonnet":"medium"}`
+is the mixed-fleet version.
+
+**Reasoning is one setting, four spellings.** `PRR_REASONING` is translated per dialect:
+`reasoning_effort` (OpenAI), `thinking.budget_tokens` scaled off `PRR_LLM_MAX_TOKENS`
+(Anthropic), `chat_template_kwargs.enable_thinking` (Qwen), `think` (Ollama) — with `none`
+omitting the field where a backend has no way to say it. `PRR_LLM_API_FLAVOR` picks the
+dialect; `auto` reads it off each model's name, which is what a LiteLLM proxy fronting
+several vendors needs. **Temperature is part of that trap**: Anthropic extended thinking
+accepts only `temperature: 1` (prloop forces it, and says so once), newer Anthropic models
+and OpenAI reasoning models reject the field entirely — that is what `PRR_LLM_TEMPERATURE=none`
+is for. `PRR_LLM_EXTRA_BODY` still wins over all of it, temperature included: it is the
+escape hatch for anything this vocabulary cannot say.
 
 **Single-GPU / one-model-at-a-time backends** (a plain Ollama host) need
 `PRR_LLM_CONCURRENCY=1`. The finder fan-out otherwise interleaves requests for different
