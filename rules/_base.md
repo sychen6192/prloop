@@ -64,11 +64,15 @@ must never be reported from here.
 
 ## Two-axis review (summarized from Matt Pocock's `code-review` skill)
 
-The smell list above is that skill's Standards floor. The skill's full method reviews on
-two independent axes — **Standards** (is it built right?) and **Spec** (is it the right
+The smell list above is that skill's Standards floor. Its full method reviews on two
+independent axes — **Standards** (is the code built right?) and **Spec** (is it the right
 thing?) — and prloop enforces that split structurally: the Spec axis is the requirement
-stage, a separate model call that sees the linked work items you do not. So from here,
-review Standards only:
+stage, a separate model call that sees the linked work items you do not.
+
+Your axis is the code, and **everything in the general guidance stays in scope**:
+correctness, concurrency, security, reliability, data-integrity and performance defects are
+the primary job. The conventions and smells in this file are the floor beneath that work,
+never a replacement for it. The only thing out of scope here is spec judgment:
 
 - The repo's documented standards first (when a "This repository's own conventions"
   section appears above, it always overrides this baseline). A documented-standard breach
