@@ -39,6 +39,12 @@ const PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\bBasic\s+[A-Za-z0-9+/=]{16,}/g, `Basic ${REDACTED}`],
   [/\bsk-[A-Za-z0-9_-]{8,}/g, REDACTED],
   [/x-access-token:[^@\s/]+@/gi, `x-access-token:${REDACTED}@`],
+  // Credentials in any URL userinfo, which is how a corporate proxy is configured:
+  // PRR_HTTPS_PROXY=http://bob:hunter2@proxy.corp:8080. The value is not secret-SHAPED
+  // (it is a URL) so no other pattern caught it, and `prloop --config` printed it in
+  // full — the one place an operator is most likely to paste into a bug report.
+  // The user half is kept: knowing WHICH account the proxy rejected is the diagnosis.
+  [/\/\/([^/:@\s]+):[^@\s/]+@/g, `//$1:${REDACTED}@`],
 ];
 
 /**

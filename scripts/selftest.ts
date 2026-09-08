@@ -4388,5 +4388,20 @@ section("payload budget: tokens, not just characters");
   check("a negative window is fatal", throwsWith(() => parseContextTokensByModel('{"m":-1}')));
 }
 
+section("redaction: credentials hidden inside a URL");
+{
+  // A proxy is configured as a URL, so its password is not secret-shaped and no other
+  // pattern matched it — while `prloop --config` prints every setting, and that output is
+  // exactly what a bug report pastes.
+  eq("proxy password redacted, user kept",
+     redactSecrets("PRR_HTTPS_PROXY=http://bob:hunter2@proxy.corp:8080"),
+     "PRR_HTTPS_PROXY=http://bob:[REDACTED]@proxy.corp:8080");
+  eq("https proxy too", redactSecrets("https://svc:p@ss@host/x").includes("[REDACTED]"), true);
+  eq("a URL without credentials is untouched",
+     redactSecrets("http://proxy.corp:8080"), "http://proxy.corp:8080");
+  eq("a bare host:port is untouched", redactSecrets("localhost:4000"), "localhost:4000");
+  eq("prose with a colon survives", redactSecrets("see //note: this"), "see //note: this");
+}
+
 console.log(`\nResult: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
