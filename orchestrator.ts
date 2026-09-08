@@ -11,6 +11,7 @@ import { runRequirementGate, toRequirementFindings } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
 import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
 import { createRunDir } from "./libs/artifacts";
+import { configSnapshot } from "./libs/configreport";
 import { tokenTotals } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
@@ -71,6 +72,11 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const ctx = await buildReviewContext(opts.ref, opts.compareTo);
   const run = createRunDir(opts.ref, ctx.iteration.id);
   log(`artifacts: ${run.dir}`);
+
+  // Saved first, before any stage can fail: a run in runs/ is only diagnosable a week later
+  // if it recorded the settings it actually ran with — which value won, and whether it came
+  // from the shell or the file. Everything else in here records what the models did with it.
+  run.saveJson("config.json", configSnapshot());
 
   run.saveJson("context.json", {
     ref: opts.ref,

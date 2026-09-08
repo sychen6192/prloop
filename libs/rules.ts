@@ -3,7 +3,7 @@
 // touched no Java — which is what lets the rule set grow without growing every prompt.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { PRLOOP_ROOT } from "../config";
+import { RULES_DIR } from "../config";
 import { normalizePath } from "./fileindex";
 import { logVerbose } from "./log";
 
@@ -82,7 +82,9 @@ function readRuleDir(dir: string): Rule[] {
   return out;
 }
 
-export const RULES_DIR = process.env.PRR_RULES_DIR ?? path.join(PRLOOP_ROOT, "rules");
+// Read in config.ts (every PRR_ knob is declared there once) and re-exported here, where
+// rule loading lives.
+export { RULES_DIR };
 
 export function loadRules(): Rule[] {
   return readRuleDir(RULES_DIR);

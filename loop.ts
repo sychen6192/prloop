@@ -10,6 +10,7 @@ import {
   LLM_BASE_URL,
   MIN_CONSENSUS_SOURCES,
   REQUIRE_CORROBORATION,
+  SHOW_CONFIG,
   SKEPTIC_MODELS,
   excludedCategories,
   isDryRun,
@@ -17,6 +18,7 @@ import {
 import { parsePrUrl } from "./ado/client";
 import { unmetCriteria } from "./gates/requirement";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
+import { configWarnings, renderConfigTable, wantsConfigDump } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
 import { createRunner } from "./models/runner";
 import { runReview } from "./orchestrator";
@@ -30,6 +32,7 @@ Options:
   --since <iteration>   review only changes after that iteration (incremental)
   --since auto          resume from the last reviewed iteration
   --dry-run             compute everything, post nothing
+  --config              print every setting, its value and its source, then exit
   -h, --help            show this help
 
 Exit codes: 0 clean | 2 blocking findings | 3 review incomplete (a stage failed) | 1 fatal
@@ -40,6 +43,12 @@ Env vars: see .env.example`);
 
 async function main() {
   const args = process.argv.slice(2);
+  // Checked before the URL is required: "which value is prloop actually using" is a
+  // question you ask when a run went wrong, and it must not need a PR to answer.
+  if (wantsConfigDump(args, SHOW_CONFIG)) {
+    console.log(renderConfigTable());
+    process.exit(0);
+  }
   if (args.length === 0 || args.includes("-h") || args.includes("--help")) usage();
 
   let compareTo = 0;
@@ -63,6 +72,10 @@ async function main() {
 
   const ref = parsePrUrl(url);
   banner(`prloop: ${ref.org}/${ref.project}/${ref.repoId} PR !${ref.prId}`);
+  // Said once, before anything is spent: an edit to .env that a shell export is quietly
+  // discarding, and a setting name that configures nothing. Both used to be visible only to
+  // someone who ran probe — which nobody does during a normal review.
+  for (const w of configWarnings()) log(`[WARN] ${w.message}`);
   log(`Models: ${FINDER_MODELS.join(", ")} @ ${LLM_BASE_URL}`);
   if (isDryRun()) log("DRY RUN: no comments will be posted");
   if (REQUIRE_CORROBORATION && FINDER_MODELS.length < MIN_CONSENSUS_SOURCES && SKEPTIC_MODELS.length === 0) {

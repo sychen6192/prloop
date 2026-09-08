@@ -148,7 +148,9 @@ PRR_SKEPTIC_MODELS=model-c                 # different family again
 
 ⚠️ **`.env` never overrides a variable already exported in your shell.** That is deliberate
 (CI injects real values), but it means `HTTPS_PROXY` in `.env` silently does nothing if your
-shell has it. Use the `PRR_`-prefixed names, which always win.
+shell has it. Use the `PRR_`-prefixed names, which always win. Every run now warns about a
+`.env` line a shell export is discarding, and about a `PRR_` name prloop does not read;
+`prloop --config` prints every setting with its value and where that value came from.
 
 ## Run
 
@@ -201,7 +203,8 @@ npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
   stops there: prloop never writes its own config.
 - **Clean PR → one quiet line.** Style and formatting never get a comment; that's the linter's job.
 
-Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the exact prompts
+Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the settings the run
+actually used and where each came from (`config.json`), the exact prompts
 (`finder-prompt.md` is finder 0's; `finder-<i>-<model>-prompt.md` is each finder's own, since
 every finder reads the files in its own seeded order), each model's raw output
 (`finder-*-raw.txt`), the run seed and per-finder seeds (`finder-outputs.json`), per-finding
@@ -239,6 +242,56 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_TRIAGE_MODEL` | — | unset = high-FP tool findings are dropped |
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |
 | `PRR_DRY_RUN` | — | `1` = compute, publish nothing |
+
+Everything else prloop reads. `prloop --config` prints this same list with the value each
+one currently has and where it came from (`shell` / `.env` / `default`), which is the fast
+answer to "why did editing `.env` change nothing".
+
+| Variable | Default | |
+| --- | --- | --- |
+| `PRR_ADO_PAT` | — | PAT with Code (Read & Write); empty = `az login`. Never logged or saved |
+| `PRR_AUTH_MODE` | `auto` | `auto` \| `pat` \| `azcli` |
+| `PRR_AZ_BIN` | `az` | az CLI executable, when it is not on `PATH` |
+| `PRR_ADO_BASE_URL` | — | only when the API host differs from the browser host |
+| `PRR_ADO_API_VERSION` | `7.1` | on-prem: Server 2019→5.0, 2020→6.0, 2022→7.0 |
+| `PRR_ADO_TIMEOUT_MS` | `60000` | per-request deadline for ADO REST calls |
+| `PRR_ADO_MAX_RETRIES` | `3` | attempts for a transient ADO failure |
+| `PRR_LLM_BASE_URL` | `http://localhost:4000/v1` | OpenAI-compatible endpoint |
+| `PRR_LLM_API_KEY` | `dummy` | key for that endpoint. Never logged or saved |
+| `PRR_REQ_MODEL` | first finder | requirement axis model; set it when acceptance criteria need a stronger one |
+| `PRR_LLM_TIMEOUT_MS` | `900000` | deadline for one model call |
+| `PRR_LLM_TEMPERATURE` | `0.2` | low on purpose: review is not a creative task |
+| `PRR_LLM_STRUCTURED` | `1` | `0` = don't send `response_format`; the schema is inlined into the prompt instead |
+| `PRR_RUNNER` | `openai` | `openai` \| `opencode` |
+| `PRR_OPENCODE_BIN` | `opencode` | opencode executable |
+| `PRR_OPENCODE_AGENT` | `prloop-reviewer` | agent definition prloop drives (installed by `npm run setup`) |
+| `PRR_OPENCODE_JSON` | `1` | `0` = drop `--format json` for builds without JSONL events; loses tracing |
+| `PRR_AGENT_TIMEOUT_MS` | `900000` | wall clock for one opencode session |
+| `PRR_RULES_DIR` | `rules/` | your team's rules as `.md` files with an `applyTo` glob |
+| `PRR_MAX_DIFF_CHARS` | `240000` | ceiling on the diff sent to a finder; overflow makes the run incomplete |
+| `PRR_HUNK_CONTEXT_BEFORE` | `6` | context lines before each hunk (asymmetric: what precedes a change means more) |
+| `PRR_HUNK_CONTEXT_AFTER` | `3` | context lines after each hunk |
+| `PRR_MAX_FILE_BYTES` | `2000000` | bigger files are diffed, never sent whole |
+| `PRR_SKEPTIC_CONTEXT_LINES` | `25` | source lines around the finding; a skeptic that needs the whole file is guessing |
+| `PRR_SKEPTIC_TIMEOUT_MS` | `180000` | tighter than a finder's, and separate: a skeptic timeout fails open |
+| `PRR_MIN_CONSENSUS_SOURCES` | `2` | independent finders needed to publish without a skeptic |
+| `PRR_SKIP_STATIC` | — | `1` = skip static analysis |
+| `PRR_STATIC_TIMEOUT_MS` | `300000` | deadline for one linter invocation |
+| `PRR_TRIAGE_CONTEXT_LINES` | `12` | source lines shown to the triage model |
+| `PRR_MAX_TRIAGE_ITEMS` | `40` | a PR tripping 200 lint rules has a lint config problem, not a review problem |
+| `PRR_SKIP_REQUIREMENT` | — | `1` = skip the requirement axis |
+| `PRR_DISMISSAL_HINT_THRESHOLD` | `3` | dismissals in one category before the summary suggests excluding it |
+| `PRR_MAX_INLINE_REQ_COMMENTS` | `3` | requirement-axis budget, separate so code findings cannot crowd it out |
+| `PRR_POST_STATUS` | — | `1` = also post a PR status (needs a branch policy to gate merges) |
+| `PRR_STATUS_GENRE` | `prloop` | genre of that status |
+| `PRR_STATUS_NAME` | `ai-review` | name of that status |
+| `PRR_HTTPS_PROXY` | — | overrides `HTTPS_PROXY` from the shell (Node's fetch reads neither by itself) |
+| `PRR_HTTP_PROXY` | — | overrides `HTTP_PROXY` from the shell |
+| `PRR_NO_PROXY` | — | hosts that bypass the proxy; `host:port` entries match on port |
+| `PRR_USER_AGENT` | `prloop/<version>` | for proxies that filter CONNECT by User-Agent |
+| `PRR_QUIET` | — | `1` = drop the verbose log lines |
+| `PRR_RUNS_DIR` | `runs/` | artifacts root |
+| `PRR_SHOW_CONFIG` | — | `1` = print the settings table and exit, same as `--config` (for pipelines) |
 
 **Thinking models** outgrow the default 8192-token budget: a measured finder call on a
 self-hosted `qwen3.6:27b` used 7.8k completion tokens with ~24k characters of reasoning

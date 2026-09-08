@@ -7,18 +7,15 @@
 //
 // So we read the standard variables ourselves and hand fetch an explicit dispatcher.
 import { Agent, ProxyAgent, setGlobalDispatcher, type Dispatcher } from "undici";
+import { HTTP_PROXY, HTTPS_PROXY, NO_PROXY, USER_AGENT_OVERRIDE } from "../config";
 import { logVerbose } from "./log";
 import { caBundle, caSummary } from "./tls";
 
-/**
- * User-Agent sent on both ordinary requests and the proxy CONNECT.
- *
- * The default identifies this tool honestly. Some corporate proxies filter CONNECT by
- * User-Agent — allowing browsers and git while refusing anything unfamiliar with a 403 —
- * and on such a network PRR_USER_AGENT exists as an escape hatch (e.g. the exact string
- * your git sends). That is a policy workaround for the operator to choose deliberately,
- * not something an open tool should ship as its default.
- */
+// The values themselves are read in config.ts (every PRR_ knob is declared there once, so
+// that provenance, the typo check and --config all see it); they are re-exported here
+// because this is where proxying is implemented and where callers look for them.
+export { HTTP_PROXY, HTTPS_PROXY, NO_PROXY };
+
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 // Derived from package.json so the UA can never drift from the released version again.
@@ -30,25 +27,12 @@ const pkgVersion = (() => {
     return "0.0.0";
   }
 })();
-export const USER_AGENT = process.env.PRR_USER_AGENT ?? `prloop/${pkgVersion}`;
-
-function envAny(...names: string[]): string {
-  for (const n of names) {
-    const v = process.env[n] ?? process.env[n.toLowerCase()] ?? process.env[n.toUpperCase()];
-    if (v && v.trim()) return v.trim();
-  }
-  return "";
-}
-
-// PRR_-prefixed values win over the conventional ones.
-//
-// The .env loader never overwrites an existing environment variable, so on a machine that
-// already exports HTTPS_PROXY — which is most corporate machines — writing it in .env has
-// no effect and no error. Giving prloop its own names makes .env a reliable place to
-// override the inherited setting, rather than a file whose contents silently do nothing.
-export const HTTPS_PROXY = envAny("PRR_HTTPS_PROXY", "HTTPS_PROXY", "https_proxy");
-export const HTTP_PROXY = envAny("PRR_HTTP_PROXY", "HTTP_PROXY", "http_proxy");
-export const NO_PROXY = envAny("PRR_NO_PROXY", "NO_PROXY", "no_proxy");
+/**
+ * User-Agent sent on both ordinary requests and the proxy CONNECT. The default identifies
+ * this tool honestly; PRR_USER_AGENT is the escape hatch for a proxy that filters CONNECT
+ * by User-Agent (see the note on the config const).
+ */
+export const USER_AGENT = USER_AGENT_OVERRIDE || `prloop/${pkgVersion}`;
 
 /**
  * Standard NO_PROXY semantics: comma-separated hosts, a leading dot or bare suffix matches

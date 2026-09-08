@@ -63,7 +63,29 @@ import { applyReqSkepticVerdicts, resolveJudgments, verifySatisfiedEvidence } fr
 import { extractCriteria, splitCriteria } from "../libs/criteria";
 import type { CriterionCheck, ReqVerdict } from "../libs/types";
 import { FINDINGS_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
-import { FINDER_CATEGORIES, PRLOOP_ROOT, parseFinderPromptSuffixes, parseFinderSeed, type Severity } from "../config";
+import {
+  FINDER_CATEGORIES,
+  KNOWN_KEYS,
+  PRLOOP_ROOT,
+  applyDotEnv,
+  configReport,
+  defaultOf,
+  envAny,
+  findShadowed,
+  parseDotEnv,
+  parseFinderPromptSuffixes,
+  parseFinderSeed,
+  unknownKeys,
+  type Severity,
+} from "../config";
+import {
+  configSnapshot,
+  configWarnings,
+  displayValue,
+  renderConfigTable,
+  truncateValue,
+  wantsConfigDump,
+} from "../libs/configreport";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -2798,6 +2820,176 @@ section("aggregate: a disagreeing source lends neither its fix nor its evidence"
   );
   eq("an agreeing source still fills a missing fix", agree.merged[0]?.suggested_fix, "counter.incrementAndGet();");
   eq("...and missing evidence", agree.merged[0]?.evidence, "two callers interleave");
+}
+
+
+section("config: .env parsing (the two bugs that made a correct line configure the wrong thing)");
+{
+  const parsed = parseDotEnv(
+    [
+      "# a comment line",
+      "",
+      "PRR_LLM_MAX_TOKENS=16384",
+      "export PRR_QUIET=1",
+      "PRR_FINDER_MODELS=a,b # two models, not one called 'b # note'",
+      "PRR_STATUS_NAME=\"ai review # 2\"",
+      "PRR_STATUS_GENRE='quoted'   # trailing comment after the quotes",
+      "PRR_ADO_PAT=abc#notacomment",
+      "PRR_LLM_MAX_TOKENS=99",
+      "no equals sign here",
+      "=novalue",
+    ].join("\n"),
+  );
+  eq("a plain assignment", parsed.get("PRR_LLM_MAX_TOKENS"), "16384");
+  eq("`export FOO=bar`, pasted from a shell profile, assigns FOO", parsed.get("PRR_QUIET"), "1");
+  eq("an unquoted trailing comment is a comment, not part of the value", parsed.get("PRR_FINDER_MODELS"), "a,b");
+  eq("a # inside quotes is part of the value", parsed.get("PRR_STATUS_NAME"), "ai review # 2");
+  eq("a comment after a quoted value is still stripped", parsed.get("PRR_STATUS_GENRE"), "quoted");
+  eq("a # with no space before it is part of the value", parsed.get("PRR_ADO_PAT"), "abc#notacomment");
+  eq("the first occurrence wins (bin/prloop's head -1 agrees)", parsed.get("PRR_LLM_MAX_TOKENS"), "16384");
+  check("a line with no = is skipped", !parsed.has("no equals sign here"));
+  check("a line with no key is skipped", parsed.size === 6, `${parsed.size} keys`);
+}
+{
+  // Precedence is unchanged and load-bearing: CI exports the real values and must win.
+  const env: NodeJS.ProcessEnv = { PRR_QUIET: "1" };
+  applyDotEnv(new Map([["PRR_QUIET", "0"], ["PRR_MAX_EXTRAS", "9"]]), env);
+  eq("an exported variable survives the file", env["PRR_QUIET"], "1");
+  eq("...and the file fills in what the shell did not set", env["PRR_MAX_EXTRAS"], "9");
+}
+{
+  // The footgun itself: .env edited, shell still winning, nothing said so.
+  const file = new Map([["PRR_LLM_MAX_TOKENS", "16384"], ["PRR_QUIET", "1"], ["PRR_MAX_EXTRAS", "5"]]);
+  const shell = new Map([["PRR_LLM_MAX_TOKENS", "32768"], ["PRR_QUIET", "1"]]);
+  const shadowed = findShadowed(file, shell);
+  eq("only a DIFFERING shell value shadows", shadowed.map((e) => e.name), ["PRR_LLM_MAX_TOKENS"]);
+  eq("the shell value is the effective one", shadowed[0]?.value, "32768");
+  eq("...and .env's value is kept for the message", shadowed[0]?.fileValue, "16384");
+  eq("a key only the shell sets is not a shadow", findShadowed(new Map(), shell).length, 0);
+}
+{
+  eq("the proxy names keep their precedence", envAny(["PRR_HTTPS_PROXY", "HTTPS_PROXY", "https_proxy"], { PRR_HTTPS_PROXY: "http://a", HTTPS_PROXY: "http://b" }), "http://a");
+  eq("...falling back to the conventional name", envAny(["PRR_HTTPS_PROXY", "HTTPS_PROXY"], { HTTPS_PROXY: "http://b" }), "http://b");
+  eq("...and the lowercase spelling", envAny(["PRR_HTTPS_PROXY", "HTTPS_PROXY"], { https_proxy: "http://c" }), "http://c");
+  eq("nothing set is the empty string", envAny(["PRR_HTTPS_PROXY", "HTTPS_PROXY"], {}), "");
+}
+
+section("config: startup warnings and the --config table");
+{
+  process.env["PRR_TYPPO_MAX_TOKENS"] = "16384";
+  check("a misspelled setting is reported", unknownKeys().includes("PRR_TYPPO_MAX_TOKENS"));
+  const warnings = configWarnings();
+  check(
+    "...with a message that names it as a typo",
+    warnings.some((w) => w.message === "unknown setting PRR_TYPPO_MAX_TOKENS (not a prloop setting — check for a typo)"),
+  );
+  delete process.env["PRR_TYPPO_MAX_TOKENS"];
+  check("a real setting is not reported as unknown", !unknownKeys().includes("PRR_LLM_MAX_TOKENS"));
+}
+{
+  // A PAT reaches the log, the table and runs/config.json only as a placeholder.
+  process.env["PRR_ADO_PAT"] = "ghp_averyrealisticlookingtoken0123";
+  const table = renderConfigTable();
+  check("a secret never reaches the config table", !table.includes("ghp_averyrealisticlookingtoken0123"));
+  check("...it shows as [REDACTED]", /PRR_ADO_PAT\s+\[REDACTED\]/.test(table));
+  const snapshot = configSnapshot();
+  const pat = snapshot.entries.find((e) => e.name === "PRR_ADO_PAT");
+  eq("...and config.json saves the placeholder, not the token", pat?.value, "[REDACTED]");
+  eq("...next to the source, which is the point of saving it", pat?.source, "shell");
+  delete process.env["PRR_ADO_PAT"];
+  eq("an unset secret is blank, not [REDACTED]", displayValue("PRR_ADO_PAT", ""), "");
+  eq("a non-secret value is shown as it is", displayValue("PRR_MAX_EXTRAS", "7"), "7");
+}
+{
+  // config.json is written through the same redacting artifact writer as everything else in
+  // runs/; the point of the file is that it is safe to attach to a bug report.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prr-config-"));
+  process.env["PRR_ADO_PAT"] = "ghp_averyrealisticlookingtoken0123";
+  openRunDir(dir).saveJson("config.json", configSnapshot());
+  const saved = fs.readFileSync(path.join(dir, "config.json"), "utf8");
+  delete process.env["PRR_ADO_PAT"];
+  check("the run's config.json holds no secret", !saved.includes("ghp_averyrealisticlookingtoken0123"));
+  const reloaded = JSON.parse(saved) as { entries: Array<{ name: string }> };
+  eq("...and one entry per registry key", reloaded.entries.length, KNOWN_KEYS.length);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+{
+  eq("a long value is cut to a loggable length", truncateValue("x".repeat(60)), `${"x".repeat(40)}…`);
+  eq("a short one is left alone", truncateValue("qwen3-coder"), "qwen3-coder");
+  check("a credential in a value is scrubbed before it is cut", !truncateValue("Bearer sk-abcdefghijklmnop").includes("sk-abcdefghijklmnop"));
+}
+{
+  check("--config asks for the table", wantsConfigDump(["--config"], false));
+  check("PRR_SHOW_CONFIG=1 asks for it too", wantsConfigDump([], true));
+  check("a normal run does not", !wantsConfigDump(["https://dev.azure.com/o/p/_git/r/pullrequest/1", "--dry-run"], false));
+  check("every registry key has a row", configReport().length === KNOWN_KEYS.length);
+  const table = renderConfigTable();
+  check("the table names the knob that started all this", /PRR_LLM_MAX_TOKENS\s+8192\s+default/.test(table));
+  check("...and every other one", KNOWN_KEYS.every((k) => table.includes(k.name)));
+}
+
+section("config SSOT: registry, readers, .env.example and the README settings table");
+{
+  const read = (rel: string) => fs.readFileSync(path.join(PRLOOP_ROOT, rel), "utf8");
+  const names = KNOWN_KEYS.map((k) => k.name);
+  const known = new Set(names);
+  eq("no duplicate registry entries", names.length - known.size, 0);
+  check("every entry has a description", KNOWN_KEYS.every((k) => k.description.length > 0 && k.description.length <= 60));
+
+  // 1. The registry and the readers describe the same set of knobs. A knob added to
+  //    config.ts without a registry entry has no provenance, no --config row and no typo
+  //    check; an entry with no reader is a setting that silently does nothing.
+  const configSrc = read("config.ts");
+  const readNames = new Set<string>();
+  for (const m of configSrc.matchAll(/process\.env\.(PRR_[A-Z0-9_]+)/g)) readNames.add(m[1]!);
+  for (const m of configSrc.matchAll(/\b(?:numEnv|enumEnv|strEnv|flagEnv|switchEnv)\("(PRR_[A-Z0-9_]+)"/g)) readNames.add(m[1]!);
+  for (const m of configSrc.matchAll(/envAny\(\["(PRR_[A-Z0-9_]+)"/g)) readNames.add(m[1]!);
+  eq("every knob config.ts reads is in the registry", [...readNames].filter((n) => !known.has(n)), []);
+  eq("every registry key is actually read", names.filter((n) => !readNames.has(n)), []);
+  const kindOf = new Map(KNOWN_KEYS.map((k) => [k.name, k.kind]));
+  eq(
+    "numEnv knobs are registered as numbers",
+    [...configSrc.matchAll(/(?<![A-Za-z])numEnv\("(PRR_[A-Z0-9_]+)"/g)].map((m) => m[1]!).filter((n) => kindOf.get(n) !== "number"),
+    [],
+  );
+  eq(
+    "on/off knobs are registered as bools",
+    [...configSrc.matchAll(/(?:flagEnv|switchEnv)\("(PRR_[A-Z0-9_]+)"/g)].map((m) => m[1]!).filter((n) => kindOf.get(n) !== "bool"),
+    [],
+  );
+
+  // 2. Documented in both places, or in neither (CLAUDE.md's rule; the drift it caught the
+  //    first time it ran was 21 knobs missing from .env.example and 43 from the README).
+  const documented = KNOWN_KEYS.filter((k) => !k.internal).map((k) => k.name);
+  const declared = new Set<string>();
+  for (const line of read(".env.example").split("\n")) {
+    const m = /^\s*#?\s*(PRR_[A-Z0-9_]+)\s*=/.exec(line);
+    if (m) declared.add(m[1]!);
+  }
+  eq("every knob appears in .env.example", documented.filter((n) => !declared.has(n)), []);
+  eq(".env.example names no knob prloop stopped reading", [...declared].filter((n) => !known.has(n)), []);
+  const rows = new Set<string>();
+  for (const m of read("README.md").matchAll(/^\| `(PRR_[A-Z0-9_]+)` \|/gm)) rows.add(m[1]!);
+  eq("every knob has a row in the README settings table", documented.filter((n) => !rows.has(n)), []);
+  eq("the README names no knob prloop stopped reading", [...rows].filter((n) => !known.has(n)), []);
+
+  // 3. Reading a PRR_ variable anywhere else puts it outside all of the above. Writes are
+  //    fine — the CLI exports PRR_DRY_RUN for --dry-run, and tests seed values.
+  const ls = spawnSync("git", ["ls-files", "-z", "--", "*.ts"], { cwd: PRLOOP_ROOT, encoding: "utf8" });
+  const tracked = (ls.status === 0 ? ls.stdout.split("\0") : []).filter(Boolean);
+  check("tracked TypeScript sources were listed", tracked.length > 20, `${tracked.length} files`);
+  const strays: string[] = [];
+  for (const rel of tracked) {
+    if (rel === "config.ts") continue;
+    read(rel).split("\n").forEach((line, i) => {
+      if (/delete\s+process\.env/.test(line)) return;
+      for (const m of line.matchAll(/process\.env(?:\.(PRR_[A-Z0-9_]+)|\["(PRR_[A-Z0-9_]+)"\])(\s*=(?!=))?/g)) {
+        if (m[3] === undefined) strays.push(`${rel}:${i + 1} ${m[1] ?? m[2] ?? ""}`);
+      }
+    });
+  }
+  eq("no PRR_ setting is read outside config.ts", strays, []);
+  eq("the defaults the readers recorded are the ones the table shows", defaultOf("PRR_LLM_MAX_TOKENS"), "8192");
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);
