@@ -152,6 +152,47 @@ export const LLM_EXTRA_BODY: Record<string, unknown> | undefined = (() => {
   }
 })();
 
+/**
+ * Resolves the extra body for one model: the per-model entry wins when present ({} means
+ * "send none"), otherwise the global. Pure and exported for tests; the config consts below
+ * feed it at runtime.
+ */
+export function resolveExtraBody(
+  model: string,
+  byModel: Record<string, Record<string, unknown>> | undefined,
+  global: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  const specific = byModel?.[model];
+  return specific !== undefined ? specific : global;
+}
+
+// Per-model overrides for LLM_EXTRA_BODY: a JSON object keyed by model name, each value
+// REPLACING the global for that model. The motivating shape is a mixed fleet: thinking
+// disabled globally, re-enabled for the one finder whose depth is worth the runaway risk
+// (an empty {} entry = send no extra body, i.e. the engine's default behaviour) and for
+// the skeptic. Replacement, not merging — Qwen3's switch is binary, and merge semantics
+// would make "which knob won" a puzzle.
+export const LLM_EXTRA_BODY_BY_MODEL: Record<string, Record<string, unknown>> | undefined = (() => {
+  try {
+    const parsed = parseExtraBody(process.env.PRR_LLM_EXTRA_BODY_BY_MODEL);
+    if (parsed === undefined) return undefined;
+    for (const [model, body] of Object.entries(parsed)) {
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        throw new Error(`entry "${model}" must be a JSON object (use {} to send none)`);
+      }
+    }
+    return parsed as Record<string, Record<string, unknown>>;
+  } catch (e) {
+    console.error(`FATAL: PRR_LLM_EXTRA_BODY_BY_MODEL ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+})();
+
+/** The extra body actually sent for a model's calls. */
+export function extraBodyFor(model: string): Record<string, unknown> | undefined {
+  return resolveExtraBody(model, LLM_EXTRA_BODY_BY_MODEL, LLM_EXTRA_BODY);
+}
+
 // --- Diff / token budget (PR-Agent style deterministic compression) ---
 export const MAX_DIFF_CHARS = numEnv("PRR_MAX_DIFF_CHARS", 240_000, 1000);
 // Extra context lines around each hunk. Asymmetric on purpose: preceding context

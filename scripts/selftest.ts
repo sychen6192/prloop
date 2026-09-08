@@ -1594,6 +1594,34 @@ section("strict-mode schema invariant");
     const missing = walk(schema, name);
     check(`${name} schema is strict-mode compliant`, missing.length === 0, missing.join(", "));
   }
+
+  // Backends enforce different JSON Schema subsets, and a value constraint they don't
+  // support is a hard HTTP 400 that takes a whole finder down (seen live: Bedrock's
+  // structured output rejecting minimum/maximum on a number). None of these were ever
+  // load-bearing — ranges are clamped and lists capped in code — so the schemas describe
+  // shape only. This walker keeps it that way.
+  const CONSTRAINTS = new Set([
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minItems", "maxItems", "uniqueItems", "minLength", "maxLength", "pattern", "format",
+  ]);
+  const constraints = (node: unknown, path: string): string[] => {
+    if (typeof node !== "object" || node === null) return [];
+    const out: string[] = [];
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (CONSTRAINTS.has(k)) out.push(`${path}.${k}`);
+      out.push(...constraints(v, `${path}.${k}`));
+    }
+    return out;
+  };
+  for (const [name, schema] of [
+    ["findings", FINDINGS_SCHEMA],
+    ["requirement", REQUIREMENT_SCHEMA],
+    ["verdict", VERDICT_SCHEMA],
+    ["triage", TRIAGE_SCHEMA],
+  ] as const) {
+    const found = constraints(schema, name);
+    check(`${name} schema carries no value constraints (backend dialects differ)`, found.length === 0, found.join(", "));
+  }
 }
 
 section("skeptic verdict semantics");

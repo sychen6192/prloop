@@ -4,7 +4,7 @@
 import {
   LLM_API_KEY,
   LLM_BASE_URL,
-  LLM_EXTRA_BODY,
+  extraBodyFor,
   LLM_MAX_TOKENS,
   LLM_STREAM,
   LLM_STRUCTURED_OUTPUT,
@@ -247,7 +247,7 @@ export class OpenAICompatRunner implements ModelRunner {
   }
 
   private async request(req: ChatRequest, stream: boolean): Promise<ChatResponse> {
-    const body = buildChatBody(req, stream, LLM_EXTRA_BODY);
+    const body = buildChatBody(req, stream, extraBodyFor(req.model));
     const url = `${this.baseUrl.replace(/\/+$/, "")}/chat/completions`;
     const ctrl = new AbortController();
     const timeoutMs = req.timeoutMs ?? LLM_TIMEOUT_MS;
