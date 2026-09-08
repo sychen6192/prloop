@@ -168,6 +168,24 @@ section("request body assembly: PRR_LLM_EXTRA_BODY adds engine knobs, never brea
   check("response_format present with schema", JSON.stringify(withSchema["response_format"]).includes('"findings"'));
 }
 
+section("schema delivery: enforced by the backend, or inlined into the prompt — never neither");
+{
+  const req = { model: "m", system: "s", user: "review this", schema: { type: "object", required: ["findings"] }, schemaName: "findings" };
+  const enforced = buildChatBody(req, false, undefined, true);
+  const enforcedUser = (enforced["messages"] as Array<{ content: string }>)[1]!.content;
+  check("structured on: response_format carries the schema", JSON.stringify(enforced["response_format"]).includes('"findings"'));
+  eq("structured on: prompt untouched", enforcedUser, "review this");
+
+  // PRR_LLM_STRUCTURED=0 (or a backend that cannot enforce): the schema rides in the prompt.
+  // Seen live without this: Claude invented field names and every finding was dropped.
+  const inlined = buildChatBody(req, false, undefined, false);
+  const inlinedUser = (inlined["messages"] as Array<{ content: string }>)[1]!.content;
+  check("structured off: no response_format", !("response_format" in inlined));
+  check("structured off: schema text in the prompt", inlinedUser.includes('"findings"') && inlinedUser.includes("JSON Schema"));
+  check("structured off: original prompt kept", inlinedUser.startsWith("review this"));
+  eq("no schema, structured off: prompt untouched", (buildChatBody({ model: "m", system: "s", user: "u" }, false, undefined, false)["messages"] as Array<{ content: string }>)[1]!.content, "u");
+}
+
 section("PRR_LLM_EXTRA_BODY parsing fails fast at startup, not as HTTP 400 mid-run");
 {
   eq("unset stays unset", parseExtraBody(undefined), undefined);
