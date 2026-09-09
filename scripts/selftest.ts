@@ -3014,6 +3014,71 @@ section("finder knobs: PRR_FINDER_PROMPT_SUFFIX_BY_MODEL and PRR_FINDER_SEED");
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+section("finder coverage: what NO finder saw, not what finder 0 missed");
+{
+  // The diff is budgeted per finder — buildDiffPayload weighs it against that model's
+  // context window (PRR_CONTEXT_TOKENS_BY_MODEL) and that model's system prompt — so a
+  // mixed fleet does not see the same files. runFinders used to report finder 0's omission
+  // list as the run's, which made the coverage gate depend on which model happened to be
+  // listed first: PRR_FINDER_MODELS=small,big called four files unreviewed that `big` read
+  // in full, and PRR_FINDER_MODELS=big,small called the run complete.
+  //
+  // Config is read at import time, so this runs in a fresh process per the pattern above.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-coverage-"));
+  const probe = path.join(dir, "probe.mts");
+  const finderMod = pathToFileURL(path.join(PRLOOP_ROOT, "gates", "finder.ts")).href;
+  const tsxCli = path.join(PRLOOP_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+  fs.writeFileSync(
+    probe,
+    `import { runFinders } from ${JSON.stringify(finderMod)};\n` +
+      `const body = (n) => Array.from({ length: 120 }, (_, i) => \`+  const \${n}\${i} = compute(\${i});\`).join("\\n");\n` +
+      `const mk = (n) => ({ path: \`src/\${n}.ts\`, changeType: "edit",\n` +
+      `  hunks: [{ rightStart: 1, rightCount: 120, leftStart: 1, leftCount: 0, body: body(n) }],\n` +
+      `  rightLines: [], leftLines: [], changedRightLines: new Set([1]),\n` +
+      `  binary: false, truncated: false, language: "typescript" });\n` +
+      `const files = ["a","b","c","d","e","f"].map(mk);\n` +
+      `const pr = { title: "t", description: "", sourceBranch: "s", targetBranch: "t", createdBy: "a", status: "active" };\n` +
+      `const runner = { chat: async (r) => ({ model: r.model, text: '{"findings":[]}' }) };\n` +
+      `const out = await runFinders(runner, { pr, files, iterationId: 1, compareTo: 0 }, process.env.ORDER.split(","));\n` +
+      `console.log(JSON.stringify({ aggregate: out.omitted,\n` +
+      `  perFinder: out.outputs.map((o) => ({ model: o.model, omitted: o.omitted, bound: o.bound })) }));\n`,
+  );
+  // "big" is cut off by the char ceiling and loses one file; "small" is cut off by its
+  // context window and loses four. Only src/f.ts is missed by both.
+  const runProbe = (order: string) => {
+    const r = spawnSync(process.execPath, [tsxCli, probe], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ORDER: order,
+        PRR_QUIET: "1",
+        PRR_MAX_DIFF_CHARS: "20000",
+        PRR_CONTEXT_TOKENS_BY_MODEL: '{"big":1000000,"small":1}',
+      },
+    });
+    return parseJsonObject<{
+      aggregate: string[];
+      perFinder: Array<{ model: string; omitted: string[]; bound?: string }>;
+    }>((r.stdout ?? "").trim().split("\n").pop() ?? "");
+  };
+
+  const fwd = runProbe("big,small");
+  const rev = runProbe("small,big");
+  check("coverage probe ran", fwd.ok && rev.ok);
+  if (fwd.ok && rev.ok) {
+    eq("only the file no finder saw counts as a coverage gap", fwd.value.aggregate, ["src/f.ts"]);
+    eq("...and the answer does not depend on which finder is listed first", rev.value.aggregate, fwd.value.aggregate);
+
+    const big = fwd.value.perFinder.find((o) => o.model === "big");
+    const small = fwd.value.perFinder.find((o) => o.model === "small");
+    eq("the char-bound finder carries its own omission list", big?.omitted, ["src/f.ts"]);
+    eq("...naming the ceiling that cut it off", big?.bound, "chars");
+    eq("the small-window finder lost more", small?.omitted, ["src/c.ts", "src/d.ts", "src/e.ts", "src/f.ts"]);
+    eq("...and names the other ceiling", small?.bound, "tokens");
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 section("finder stage: per-model stance, seeded file order, drop accounting");
 {
   const files = ["a", "b", "c", "d", "e"].map((n) => mkFile(`/src/${n}.ts`, [`${n}();`], [1]));

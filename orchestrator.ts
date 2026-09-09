@@ -48,11 +48,13 @@ export interface ReviewRunResult {
  * Coverage gaps that make a review incomplete (PRR_STRICT_COVERAGE). Exported for the
  * selftest.
  *
- * A file the finder never saw was not reviewed, whatever the finder said about the rest:
- * left out of its context because the diff ran past PRR_MAX_DIFF_CHARS, or skipped by
- * intake as too large to fetch. Both were logged and named in the summary, and the run
- * still exited 0 — a green check over a PR whose largest file nobody read. Binary files
- * are not counted: nothing in them is reviewable, so their absence hides nothing.
+ * A file NO finder saw was not reviewed, whatever the finders said about the rest: left out
+ * of every finder's context because the diff ran past PRR_MAX_DIFF_CHARS or past the
+ * models' context windows, or skipped by intake as too large to fetch. Both were logged and
+ * named in the summary, and the run still exited 0 — a green check over a PR whose largest
+ * file nobody read. Binary files are not counted: nothing in them is reviewable, so their
+ * absence hides nothing. A file some finders saw and others did not is not a gap — it was
+ * reviewed, by fewer opinions; runFinders logs that separately.
  */
 export function coverageGaps(
   omitted: string[],

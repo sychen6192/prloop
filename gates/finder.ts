@@ -32,6 +32,12 @@ export interface FinderOutput {
   // — finder 0's — cannot explain what finder 2 saw. Absent on outputs built offline.
   seed?: number;
   prompt?: string;
+  // What THIS finder was not shown, and which ceiling cut it off. Per finder for the same
+  // reason seed and prompt are: the diff is budgeted against the model's own context window
+  // (PRR_CONTEXT_TOKENS_BY_MODEL) and its own system prompt, so a heterogeneous fleet does
+  // not see the same files. Absent on outputs built offline.
+  omitted?: string[];
+  bound?: "chars" | "tokens";
 }
 
 const VALID_SEVERITY = new Set<string>(SEVERITIES);
@@ -294,9 +300,11 @@ export async function runFinders(
   const knownCites = knownCitesFor(selected, input.conventions);
   const suffixes = opts.promptSuffixes ?? FINDER_PROMPT_SUFFIX_BY_MODEL;
 
-  // Selection is decided once, by budget, and is identical for every finder; only the
-  // order of the included files differs per finder (libs/prng.ts says why). The run seed
-  // is logged so a result can be replayed with PRR_FINDER_SEED.
+  // The seed permutes the ORDER of the selected files per finder and never the selection
+  // itself (libs/prng.ts says why). Selection can still differ between finders, because the
+  // budget does: buildDiffPayload weighs the diff against this model's context window and
+  // this model's system prompt, both of which are per-model. The run seed is logged so a
+  // result can be replayed with PRR_FINDER_SEED.
   const runSeed = opts.seed ?? FINDER_SEED ?? newRunSeed();
   // The system prompt and the schema are handed to the prompt builder, not just to the
   // runner: they share the model's context window with the diff, so the diff cannot be
@@ -315,20 +323,35 @@ export async function runFinders(
     });
   const prompts = models.map((_, i) => promptFor(i));
   const first = prompts[0] ?? promptFor(0);
-  const omitted = first.omitted;
-  if (omitted.length > 0) {
+  // Coverage is what NO finder saw. Reporting finder 0's list instead let a file the
+  // smallest-window finder dropped pass as reviewed, and — with one finder, the common
+  // case — the two are the same list, so the gap only opened on a mixed fleet.
+  const omitted = first.omitted.filter((f) => prompts.every((p) => p.omitted.includes(f)));
+  // Seen by some finders and not others: reviewed, but by fewer opinions than the run was
+  // configured for, so anything found there cannot reach the corroboration bar. Worth
+  // saying out loud; not grounds for calling the run incomplete.
+  const partial = [...new Set(prompts.flatMap((p) => p.omitted))].filter((f) => !omitted.includes(f));
+  if (omitted.length > 0 || partial.length > 0) {
     // Which ceiling bound decides which knob is worth changing: raising PRR_MAX_DIFF_CHARS
     // does nothing when the model's context window is what ran out.
-    const knob = first.bound === "tokens" ? "the model's context window (PRR_CONTEXT_TOKENS)" : "PRR_MAX_DIFF_CHARS";
-    log(`[WARN] diff over ${knob}; ${omitted.length} files left out of the finder context`);
+    const bound = prompts.find((p) => p.bound)?.bound;
+    const knob = bound === "tokens" ? "the model's context window (PRR_CONTEXT_TOKENS)" : "PRR_MAX_DIFF_CHARS";
+    if (omitted.length > 0) {
+      log(`[WARN] diff over ${knob}; ${omitted.length} files left out of every finder's context`);
+    }
+    if (partial.length > 0) {
+      log(`[WARN] diff over ${knob}; ${partial.length} files seen by only some finders (fewer opinions, no corroboration)`);
+    }
   }
   log(`finder file order: run seed ${runSeed}${models.length > 1 ? `, one permutation per finder` : ""}`);
 
   // Parallel across models; each is an independent opinion (M3 relies on that independence).
   const outputs = await Promise.all(
-    models.map((m, i) =>
-      runOne(runner, m, systems[i]!, prompts[i]!.text, seedFor(runSeed, i), knownCites),
-    ),
+    models.map(async (m, i) => ({
+      ...(await runOne(runner, m, systems[i]!, prompts[i]!.text, seedFor(runSeed, i), knownCites)),
+      omitted: prompts[i]!.omitted,
+      ...(prompts[i]!.bound === undefined ? {} : { bound: prompts[i]!.bound }),
+    })),
   );
   return { outputs, prompt: first.text, omitted, rules: selected.map((r) => r.name), seed: runSeed };
 }
