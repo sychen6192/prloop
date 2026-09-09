@@ -894,10 +894,6 @@ export const QUIET = flagEnv("PRR_QUIET");
 // adding a flag means editing YAML but adding a variable does not.
 export const SHOW_CONFIG = flagEnv("PRR_SHOW_CONFIG");
 
-// Marker embedded in every comment we author, so re-runs can find and update
-// our own threads instead of duplicating them.
-export const BOT_MARKER = "<!-- prloop -->";
-
 // Artifacts root.
 export const RUNS_DIR = strEnv("PRR_RUNS_DIR", path.join(PRLOOP_ROOT, "runs"));
 // Retention for those artifacts. One run writes the whole finder prompt (up to

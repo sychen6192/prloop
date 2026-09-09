@@ -68,8 +68,10 @@ try {
 
   const { parsePrUrl } = await import("../ado/client");
   const { publish } = await import("../publish/publish");
-  const { SUMMARY_MARKER, fpMarker, catMarker } = await import("../publish/format");
-  const { BOT_MARKER } = await import("../config");
+  const { BOT_MARKER, SUMMARY_MARKER, findingMarkers, summaryMarkers, iterationMarker, readMarkers } =
+    await import("../publish/markers");
+  const { FINDING_CATEGORIES } = await import("../config");
+  const { fingerprint } = await import("../gates/aggregate");
   const { FileIndex } = await import("../libs/fileindex");
 
   const ref = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4821");
@@ -130,7 +132,13 @@ try {
   /** A prloop comment as a previous run would have left it on the PR. */
   const ourComment = (id: number, body: string, fp?: string, cat?: string) => ({
     id,
-    content: `${BOT_MARKER}${fp ? fpMarker(fp) : ""}${cat ? catMarker(cat) : ""}\n${body}`,
+    // Written out literally, never with findingMarkers(): a fixture built from the writer
+    // agrees with the reader even when the two are wrong together, which is exactly how the
+    // hand-copied `cat=([a-z-]+)` stayed green.
+    content:
+      `${BOT_MARKER}` +
+      `${fp ? `<!-- prloop:fp=${fp} -->` : ""}` +
+      `${cat ? `<!-- prloop:cat=${cat} -->` : ""}\n${body}`,
   });
 
   const setState = (partial: Partial<FakeAdoState>) => {
@@ -226,7 +234,10 @@ try {
     eq("...while the OTHER axis still gets its comment", result.posted.map((f) => f.fingerprint), ["cccc3333"]);
     const posted = threadPosts().filter((r) => !contentOf(r).includes(SUMMARY_MARKER));
     eq("...as exactly one inline thread", posted.length, 1);
-    check("...carrying the requirement category marker", contentOf(posted[0]!).includes(catMarker("req-mismatch")));
+    check(
+      "...carrying the requirement category marker",
+      contentOf(posted[0]!).includes("<!-- prloop:cat=req-mismatch -->"),
+    );
 
     // And the shape of that write, which is where "comments on the wrong line" is won:
     // both ends of the span, the iteration context, and the change tracking id ADO needs
@@ -251,7 +262,7 @@ try {
       threads: [],
       rejectThreadPost: (body) => {
         const comments = (body["comments"] as Array<{ content?: string }> | undefined) ?? [];
-        return (comments[0]?.content ?? "").includes(fpMarker("dddd4444")) ? 500 : undefined;
+        return (comments[0]?.content ?? "").includes("<!-- prloop:fp=dddd4444 -->") ? 500 : undefined;
       },
     });
     const { value: result, lines } = await capture(() =>
@@ -264,6 +275,73 @@ try {
     check("the summary still posts", result.summaryThreadId !== undefined);
     const summary = threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER));
     check("...and admits the comment never landed", (contentOf(summary ?? {})).includes("could not be posted"), contentOf(summary ?? {}));
+  }
+
+  section("marker protocol: the bytes on the wire, and the reader that has to agree with them");
+  {
+    // Pinned literally. These strings sit in comments on live PRs; a run that stops writing
+    // exactly them orphans every thread an earlier run left behind, and the failure looks
+    // like "prloop posted everything twice".
+    eq(
+      "a finding comment's markers",
+      findingMarkers({ fingerprint: "c848ab6f5911", category: "correctness" }),
+      "<!-- prloop --><!-- prloop:fp=c848ab6f5911 --><!-- prloop:cat=correctness -->",
+    );
+    eq("the summary's markers", summaryMarkers(), "<!-- prloop --><!-- prloop:summary -->");
+    eq("the iteration marker", iterationMarker(7), "<!-- prloop:iteration=7 -->");
+
+    // Read back off hand-written bytes, not off the writer's output.
+    const m = readMarkers(
+      "<!-- prloop --><!-- prloop:fp=c848ab6f5911 --><!-- prloop:cat=leftover-code -->\nA claim.",
+    );
+    check("ours", m.ours);
+    check("...and not the summary", !m.summary);
+    eq("...fingerprint", m.fingerprint, "c848ab6f5911");
+    eq("...category", m.category, "leftover-code");
+    eq("...iteration is absent", m.iteration, undefined);
+
+    const sum = readMarkers("<!-- prloop --><!-- prloop:summary -->\n## r\n<!-- prloop:iteration=12 -->");
+    check("the summary is recognised", sum.ours && sum.summary);
+    eq("...and carries the iteration", sum.iteration, 12);
+    eq("...but no fingerprint", sum.fingerprint, undefined);
+
+    // The assertion the old hand-copied `cat=([a-z-]+)` could not make. A category outside
+    // that class read as "no category", which postedPositions turns into axis: undefined —
+    // "blocks both axes" — and a requirement thread swallows a critical code finding again.
+    for (const cat of FINDING_CATEGORIES) {
+      eq(
+        `every category survives the round trip: ${cat}`,
+        readMarkers(findingMarkers({ fingerprint: "abc123def456", category: cat })).category,
+        cat,
+      );
+    }
+    eq(
+      "a category this build does not know reads as absent, never as a bad guess",
+      readMarkers("<!-- prloop --><!-- prloop:cat=invented-by-a-model -->").category,
+      undefined,
+    );
+
+    // The fingerprint shape lives in gates/aggregate.ts; the reader validates it by pattern
+    // rather than importing it, so this is what stops the two drifting apart.
+    const real = fingerprint({
+      file: "src/app.ts",
+      category: "correctness",
+      severity: "high",
+      confidence: 0.9,
+      quote: "const a = 1;",
+      claim: "c",
+      side: "right",
+    } as Parameters<typeof fingerprint>[0]);
+    eq("a real fingerprint round-trips", readMarkers(findingMarkers({ fingerprint: real, category: "correctness" })).fingerprint, real);
+    eq(
+      "a malformed fingerprint reads as absent",
+      readMarkers("<!-- prloop --><!-- prloop:fp=not-a-hash -->").fingerprint,
+      undefined,
+    );
+
+    eq("a comment that is not ours reads as nothing", readMarkers("Looks good to me!").ours, false);
+    eq("...as does an empty body", readMarkers(undefined).ours, false);
+    eq("...with no fingerprints to dedupe against", readMarkers(undefined).fingerprints, []);
   }
 
   section("stale threads: our own comments close when the code under them is gone");

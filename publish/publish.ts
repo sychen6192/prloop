@@ -1,17 +1,18 @@
 // Publishing: one sticky summary edited in place, plus inline threads for findings that
 // anchored. Re-runs recognise their own threads by fingerprint and never post the same
 // issue twice (the "re-review amnesia" failure mode).
-import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun, BOT_MARKER } from "../config";
+import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun } from "../config";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { createThread, listThreads, updateComment, type Thread } from "../ado/threads";
 import { postStatus } from "../ado/statuses";
 import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
 import { log } from "../libs/log";
-import { collectDismissals, findStaleThreads, iterationMarker, resolveStaleThreads } from "./lifecycle";
+import { collectDismissals, findStaleThreads, resolveStaleThreads } from "./lifecycle";
+import { iterationMarker, readMarkers } from "./markers";
 import type { AnchoredFinding, PrRef } from "../libs/types";
 import type { DismissalRecord } from "./lifecycle";
-import { SUMMARY_MARKER, renderFindingComment, renderSummary, type SummaryInput } from "./format";
+import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
 
 export interface PublishResult {
   summaryThreadId?: number;
@@ -26,7 +27,7 @@ export interface PublishResult {
 
 function findSummaryThread(threads: Thread[]): { thread: Thread; commentId: number } | undefined {
   for (const t of threads) {
-    const c = t.comments?.find((c) => !c.isDeleted && (c.content ?? "").includes(SUMMARY_MARKER));
+    const c = t.comments?.find((c) => !c.isDeleted && readMarkers(c.content).summary);
     if (c) return { thread: t, commentId: c.id };
   }
   return undefined;
@@ -67,14 +68,13 @@ const axisOf = (category: string) => (category === "req-mismatch" ? "requirement
  */
 export function postedPositions(threads: Thread[], index: FileIndex): PostedPosition[] {
   const out: PostedPosition[] = [];
-  const catRe = /<!-- prloop:cat=([a-z-]+) -->/;
   for (const t of threads) {
     if (t.status === "fixed") continue;
     const ctx = t.threadContext;
     if (!ctx?.filePath || !ctx.rightFileStart?.line) continue;
-    const ourComment = t.comments?.find((c) => !c.isDeleted && (c.content ?? "").includes(BOT_MARKER));
+    const ourComment = t.comments?.find((c) => !c.isDeleted && readMarkers(c.content).ours);
     if (!ourComment) continue;
-    const cat = catRe.exec(ourComment.content ?? "")?.[1];
+    const cat = readMarkers(ourComment.content).category;
     out.push({
       // Thread paths come back from ADO in its own shape and may cite a pre-rename path;
       // resolve through the index so a thread on the old name still occupies the renamed
@@ -110,13 +110,10 @@ export function coveredByThread(f: AnchoredFinding, positions: PostedPosition[])
 
 function postedFingerprints(threads: Thread[]): Set<string> {
   const out = new Set<string>();
-  const re = /<!-- prloop:fp=([0-9a-f]+) -->/g;
   for (const t of threads) {
     for (const c of t.comments ?? []) {
       if (c.isDeleted) continue;
-      for (const m of (c.content ?? "").matchAll(re)) {
-        if (m[1]) out.add(m[1]);
-      }
+      for (const fp of readMarkers(c.content).fingerprints) out.add(fp);
     }
   }
   return out;

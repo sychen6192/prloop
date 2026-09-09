@@ -9,22 +9,19 @@
 // State lives in the PR itself (a marker inside our own summary comment), not on disk:
 // the tool is meant to be runnable from a pipeline agent, a laptop, or a cron box without
 // them sharing a filesystem.
-import { BOT_MARKER } from "../config";
+import { readMarkers } from "./markers";
 import { listThreads, setThreadStatus, type Thread } from "../ado/threads";
 import type { FileIndex } from "../libs/fileindex";
 import { log, logVerbose } from "../libs/log";
 import type { PrRef } from "../libs/types";
 
-const ITERATION_MARKER = /<!-- prloop:iteration=(\d+) -->/;
-export const iterationMarker = (id: number) => `<!-- prloop:iteration=${id} -->`;
-
 /** The iteration recorded by our last run, read back from the sticky summary. */
 export function lastReviewedIteration(threads: Thread[]): number | undefined {
   for (const t of threads) {
     for (const c of t.comments ?? []) {
-      if (c.isDeleted || !(c.content ?? "").includes(BOT_MARKER)) continue;
-      const m = ITERATION_MARKER.exec(c.content ?? "");
-      if (m?.[1]) return Number(m[1]);
+      if (c.isDeleted) continue;
+      const m = readMarkers(c.content);
+      if (m.ours && m.iteration !== undefined) return m.iteration;
     }
   }
   return undefined;
@@ -59,7 +56,7 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
   for (const t of threads) {
     if (t.status !== "active") continue;
     const first = t.comments?.find((c) => !c.isDeleted);
-    if (!first || !(first.content ?? "").includes(BOT_MARKER)) continue;
+    if (!first || !readMarkers(first.content).ours) continue;
     // The summary thread has no file context and is never resolved this way.
     const ctx = t.threadContext;
     if (!ctx?.filePath || !ctx.rightFileStart?.line) continue;
@@ -114,23 +111,21 @@ export interface DismissalRecord {
  */
 export function collectDismissals(threads: Thread[]): DismissalRecord[] {
   const out: DismissalRecord[] = [];
-  const fpRe = /<!-- prloop:fp=([0-9a-f]+) -->/;
-  const catRe = /<!-- prloop:cat=([a-z-]+) -->/;
   for (const t of threads) {
     // wontFix/byDesign only. In the ADO UI "Closed" routinely means "handled", not
     // "wrong finding" — recording it as a dismissal would suppress a real finding class
     // forever, across PRs, because someone once fixed an instance and closed the thread.
     const dismissed = t.status === "wontFix" || t.status === "byDesign";
     if (!dismissed) continue;
-    const c = t.comments?.find((x) => !x.isDeleted && (x.content ?? "").includes(BOT_MARKER));
+    const c = t.comments?.find((x) => !x.isDeleted && readMarkers(x.content).ours);
     if (!c) continue;
-    const fp = fpRe.exec(c.content ?? "")?.[1];
-    if (!fp) continue; // the summary comment carries no fingerprint
+    const m = readMarkers(c.content);
+    if (!m.fingerprint) continue; // the summary comment carries no fingerprint
     out.push({
-      fingerprint: fp,
+      fingerprint: m.fingerprint,
       file: t.threadContext?.filePath ?? "",
       claim: (c.content ?? "").split("\n").find((l) => l && !l.startsWith("<") && !l.startsWith("**")) ?? "",
-      category: catRe.exec(c.content ?? "")?.[1],
+      category: m.category,
       resolvedAs: t.status ?? "",
     });
   }

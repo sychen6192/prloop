@@ -46,7 +46,8 @@ import { environmentFailure, filterToChangedLines, matchesReviewedContent, proje
 import { renderFindingComment } from "../publish/format";
 import { parseToolOutput } from "../profiles/parsers";
 import { selectProfiles, filesForProfile, PROFILES } from "../profiles";
-import { lastReviewedIteration, findStaleThreads, collectDismissals, iterationMarker } from "../publish/lifecycle";
+import { lastReviewedIteration, findStaleThreads, collectDismissals } from "../publish/lifecycle";
+import { iterationMarker } from "../publish/markers";
 import { postedPositions } from "../publish/publish";
 import {
   dismissedCategoryHints,

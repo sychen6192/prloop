@@ -1,6 +1,7 @@
 // Comment rendering. Every comment carries hidden markers so re-runs can recognise their
 // own threads: the bot marker identifies authorship, the fingerprint identifies the issue.
-import { BOT_MARKER, MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "../config";
+import { MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "../config";
+import { findingMarkers, summaryMarkers } from "./markers";
 import { detectLanguage } from "../libs/lang";
 import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
@@ -8,12 +9,6 @@ import type { AggregateResult } from "../gates/aggregate";
 import type { CategoryHint } from "../libs/learnings";
 import type { ReviewContext } from "../ado/intake";
 import type { StaticResult } from "../gates/static";
-
-export const SUMMARY_MARKER = "<!-- prloop:summary -->";
-export const fpMarker = (fp: string) => `<!-- prloop:fp=${fp} -->`;
-// Lets a dismissal be attributed to a category later without re-deriving it from prose —
-// the raw material for "the team keeps dismissing category X" hints.
-export const catMarker = (cat: string) => `<!-- prloop:cat=${cat} -->`;
 
 const SEVERITY_LABEL: Record<string, string> = {
   critical: "🔴 Critical",
@@ -57,7 +52,7 @@ const detailsOpen = (title: string) => `<details><summary>${title}</summary>`;
 
 export function renderFindingComment(f: AnchoredFinding): string {
   const parts: string[] = [
-    `${BOT_MARKER}${fpMarker(f.fingerprint)}${catMarker(f.category)}`,
+    findingMarkers(f),
     `**${SEVERITY_LABEL[f.severity] ?? f.severity}** · ${CATEGORY_LABEL[f.category] ?? f.category}`,
     "",
     f.claim,
@@ -233,7 +228,7 @@ function postingClaim(input: SummaryInput, inline: AnchoredFinding[]): string {
 export function renderSummary(input: SummaryInput): string {
   const { ctx, agg } = input;
   const lines: string[] = [
-    `${BOT_MARKER}${SUMMARY_MARKER}`,
+    summaryMarkers(),
     `## 🔍 prloop automated review`,
     "",
   ];

@@ -30,6 +30,13 @@ The stable identity of a finding across runs, hashed from its normalized file, c
 quote, and carried in a hidden comment marker so re-runs recognise what they already said.
 _Avoid_: id, hash (bare)
 
+**Marker**:
+A hidden HTML comment prloop embeds in every comment it writes — authorship, fingerprint,
+category, iteration — and reads back on the next run to recognise its own threads. One
+grammar, owned by `publish/markers.ts`: writers and readers agree byte for byte, and the
+bytes are fixed because they already sit on live PRs.
+_Avoid_: tag, annotation, sentinel
+
 **FileIndex**:
 The one resolver from a foreign path string — model-quoted or tool-reported — to a FileDiff
 in the change set; built once per review from the iteration's files, unique-match-or-nothing
