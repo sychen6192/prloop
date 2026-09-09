@@ -2,6 +2,7 @@
 // line, so it gets the most coverage here — these assertions are the regression net for the
 // class of bug that motivated the whole project.
 import { splitLines } from "../libs/text";
+import { buildLocalReviewContext } from "../git/intake";
 import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
@@ -2463,6 +2464,62 @@ section("opencode invocation: prompt delivery");
 
   // Whatever the prompt looks like, a flags-only argv cannot hit the cmd.exe limit.
   check("flags-only argv is always within the cmd.exe limit", planSpawn("opencode.cmd", args, "win32").error === undefined);
+}
+
+section("local intake: the second provider at the ReviewContext seam, held to the contract");
+{
+  // ReviewContext used to be defined inside ado/intake.ts, and git/intake.ts imported the
+  // type from there — a seam owned by one of its sides, so nothing stated what a provider
+  // owes. Three fields had drifted by the time anyone looked. These are the two that a test
+  // can catch; the third (empty commit sentinels) is asserted below.
+  const gitOk = (await run("git", ["--version"], 10_000)).code === 0;
+  if (!gitOk) {
+    skip("a rename keeps its trail through the local intake", "no git on this platform");
+  } else {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-localintake-"));
+    const g = async (...args: string[]) => run("git", ["-C", repo, ...args], 20_000);
+    await g("init", "-q", "-b", "main");
+    await g("config", "user.email", "selftest@example.invalid");
+    await g("config", "user.name", "selftest");
+    fs.writeFileSync(path.join(repo, "old.ts"), "export function a() {\n  return 1;\n}\n");
+    await g("add", "-A");
+    await g("commit", "-qm", "base");
+    await g("checkout", "-q", "-b", "feature");
+    await g("mv", "old.ts", "new.ts");
+    fs.writeFileSync(path.join(repo, "new.ts"), "export function a() {\n  return 2;\n}\n");
+    await g("add", "-A");
+    await g("commit", "-qm", "rename");
+
+    const ctx = await buildLocalReviewContext({ repo, base: "main", head: "feature" });
+    const f = ctx.files.find((x: FileDiff) => x.path === "new.ts");
+    eq("the renamed file is under review", f?.changeType, "rename");
+    // libs/fileindex.ts follows originalPath to keep a thread created on the old name
+    // attached, and libs/payload.ts renders "(renamed from ...)". The ADO intake set it;
+    // this one declared the rename and then hid it.
+    eq("...and carries the path it came from", f?.originalPath, "old.ts");
+    // The left side has to be read from the OLD path: at the base ref the new one does not
+    // exist, so reading it there gave an empty left side and diffed a rename as a wholly
+    // new file — every line of it "added", for the finder to review from scratch.
+    eq("...with its left side read from that path, not an empty one", f?.leftLines.length, 3);
+    check("...so it is not diffed as wholly added", (f?.changedRightLines.size ?? 99) < 3);
+
+    // orchestrator.ts fetches the repo's convention files at targetRefCommit and hands
+    // sourceRefCommit to the static gate. Empty strings satisfied the type and then meant
+    // "no conventions, no source commit" without anyone saying so.
+    check("the iteration carries a real head commit", /^[0-9a-f]{40}$/.test(ctx.iteration.sourceRefCommit));
+    check("...a real base commit", /^[0-9a-f]{40}$/.test(ctx.iteration.targetRefCommit));
+    check("...and the merge base the three-dot diff was taken against", /^[0-9a-f]{40}$/.test(ctx.iteration.commonRefCommit));
+
+    // A file the provider could not read is skipped with a named reason, never handed over
+    // as empty — an empty left side diffs as wholly added and reads downstream as a clean
+    // review of code nobody saw. `too large` is the one reason coverageGaps counts.
+    const gone = await buildLocalReviewContext({ repo, base: "main", head: "no-such-ref-at-all" }).catch(
+      () => undefined,
+    );
+    eq("an unreadable ref fails loudly rather than reviewing nothing", gone, undefined);
+
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 }
 
 section("opencode: a killed or crashed run is a named failure, not an empty answer");

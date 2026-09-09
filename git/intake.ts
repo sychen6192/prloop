@@ -11,7 +11,7 @@ import { splitLines } from "../libs/text";
 import { log, logVerbose } from "../libs/log";
 import { run } from "../libs/shell";
 import type { ChangeType, FileDiff, PrInfo } from "../libs/types";
-import type { ReviewContext } from "../ado/intake";
+import type { ReviewContext, SkippedFile } from "../libs/context";
 
 async function git(repo: string, args: string[]): Promise<string> {
   const res = await run("git", ["-C", repo, ...args], 120_000);
@@ -19,11 +19,33 @@ async function git(repo: string, args: string[]): Promise<string> {
   return res.stdout;
 }
 
-/** File content at a ref, or empty when the path doesn't exist there (added/deleted). */
-async function showFile(repo: string, ref: string, filePath: string): Promise<string[]> {
+/**
+ * File content at a ref.
+ *
+ * The reason this returns a reason and not just lines: every non-zero git exit used to
+ * collapse into "empty", i.e. "the path does not exist at this ref" — the expected answer
+ * for an added or deleted file. A file too large for the output cap (libs/shell.ts kills the
+ * child past 8 MB) therefore came back as absent, was diffed as wholly added, and the run
+ * reported a clean review of a file nobody had read. The ADO intake names that case
+ * `too large` and orchestrator.ts counts it into coverageGaps; collapsing failure into
+ * absence is exactly what CLAUDE.md's "failures are named precisely" rule is about.
+ */
+async function showFile(
+  repo: string,
+  ref: string,
+  filePath: string,
+): Promise<{ lines: string[] } | { failure: string }> {
   const res = await run("git", ["-C", repo, "show", `${ref}:${filePath}`], 120_000);
-  if (res.code !== 0) return [];
-  return splitLines(Buffer.from(res.stdout, "utf8"));
+  if (res.code === 0) return { lines: splitLines(Buffer.from(res.stdout, "utf8")) };
+  if (res.timedOut) return { failure: "git show timed out" };
+  // The output cap. Same wording as ado/blobs.ts uses, because the same thing happened and
+  // orchestrator.ts recognises this exact string.
+  if (/produced more than \d+ characters/.test(res.stderr)) return { failure: "too large" };
+  // git's own words for "not at this ref", which is not a failure at all.
+  if (/does not exist in|exists on disk, but not in|unknown revision or path/.test(res.stderr)) {
+    return { lines: [] };
+  }
+  return { failure: `git show failed: ${res.stderr.trim().split("\n")[0] ?? `exit ${res.code}`}` };
 }
 
 function mapStatus(code: string): ChangeType {
@@ -55,12 +77,17 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     .map((l) => l.trim())
     .filter(Boolean)
     .map((l) => {
+      // A rename line is "R096\told\tnew": the trail matters, because fileindex follows
+      // originalPath to keep a thread created on the old name attached to the file.
       const parts = l.split("\t");
-      return { status: parts[0] ?? "", path: parts[parts.length - 1] ?? "" };
+      const status = parts[0] ?? "";
+      const path = parts[parts.length - 1] ?? "";
+      const originalPath = status.startsWith("R") && parts.length >= 3 ? parts[1] : undefined;
+      return { status, path, ...(originalPath === undefined ? {} : { originalPath }) };
     })
     .filter((e) => e.path);
 
-  const skipped: Array<{ path: string; reason: string }> = [];
+  const skipped: SkippedFile[] = [];
   const files: FileDiff[] = [];
 
   for (const e of entries) {
@@ -78,10 +105,20 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       continue;
     }
 
-    const [rightLines, leftLines] = await Promise.all([
+    // A rename reads its left side from the OLD path; at the base ref the new one does not
+    // exist yet, and reading it there produced an empty left side — a rename diffed as a
+    // wholly new file.
+    const [right, left] = await Promise.all([
       showFile(opts.repo, opts.head, e.path),
-      showFile(opts.repo, opts.base, e.path),
+      showFile(opts.repo, opts.base, e.originalPath ?? e.path),
     ]);
+    const failure = "failure" in right ? right.failure : "failure" in left ? left.failure : undefined;
+    if (failure !== undefined) {
+      skipped.push({ path: e.path, reason: failure });
+      continue;
+    }
+    const rightLines = (right as { lines: string[] }).lines;
+    const leftLines = (left as { lines: string[] }).lines;
     const { hunks, changedRightLines, changedLeftLines } = buildHunks(
       leftLines,
       rightLines,
@@ -95,6 +132,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     // leading slash, forward separators. git already reports exactly that.
     files.push({
       path: e.path,
+      ...(e.originalPath === undefined ? {} : { originalPath: e.originalPath }),
       changeType,
       hunks,
       rightLines,
@@ -121,7 +159,18 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
 
   log(`Local diff: ${opts.base}...${opts.head}, ${files.length} files under review, ${skipped.length} skipped`);
 
-  const iteration = { id: 1, sourceRefCommit: "", targetRefCommit: "", commonRefCommit: "", createdDate: "" };
+  // Real commits, not empty strings. orchestrator.ts fetches the repository's convention
+  // files at ctx.iteration.targetRefCommit and hands ctx.iteration.sourceRefCommit to the
+  // static gate; a sentinel there satisfies the type and then silently means "no
+  // conventions" and "no source commit". prId 0 and the empty baseUrl stay sentinels — there
+  // is no PR — and every ADO call is gated on having one before it runs.
+  const iteration = {
+    id: 1,
+    sourceRefCommit: (await git(opts.repo, ["rev-parse", opts.head])).trim(),
+    targetRefCommit: (await git(opts.repo, ["rev-parse", opts.base])).trim(),
+    commonRefCommit: (await git(opts.repo, ["merge-base", opts.base, opts.head])).trim(),
+    createdDate: "",
+  };
   return {
     ref: { baseUrl: "", org: "local", project: "local", repoId: opts.repo, prId: 0 },
     pr,

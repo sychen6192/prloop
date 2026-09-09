@@ -37,6 +37,13 @@ grammar, owned by `publish/markers.ts`: writers and readers agree byte for byte,
 bytes are fixed because they already sit on live PRs.
 _Avoid_: tag, annotation, sentinel
 
+**ReviewContext**:
+Everything one review reads: the iteration's file diffs with real line indexes, what was
+skipped and why, and the FileIndex built from them. Its contract — what a provider must
+guarantee — lives in `libs/context.ts`, not in either provider; `ado/` builds one from the
+REST API, `git/` from a working tree.
+_Avoid_: state, payload, snapshot
+
 **FileIndex**:
 The one resolver from a foreign path string — model-quoted or tool-reported — to a FileDiff
 in the change set; built once per review from the iteration's files, unique-match-or-nothing

@@ -55,7 +55,7 @@ and closes its server in a `finally`.
 | `prompts/` | every prompt, one file per stage |
 | `rules/` | reviewer rules as markdown with `applyTo` globs |
 | `publish/` | comment rendering, the hidden marker protocol, dedup (fingerprint + position), lifecycle |
-| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types (SSOT) |
+| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types and the ReviewContext contract (SSOT) |
 | `scripts/` | selftests (+ `fakes/`), doctor/probe/tlsfix diagnostics, local-review |
 
 ## Conventions

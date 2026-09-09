@@ -3,28 +3,15 @@
 // Everything downstream (finder prompt, anchoring, publishing) reads from here.
 import { ADO_CONCURRENCY } from "../config";
 import { getBlob } from "./blobs";
+// Re-exported for the callers that grew up importing it from here; libs/context.ts owns it.
+export type { ReviewContext } from "../libs/context";
 import { getIterationChanges, getPrInfo, listIterations } from "./iterations";
 import { buildHunks, diffLines } from "../libs/diff";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { log, logVerbose } from "../libs/log";
-import type { ChangeEntry, FileDiff, Iteration, PrInfo, PrRef } from "../libs/types";
-
-export interface ReviewContext {
-  ref: PrRef;
-  pr: PrInfo;
-  iterations: Iteration[];
-  // The iteration being reviewed (always the latest).
-  iteration: Iteration;
-  // 0 = full PR; >0 = incremental review since that iteration (M5).
-  compareTo: number;
-  files: FileDiff[];
-  // Changed files we deliberately did not review (lockfiles, binaries, generated output).
-  skipped: Array<{ path: string; reason: string }>;
-  changeTrackingIds: Map<string, number>;
-  // Built once here; the single resolver for foreign path strings (see CONTEXT.md).
-  fileIndex: FileIndex;
-}
+import type { ReviewContext, SkippedFile } from "../libs/context";
+import type { ChangeEntry, FileDiff, PrRef } from "../libs/types";
 
 async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> {
   const language = detectLanguage(entry.path);
@@ -76,7 +63,7 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
     path: normalizePath(e.path),
     originalPath: e.originalPath === undefined ? undefined : normalizePath(e.originalPath),
   }));
-  const skipped: Array<{ path: string; reason: string }> = [];
+  const skipped: SkippedFile[] = [];
   const changeTrackingIds = new Map<string, number>();
   const targets: ChangeEntry[] = [];
 

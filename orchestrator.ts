@@ -26,6 +26,13 @@ export interface ReviewRunOptions {
   ref: PrRef;
   runner: ModelRunner;
   compareTo: number;
+  /**
+   * Where the ReviewContext comes from. Defaults to the Azure DevOps intake; git/intake.ts
+   * is the other adapter at this seam. A parameter rather than a hard-wired import so the
+   * contract in libs/context.ts is something a provider can be held to — including in a
+   * test — instead of being whatever ado/intake.ts happens to return.
+   */
+  intake?: (ref: PrRef, compareTo: number) => Promise<ReviewContext>;
 }
 
 export interface ReviewRunResult {
@@ -92,7 +99,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const started = Date.now();
 
   banner("Step 1/4: fetch PR changes");
-  const ctx = await buildReviewContext(opts.ref, opts.compareTo);
+  const ctx = await (opts.intake ?? buildReviewContext)(opts.ref, opts.compareTo);
   const run = createRunDir(opts.ref, ctx.iteration.id);
   log(`artifacts: ${run.dir}`);
 
