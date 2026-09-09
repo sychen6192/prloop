@@ -113,7 +113,7 @@ console.log("\nEntry points the selftests cannot reach");
 console.log("\nPaths documents point at");
 {
   // docs/superpowers/specs/ was renamed to docs/design/; a stale link in a doc is silent.
-  for (const f of ["README.md", "CLAUDE.md", "CONTRIBUTING.md", "PROPOSAL.md", "docs/troubleshooting.md"]) {
+  for (const f of ["README.md", "ARCHITECTURE.md", "CONTRIBUTING.md", "PROPOSAL.md", "docs/troubleshooting.md"]) {
     check(`${f} does not reference the retired docs/superpowers/ path`, !read(f).includes("docs/superpowers"));
   }
 }

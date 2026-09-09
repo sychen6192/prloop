@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Read the load-bearing invariants in `CLAUDE.md` first. Several
+        Read the load-bearing invariants in `ARCHITECTURE.md` first. Several
         plausible-sounding features are deliberately absent — a model deciding control flow,
         the two axes sharing a budget, the skeptic raising severity, prloop editing its own
         config — and PROPOSAL.md §10 lists options already rejected, with reasons.
