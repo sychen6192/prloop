@@ -1,6 +1,6 @@
 # Contributing
 
-Read [ARCHITECTURE.md](./ARCHITECTURE.md) first — it is the map of the code, and its **load-bearing
+Read [CLAUDE.md](./CLAUDE.md) first — it is the map of the code, and its **load-bearing
 invariants** section lists the things that are bugs when violated, not style preferences:
 models never emit line numbers, the control loop is deterministic TypeScript, the skeptic's
 asymmetries (lowers only, fails open) and anchoring's (fails closed), the two axes staying

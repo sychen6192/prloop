@@ -7,7 +7,7 @@
 ## Invariant touched
 
 <!--
-Name it if the change goes near one (ARCHITECTURE.md has the list), and say how it still holds:
+Name it if the change goes near one (CLAUDE.md has the list), and say how it still holds:
 deterministic control loop · models never emit line numbers · the two axes stay blind to
 each other · skeptic lowers only / fails open · anchoring fails closed · config SSOT ·
 undici is the only runtime dependency. "None" is a fine answer.

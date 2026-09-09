@@ -1,7 +1,7 @@
-# prloop — architecture
+# prloop — guide for AI-assisted development
 
-Automated PR review for Azure DevOps. Read README.md for what the tool does and how to run
-it; PROPOSAL.md for the research basis. This file is the map for working on the code.
+Automated PR review for Azure DevOps. Read README.md for the architecture; PROPOSAL.md for
+the research basis. This file is the map for working on the code.
 
 ## Commands
 
