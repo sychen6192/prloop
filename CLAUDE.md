@@ -6,13 +6,22 @@ the research basis. This file is the map for working on the code.
 ## Commands
 
 ```bash
-npm run check        # typecheck + full offline selftest — run before every commit
+npm run check        # typecheck + every offline selftest — run before every commit
 npx tsx scripts/selftest.ts          # anchoring / pipeline regression net
-npx tsx scripts/selftest-stream.ts   # SSE transport regression net
+npx tsx scripts/selftest-stream.ts   # SSE parsing and the failure taxonomy around it
+npx tsx scripts/selftest-runner.ts   # HTTP model transport: retries, fallback, accounting
+npx tsx scripts/selftest-publish.ts  # what publish() writes to the PR
+npx tsx scripts/selftest-ado.ts      # ADO intake edges: paging, parent PBIs, conventions
+npx tsx scripts/selftest-cli.ts      # argument grammar and exit codes
+npx tsx scripts/selftest-docs.ts     # claims the docs make about the code
 npx tsx scripts/demo.ts              # render comments from fake data, no network
+npx tsx scripts/calibrate.ts         # dismissal / kill rates from runs/ + dismissals.jsonl
 ```
 
-Everything is offline-testable; no test needs ADO credentials or a model endpoint.
+Everything is offline-testable; no test needs ADO credentials or a model endpoint. The four
+nets that exercise side effects drive the real code against fake servers built from `node:http`
+in `scripts/fakes/` — test infrastructure, never a dependency. Every one of them binds port 0
+and closes its server in a `finally`.
 
 ## Load-bearing invariants (violating these is a bug, not a style choice)
 
@@ -27,8 +36,10 @@ Everything is offline-testable; no test needs ADO credentials or a model endpoin
   CLOSED (a wrong-line comment is worse than a miss). Keep them.
 - **Two axes stay blind to each other.** The requirement axis and code axis must not see
   each other's output, and their comment budgets stay separate.
-- **Config is SSOT in `config.ts`** — every knob is a `PRR_*` env var defined there once,
-  documented in `.env.example` and the README table. Add all three or none.
+- **Config is SSOT in `config.ts`** — every knob is a `PRR_*` env var read there once, listed
+  in the `KNOWN_KEYS` registry, and documented in `.env.example` and the README table. Add all
+  four or none; `scripts/selftest.ts` fails on any of them missing. A knob read outside
+  `config.ts` has no provenance, no `--config` row and no typo warning, so there are none.
 - **Every model call goes through `models/runner.ts`** (concurrency, retries, streaming,
   token accounting). Never call fetch directly for model traffic.
 
@@ -44,8 +55,8 @@ Everything is offline-testable; no test needs ADO credentials or a model endpoin
 | `prompts/` | every prompt, one file per stage |
 | `rules/` | reviewer rules as markdown with `applyTo` globs |
 | `publish/` | comment rendering, dedup (fingerprint + position), lifecycle |
-| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, types (SSOT) |
-| `scripts/` | selftests, doctor/probe/tlsfix diagnostics, local-review |
+| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types (SSOT) |
+| `scripts/` | selftests (+ `fakes/`), doctor/probe/tlsfix diagnostics, local-review |
 
 ## Conventions
 

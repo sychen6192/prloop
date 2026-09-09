@@ -7,7 +7,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as net from "node:net";
 import * as tls from "node:tls";
-import { ADO_API_VERSION, ADO_PAT, PRLOOP_ROOT } from "../config";
+import { ADO_API_VERSION, ADO_PAT, DOTENV_PATH, PRLOOP_ROOT, entryFor } from "../config";
+import { describeEntry } from "../libs/configreport";
 import { authHeader, describeAuthMode } from "../ado/auth";
 import { parsePrUrl, prBase } from "../ado/client";
 import { HTTPS_PROXY, HTTP_PROXY, USER_AGENT, bypassesProxy, dispatcherFor, proxySummary, redactProxy } from "../libs/proxy";
@@ -25,40 +26,12 @@ function line(label: string, value: string) {
 /**
  * Config provenance. The .env loader deliberately never overrides an existing environment
  * variable, so a stale `export` in a shell profile silently wins over the file — which is
- * invisible unless you look for it.
+ * invisible unless you look for it. The bookkeeping is config.ts's (it is the only place
+ * that can tell a shell export from a value it set itself); this just prints it.
  */
 function reportProvenance(keys: string[]) {
-  const envPath = path.join(PRLOOP_ROOT, ".env");
-  const fileValues = new Map<string, string>();
-  if (fs.existsSync(envPath)) {
-    for (const raw of fs.readFileSync(envPath, "utf8").split("\n")) {
-      const s = raw.trim();
-      if (!s || s.startsWith("#")) continue;
-      const i = s.indexOf("=");
-      if (i <= 0) continue;
-      fileValues.set(s.slice(0, i).trim(), s.slice(i + 1).trim());
-    }
-  } else {
-    console.log(`  (${envPath} not found)`);
-  }
-
-  for (const k of keys) {
-    const inFile = fileValues.get(k);
-    const effective = process.env[k];
-    const shown = k.includes("PAT") || k.includes("KEY")
-      ? effective
-        ? `(set, length ${effective.length})`
-        : "(not set)"
-      : (effective ?? "(not set)");
-
-    let source = "default";
-    if (inFile !== undefined && effective === inFile) source = ".env";
-    else if (effective !== undefined && inFile === undefined) source = "shell env var";
-    else if (inFile !== undefined && effective !== inFile) {
-      source = `⚠️  shell env var overrides .env (.env says "${inFile}", effective value is "${effective ?? ""}")`;
-    }
-    line(k, `${shown}   ← ${source}`);
-  }
+  if (!fs.existsSync(DOTENV_PATH)) console.log(`  (${DOTENV_PATH} not found)`);
+  for (const k of keys) line(k, describeEntry(entryFor(k)));
 }
 
 async function rawGet(url: string, header: string): Promise<void> {
@@ -80,7 +53,7 @@ async function rawGet(url: string, header: string): Promise<void> {
     if (res.status === 203 || ctype.includes("text/html")) {
       console.log(
         "  → Got a sign-in page, not JSON. Auth was rejected: PAT invalid, expired, " +
-          "or missing the Code (Read & Write) scope.",
+          "or missing scope (needs Code (Read & Write) + Work Items (Read)).",
       );
       return;
     }

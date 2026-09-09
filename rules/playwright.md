@@ -44,8 +44,10 @@ file and none may be cited against it.
   banners, and overlays as test failures. → mock the responses with the Network API
   (`page.route`).
 
-## Widely-agreed additions (community consensus, not in the official docs — word findings
-accordingly and cap severity at medium)
+## Widely-agreed additions
+
+Community consensus, not in the official docs — word findings accordingly and cap severity
+at medium.
 
 - **`page.waitForTimeout(...)` as synchronization.** A fixed sleep is flakiness with a delay
   attached: too short it flakes, too long it slows the suite. → a web-first assertion or an

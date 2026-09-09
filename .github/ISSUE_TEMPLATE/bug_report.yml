@@ -1,0 +1,74 @@
+name: Bug report
+description: A review landed wrong, a stage crashed, or prloop would not start.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Almost every wrong review result is diagnosed from the run directory, not from the
+        code. Please open `runs/<org>/<project>/<repo>/pr-<id>/iter-N-<ts>/` and bring what
+        it says — `run.log`, `result.json`, `findings.json`, `calls.jsonl`, and the raw model
+        output for the stage that misbehaved.
+
+        Those files contain the prompts and the diff of the code you reviewed. Secrets are
+        redacted by the tool, your source is not — paste only what you can share publicly.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected instead
+      description: For a wrong comment, say which line it landed on and which line it should have.
+    validations:
+      required: true
+
+  - type: textarea
+    id: run-dir
+    attributes:
+      label: Run directory evidence
+      description: |
+        The path of the `iter-N-<ts>/` directory, plus the relevant excerpts: the failing
+        stage's lines from `run.log`, the matching `calls.jsonl` rows, and the finding as it
+        appears in `findings.json` (its `anchor` outcome is usually the answer).
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: prloop version / commit
+      description: "`git rev-parse --short HEAD`, or the tag you checked out. `result.json` also records it."
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version and OS
+      description: "Output of `node -v`, plus Linux / macOS / Windows."
+    validations:
+      required: true
+
+  - type: input
+    id: backend
+    attributes:
+      label: Model backend and model names
+      description: >-
+        vLLM / LiteLLM / Ollama / a corporate gateway / opencode, and the exact finder,
+        skeptic, requirement and triage models. Behaviour differs sharply by family and by
+        whether the backend enforces the JSON schema.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: "`prloop --config` output"
+      description: >-
+        The whole table. It shows every setting, its value and where the value came from,
+        which is what separates "prloop is broken" from ".env never took effect".
+        `PRR_ADO_PAT` and `PRR_LLM_API_KEY` are redacted by the tool; a password embedded in
+        a proxy or base URL is not, so scrub that line yourself.
+      render: text
+    validations:
+      required: true

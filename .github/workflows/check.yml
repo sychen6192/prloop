@@ -3,19 +3,57 @@ on:
   push:
     branches: [main]
   pull_request:
+
+# Read-only: this workflow builds nothing and publishes nothing, so a compromised dependency
+# in the matrix cannot write to the repository.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's verdict worthless before it lands.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     strategy:
+      # Every cell answers a different question; stopping at the first failure hides the rest.
+      fail-fast: false
       matrix:
         # windows included deliberately: libs/shell.ts is Windows-specific spawn/kill code
         # that platform-parameterized unit tests cannot fully exercise.
         os: [ubuntu-latest, windows-latest]
+        # 20 is the floor package.json declares, 22 is what .node-version pins. The undici-7
+        # dispatcher prloop hands to Node's own bundled fetch is exactly the coupling that
+        # moves between Node majors — testing only the newer one leaves the floor unproven.
+        node: [20, 22]
     runs-on: ${{ matrix.os }}
+    # The whole suite is offline and takes seconds; ten minutes means something hung.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run check
+      # The entry point is not covered by the selftests: they import modules, they never
+      # start the CLI. Both flags exit 0 with no credentials, no endpoint and no network,
+      # so a broken loop.ts, a fatal config parse or a missing tsx shows up here.
+      - run: npm run prloop -- --help
+      - run: npm run prloop -- --config
+
+  # Separate job so a vulnerable dependency is reported as itself, not as "the Windows/Node 20
+  # cell went red". Runtime deps only: undici is the only thing that reaches a user's machine.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high

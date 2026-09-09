@@ -2,7 +2,7 @@
 // bytes ADO stores for the iteration, so line counting matches what the PR UI shows.
 // Reading from a local checkout instead would apply core.autocrlf and silently shift
 // every line number after the first CRLF difference.
-import { adoGetBytes, repoBase } from "./client";
+import { AdoTooLargeError, adoGetBytes, repoBase } from "./client";
 import { MAX_FILE_BYTES } from "../config";
 import type { PrRef } from "../libs/types";
 
@@ -39,10 +39,25 @@ export function splitLines(buf: Buffer): string[] {
 
 export async function getBlob(ref: PrRef, objectId: string | undefined): Promise<BlobContent> {
   if (!objectId) return EMPTY;
-  const buf = await adoGetBytes(`${repoBase(ref)}/blobs/${objectId}`, {
-    query: { $format: "octetStream" },
-    accept: "application/octet-stream",
-  });
+  let buf: Buffer;
+  try {
+    buf = await adoGetBytes(`${repoBase(ref)}/blobs/${objectId}`, {
+      query: { $format: "octetStream" },
+      accept: "application/octet-stream",
+      // The limit is enforced at the transport now. It used to be checked only after the
+      // whole blob had been buffered, so an oversized reviewable file (a .sql dump, a
+      // generated bundle) was downloaded twice — once per side of the diff — to be skipped.
+      maxBytes: MAX_FILE_BYTES,
+    });
+  } catch (e) {
+    // Same outcome as the old post-hoc check, so orchestrator's coverage accounting still
+    // sees a "too large" skip. `bytes` is the declared length when the server sent one, and
+    // otherwise how far the read got before it was cut off.
+    if (e instanceof AdoTooLargeError) {
+      return { lines: [], binary: false, truncated: true, bytes: e.bytes };
+    }
+    throw e;
+  }
   if (looksBinary(buf)) {
     return { lines: [], binary: true, truncated: false, bytes: buf.length };
   }

@@ -24,7 +24,7 @@ import {
 } from "../config";
 import { splitLines } from "../ado/blobs";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
-import { parseJsonObject } from "../libs/json";
+import { arrayField, parseJsonObject } from "../libs/json";
 import { log, logVerbose } from "../libs/log";
 import { commandExists, run } from "../libs/shell";
 import { filesForProfile, selectProfiles } from "../profiles";
@@ -53,6 +53,12 @@ export interface StaticResult {
   unresolved: number;
 }
 
+// Findings per triage call. Not a knob: the number that matters to an operator is the
+// ceiling (PRR_MAX_TRIAGE_ITEMS), and this only decides how the ceiling is split so that
+// one truncated completion cannot take the whole run's tool findings with it. Ten keeps a
+// batch's answer well inside any sane output budget.
+const TRIAGE_BATCH_SIZE = 10;
+
 const EMPTY: StaticResult = {
   facts: [],
   needsTriage: [],
@@ -77,15 +83,60 @@ const EMPTY: StaticResult = {
  * line endings alone, which is not a content difference.
  */
 export function matchesReviewedContent(absPath: string, rightLines: string[]): boolean {
-  let onDisk: string[];
-  try {
-    onDisk = splitLines(fs.readFileSync(absPath));
-  } catch {
-    return false;
-  }
-  if (onDisk.length !== rightLines.length) return false;
+  return classifyWorkdirFile(absPath, rightLines) === "match";
+}
+
+/** What the workdir copy of a file is. The three cases have three different fixes. */
+export type WorkdirMatch = "match" | "differs" | "unreadable";
+
+/**
+ * Pure half of the check: `onDisk` is undefined when the file could not be read at all.
+ *
+ * "I could not read this file" is not evidence of a stale checkout, and folding the two
+ * together produced the worst possible message — a permission error on one file told the
+ * user their whole checkout was at the wrong commit and offered a git checkout that would
+ * change nothing.
+ */
+export function classifyWorkdirContent(onDisk: string[] | undefined, rightLines: string[]): WorkdirMatch {
+  if (onDisk === undefined) return "unreadable";
+  if (onDisk.length !== rightLines.length) return "differs";
   const bare = (s: string) => (s.endsWith("\r") ? s.slice(0, -1) : s);
-  return onDisk.every((l, i) => bare(l) === bare(rightLines[i] ?? ""));
+  return onDisk.every((l, i) => bare(l) === bare(rightLines[i] ?? "")) ? "match" : "differs";
+}
+
+/** The file's lines, or undefined when it cannot be read at all (permissions, not a file). */
+function readLinesOrUndefined(absPath: string): string[] | undefined {
+  try {
+    return splitLines(fs.readFileSync(absPath));
+  } catch {
+    return undefined;
+  }
+}
+
+export function classifyWorkdirFile(absPath: string, rightLines: string[]): WorkdirMatch {
+  return classifyWorkdirContent(readLinesOrUndefined(absPath), rightLines);
+}
+
+/** Where a changed file goes: analysed, or excluded for one of three different reasons. */
+export type WorkdirBucket = "analyse" | "not-fetched" | "unreadable" | "stale";
+
+/**
+ * Splits the reasons a changed file is not analysed, which used to be two buckets for three
+ * causes. `readOnDisk` is a thunk so a file we already know we will skip is never read.
+ *
+ * - not-fetched: prloop never had the blob (binary, or over PRR_MAX_FILE_BYTES), so there is
+ *   nothing to compare against. Not the checkout's fault.
+ * - unreadable: the file IS in the checkout but could not be read there. Also not the
+ *   checkout's fault — and counting it as a mismatch told users their commit was wrong.
+ * - stale: the content genuinely differs, which is the one case `git checkout <sha>` fixes.
+ */
+export function bucketWorkdirFile(
+  fd: { binary: boolean; truncated: boolean; rightLines: string[] },
+  readOnDisk: () => string[] | undefined,
+): WorkdirBucket {
+  if (fd.binary || fd.truncated) return "not-fetched";
+  const cls = classifyWorkdirContent(readOnDisk(), fd.rightLines);
+  return cls === "match" ? "analyse" : cls === "unreadable" ? "unreadable" : "stale";
 }
 
 /**
@@ -336,6 +387,10 @@ export async function runStaticGate(
   // Files prloop never read (binary, or past the blob size limit). Counted apart from stale
   // ones so the two are not confused: one is the checkout's problem, the other is not.
   let unreadable = 0;
+  // Files that ARE in the checkout but could not be read there (permissions, an I/O error).
+  // A third case again: nothing about the commit is wrong, so this must never feed the
+  // stale-checkout verdict below.
+  const unreadableOnDisk: string[] = [];
 
   for (const profile of profiles) {
     const targets = filesForProfile(profile, changedPaths).filter((p) => {
@@ -352,16 +407,20 @@ export async function runStaticGate(
       // is stale. Calling that a content mismatch accused the user's checkout of being wrong
       // when the truth was that prloop never read the file. It is still excluded: with no
       // hunks there are no changed lines, so any finding on it would be dropped downstream
-      // regardless.
-      if (fd.binary || fd.truncated) {
-        unreadable++;
-        return false;
+      // regardless. A file that is present but unreadable is a third case again.
+      switch (bucketWorkdirFile(fd, () => readLinesOrUndefined(abs))) {
+        case "not-fetched":
+          unreadable++;
+          return false;
+        case "unreadable":
+          unreadableOnDisk.push(p);
+          return false;
+        case "stale":
+          stale.push(p);
+          return false;
+        default:
+          return true;
       }
-      if (!matchesReviewedContent(abs, fd.rightLines)) {
-        stale.push(p);
-        return false;
-      }
-      return true;
     });
     if (targets.length === 0) continue;
 
@@ -426,7 +485,7 @@ export async function runStaticGate(
   // prloop never read are excluded from the denominator: they are not evidence either way,
   // and counting them was enough to stop this verdict from ever firing on a repo that
   // happens to contain one oversized file.
-  const checkable = analysable - unreadable;
+  const checkable = analysable - unreadable - unreadableOnDisk.length;
   if (checkable > 0 && stale.length === checkable) {
     return {
       ...EMPTY,
@@ -434,7 +493,10 @@ export async function runStaticGate(
       skippedReason:
         `PRR_WORKDIR does not contain the code under review: all ${stale.length} checkable ` +
         `files differ from iteration content` +
-        (unreadable > 0 ? ` (${unreadable} more could not be read at all)` : "") +
+        (unreadable > 0 ? ` (${unreadable} more were never fetched: binary or over the size limit)` : "") +
+        (unreadableOnDisk.length > 0
+          ? ` (${unreadableOnDisk.length} more exist there but could not be read — permissions?)`
+          : "") +
         `. ` +
         (sourceCommit
           ? `Run \`git checkout ${sourceCommit}\` there`
@@ -472,23 +534,85 @@ export async function runStaticGate(
   if (unreadable > 0) {
     logVerbose(`static: ${unreadable} files not analysed, prloop could not read them (binary or over the size limit)`);
   }
+  if (unreadableOnDisk.length > 0) {
+    // Deliberately not the stale-checkout message: the commit is fine, the file is not
+    // readable. Pointing this at `git checkout` sent people to fix the wrong thing.
+    log(
+      `[WARN] static: ${unreadableOnDisk.length} files exist in PRR_WORKDIR but could not be read ` +
+        `(permissions, or not a regular file) — not analysed, and not evidence of a stale checkout ` +
+        `(${unreadableOnDisk.slice(0, 5).join(", ")}${unreadableOnDisk.length > 5 ? ", ..." : ""})`,
+    );
+  }
 
   return { facts, needsTriage, suppressedCount, ranTools, skipped, staleFiles: stale, unresolved };
+}
+
+export interface TriageVerdict {
+  keep: boolean;
+  reason: string;
+  severity?: Severity;
+}
+
+/**
+ * Parses the triage model's answer into per-index verdicts. Exported for the selftest.
+ *
+ * Fails closed with a NAMED error: unparseable text and a parseable object with no
+ * `results` array are different failures from "the model kept nothing", and only the last
+ * one is a verdict. Both used to collapse into an empty verdict map, which the caller read
+ * as "nothing justified" — every triage-tier finding deleted, and nothing to say so.
+ */
+export function parseTriageVerdicts(text: string): { verdicts: Map<number, TriageVerdict>; error?: string } {
+  const verdicts = new Map<number, TriageVerdict>();
+  const parsed = parseJsonObject<{ results?: unknown }>(text);
+  if (!parsed.ok) return { verdicts, error: `output unparseable: ${parsed.error}` };
+  const results = arrayField(parsed.value, "results");
+  if (!results) return { verdicts, error: "response has no results array" };
+  for (const r of results) {
+    if (typeof r !== "object" || r === null) continue;
+    const o = r as Record<string, unknown>;
+    const idx = Number(o["index"]);
+    if (!Number.isInteger(idx)) continue;
+    const sev = typeof o["severity"] === "string" ? o["severity"].toLowerCase() : "";
+    verdicts.set(idx, {
+      keep: o["keep"] === true,
+      reason: typeof o["reason"] === "string" ? o["reason"] : "",
+      severity: (SEVERITIES as readonly string[]).includes(sev) ? (sev as Severity) : undefined,
+    });
+  }
+  return { verdicts };
 }
 
 /**
  * LLM triage of the high-false-positive tier, then conversion of everything that survives
  * into review findings. Tool findings carry real line numbers already, so they bypass the
  * quote-anchoring path entirely — a linter does not hallucinate a location.
+ *
+ * `error` is set when the triage call failed or its answer was unusable. The batch is still
+ * dropped (fail closed: un-triaged high-FP findings are noise), but the caller reports the
+ * stage as incomplete — before, a dead triage model only bumped `dropped`, the run exited
+ * 0, and every triage-tier finding had been deleted with nothing to say so.
  */
 export async function triageAndConvert(
   runner: ModelRunner,
   result: StaticResult,
   index: FileIndex,
-): Promise<{ findings: AnchoredFinding[]; triaged: number; dropped: number; excluded: number }> {
+  // Parameterised for the selftest, which cannot set PRR_TRIAGE_MODEL after config loaded.
+  model: string = TRIAGE_MODEL,
+): Promise<{
+  findings: AnchoredFinding[];
+  triaged: number;
+  dropped: number;
+  excluded: number;
+  error?: string;
+  // The triage model's own words, saved as triage-raw.txt. A triage pass that dropped every
+  // tool finding is only debuggable against what it actually answered.
+  raw?: string;
+}> {
   const kept: ToolFinding[] = [...result.facts];
   let dropped = 0;
   let triaged = 0;
+  let error: string | undefined;
+  let raw: string | undefined;
 
   const batch = result.needsTriage.slice(0, MAX_TRIAGE_ITEMS);
   if (batch.length < result.needsTriage.length) {
@@ -498,65 +622,96 @@ export async function triageAndConvert(
     );
   }
 
-  if (batch.length > 0 && TRIAGE_MODEL) {
-    const items: TriageItem[] = batch.map((f, i) => ({
-      index: i,
-      tool: f.tool,
-      ruleId: f.ruleId,
-      message: f.message,
-      file: f.file,
-      line: f.line,
-      severity: f.severity,
-    }));
-    const res = await runner.chat({
-      model: TRIAGE_MODEL,
-      system: TRIAGE_SYSTEM,
-      user: buildTriagePrompt(items, index, TRIAGE_CONTEXT_LINES),
-      schema: TRIAGE_SCHEMA,
-      schemaName: "triage",
+  if (batch.length > 0 && model) {
+    // Batched, because the whole cap used to travel in ONE call: 40 findings in, one
+    // truncated completion or one malformed brace out, and all 40 were dropped with a
+    // single line in the log. Smaller batches fail independently — a bad batch costs its
+    // own items and nothing else — and each fits comfortably inside an output budget, so
+    // truncation stops being the common case.
+    const batches: ToolFinding[][] = [];
+    for (let i = 0; i < batch.length; i += TRIAGE_BATCH_SIZE) {
+      batches.push(batch.slice(i, i + TRIAGE_BATCH_SIZE));
+    }
+    const failures: string[] = [];
+    let lost = 0;
+    const name = (i: number) => (batches.length > 1 ? `batch ${i + 1}/${batches.length}: ` : "");
+    const plural = (n: number) => `${n} ${n === 1 ? "batch" : "batches"}`;
+
+    const answers = await Promise.all(
+      batches.map(async (group) => {
+        // Indexes are per-prompt: each batch is its own conversation, so the model counts
+        // from 0 and the caller maps back to the global position.
+        const items: TriageItem[] = group.map((f, i) => ({
+          index: i,
+          tool: f.tool,
+          ruleId: f.ruleId,
+          message: f.message,
+          file: f.file,
+          line: f.line,
+          severity: f.severity,
+        }));
+        return runner.chat({
+          model,
+          system: TRIAGE_SYSTEM,
+          user: buildTriagePrompt(items, index, TRIAGE_CONTEXT_LINES),
+          schema: TRIAGE_SCHEMA,
+          schemaName: "triage",
+        });
+      }),
+    );
+
+    // One artifact per run, so a triage pass that dropped everything is still debuggable
+    // against what each batch actually answered.
+    raw = answers.map((r, i) => `${name(i)}${name(i) ? "\n" : ""}${r.text}`).join("\n\n");
+
+    answers.forEach((res, bi) => {
+      const group = batches[bi]!;
+      if (res.error) {
+        // Fail closed: an un-triaged high-FP finding is noise, so it does not get posted.
+        log(`[WARN] static triage failed (${name(bi)}${res.error}); ${group.length} findings awaiting verdict will not be commented`);
+        dropped += group.length;
+        lost += group.length;
+        failures.push(`${name(bi)}${res.error}`);
+        return;
+      }
+      const parsed = parseTriageVerdicts(res.text);
+      if (parsed.error) {
+        log(`[WARN] static triage ${name(bi)}${parsed.error}; ${group.length} findings will not be commented`);
+        dropped += group.length;
+        lost += group.length;
+        failures.push(`${name(bi)}${parsed.error}`);
+        return;
+      }
+      const { verdicts } = parsed;
+      group.forEach((f, i) => {
+        const v = verdicts.get(i);
+        // No verdict means the model skipped it; treat that as "not justified".
+        if (!v?.keep) {
+          dropped++;
+          return;
+        }
+        triaged++;
+        // Same rule as the skeptic: a verifying model may lower severity, never raise
+        // it. The tool's own rating owns the ceiling.
+        const sev =
+          v.severity !== undefined && severityRank(v.severity) > severityRank(f.severity)
+            ? v.severity
+            : f.severity;
+        kept.push({ ...f, severity: sev, message: v.reason || f.message });
+      });
     });
 
-    if (res.error) {
-      // Fail closed: an un-triaged high-FP finding is noise, so it does not get posted.
-      log(`[WARN] static triage failed (${res.error}); ${batch.length} findings awaiting verdict will not be commented`);
-      dropped += batch.length;
-    } else {
-      const parsed = parseJsonObject<{ results?: unknown }>(res.text);
-      if (!parsed.ok) {
-        log(`[WARN] static triage output unparseable (${parsed.error}); ${batch.length} findings will not be commented`);
-        dropped += batch.length;
-      } else {
-        const verdicts = new Map<number, { keep: boolean; reason: string; severity?: Severity }>();
-        for (const r of (Array.isArray(parsed.value.results) ? parsed.value.results : []) as unknown[]) {
-          if (typeof r !== "object" || r === null) continue;
-          const o = r as Record<string, unknown>;
-          const idx = Number(o["index"]);
-          if (!Number.isInteger(idx)) continue;
-          const sev = typeof o["severity"] === "string" ? o["severity"].toLowerCase() : "";
-          verdicts.set(idx, {
-            keep: o["keep"] === true,
-            reason: typeof o["reason"] === "string" ? o["reason"] : "",
-            severity: (SEVERITIES as readonly string[]).includes(sev) ? (sev as Severity) : undefined,
-          });
-        }
-        batch.forEach((f, i) => {
-          const v = verdicts.get(i);
-          // No verdict means the model skipped it; treat that as "not justified".
-          if (!v?.keep) {
-            dropped++;
-            return;
-          }
-          triaged++;
-          // Same rule as the skeptic: a verifying model may lower severity, never raise
-          // it. The tool's own rating owns the ceiling.
-          const sev =
-            v.severity !== undefined && severityRank(v.severity) > severityRank(f.severity)
-              ? v.severity
-              : f.severity;
-          kept.push({ ...f, severity: sev, message: v.reason || f.message });
-        });
-        log(`static triage: ${batch.length} awaiting verdict → kept ${triaged}, filtered out ${batch.length - triaged}`);
-      }
+    // A single failure keeps its own precise name (a timeout and an unparseable answer
+    // have different fixes); several are listed, because "the triage stage failed" hides
+    // that most of it worked.
+    if (failures.length > 0) error = failures.join("; ");
+    const judged = batch.length - lost;
+    if (judged > 0) {
+      log(
+        `static triage: ${batch.length} awaiting verdict in ${plural(batches.length)} → kept ${triaged}, ` +
+          `filtered out ${judged - triaged}` +
+          (lost > 0 ? `, ${lost} lost to ${plural(failures.length)} that failed` : ""),
+      );
     }
   } else if (batch.length > 0) {
     log(`[WARN] PRR_TRIAGE_MODEL not set; ${batch.length} high-false-positive findings will not be commented`);
@@ -587,6 +742,9 @@ export async function triageAndConvert(
       category,
       severity: f.severity,
       confidence: f.tier === "fact" ? 1 : 0.8,
+      // Carried so a later merge knows whether this tool's severity is a measurement or
+      // a policy (gates/aggregate.ts mergeInto). Suppress-tier never reaches this point.
+      tier: f.tier === "fact" ? "fact" : "triage",
       file: fd.path,
       quote: lineText,
       side: "right",
@@ -613,7 +771,14 @@ export async function triageAndConvert(
   if (excluded > 0) {
     log(`static: ${excluded} tool findings dropped, category excluded by config (${[...excludedCats].join(", ")})`);
   }
-  return { findings, triaged, dropped, excluded };
+  return {
+    findings,
+    triaged,
+    dropped,
+    excluded,
+    ...(error === undefined ? {} : { error }),
+    ...(raw === undefined ? {} : { raw }),
+  };
 }
 
 // Maps a tool rule to a review category so tool findings sit in the same taxonomy as

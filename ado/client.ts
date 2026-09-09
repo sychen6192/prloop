@@ -3,8 +3,9 @@
 // (azure-devops-mcp #793 / #868 — see PROPOSAL §2).
 import { ADO_API_VERSION, ADO_BASE_URL, ADO_MAX_RETRIES, ADO_TIMEOUT_MS } from "../config";
 import { logVerbose } from "../libs/log";
+import { redactSecrets } from "../libs/redact";
 import type { PrRef } from "../libs/types";
-import { authHeader } from "./auth";
+import { AUTH_SCOPE_HINT, authHeader } from "./auth";
 import { USER_AGENT, dispatcherFor } from "../libs/proxy";
 
 export class AdoError extends Error {
@@ -16,6 +17,78 @@ export class AdoError extends Error {
     super(message);
     this.name = "AdoError";
   }
+}
+
+/**
+ * The quotable part of a rejected ADO response, for the error message itself.
+ *
+ * ADO answers with JSON whose `message` says WHY ("TF401232: the thread context is not
+ * valid", "the pull request is completed"); the status line alone left a rejected thread
+ * POST as an unexplained "400 Bad Request" because `body` was captured on the error and
+ * never surfaced. Redacted and capped: error bodies have echoed credentials before, and a
+ * message is a line, not a page.
+ */
+export function adoErrorDetail(body: string): string {
+  let text = "";
+  try {
+    const parsed: unknown = JSON.parse(body);
+    const message = (parsed as { message?: unknown } | null)?.message;
+    if (typeof message === "string") text = message;
+  } catch {
+    // A sign-in page or a proxy's HTML error page carries nothing worth quoting; plain text does.
+    if (!/^\s*</.test(body)) text = body;
+  }
+  text = redactSecrets(text.replace(/\s+/g, " ").trim());
+  return text.length > 300 ? `${text.slice(0, 299)}…` : text;
+}
+
+/**
+ * The response is bigger than the caller is willing to read. Not an API failure — a local
+ * limit — but it carries 413 so the retry loop treats it as a final answer rather than
+ * fetching the same oversized blob three more times.
+ */
+export class AdoTooLargeError extends AdoError {
+  constructor(
+    readonly bytes: number,
+    readonly limit: number,
+  ) {
+    super(`response is ${bytes} bytes, over the ${limit}-byte limit`, 413);
+    this.name = "AdoTooLargeError";
+  }
+}
+
+/**
+ * Whether a response can be refused before a single byte of its body is read. Pure so the
+ * decision is testable; a missing or unparseable content-length means "read and cap instead".
+ */
+export function exceedsMaxBytes(contentLength: string | null | undefined, maxBytes?: number): boolean {
+  if (!maxBytes || maxBytes <= 0) return false;
+  const n = Number(contentLength);
+  return Number.isFinite(n) && n > maxBytes;
+}
+
+/**
+ * Reads a body, giving up as soon as it passes `maxBytes`.
+ *
+ * The fallback for a response that declares no content-length: without it, a chunked
+ * multi-gigabyte blob would still be buffered whole before anyone got to check its size.
+ */
+async function readCapped(res: Response, maxBytes: number): Promise<Buffer> {
+  const reader = res.body?.getReader();
+  if (!reader) return Buffer.from(await res.arrayBuffer());
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new AdoTooLargeError(total, maxBytes);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
 }
 
 /**
@@ -93,6 +166,9 @@ interface RequestOpts {
   raw?: boolean;
   accept?: string;
   apiVersion?: string;
+  // Refuse a body over this many bytes, by content-length if the server declares one and
+  // while reading otherwise. Throws AdoTooLargeError; the caller decides what that means.
+  maxBytes?: number;
 }
 
 /**
@@ -143,7 +219,9 @@ async function request(url: string, opts: RequestOpts = {}): Promise<Buffer> {
       // A PAT that lacks scope gets a 203 + sign-in HTML page rather than a 401.
       if (res.status === 203) {
         throw new AdoError(
-          "Azure DevOps returned 203 (sign-in page): PAT invalid or missing scope (needs Code Read & Write)",
+          // The requirement axis reads work items, so a Code-only PAT passes intake and
+          // then fails there with no clue why. Name both scopes.
+          `Azure DevOps returned 203 (sign-in page): PAT invalid or missing scope (needs ${AUTH_SCOPE_HINT})`,
           203,
         );
       }
@@ -161,14 +239,25 @@ async function request(url: string, opts: RequestOpts = {}): Promise<Buffer> {
       }
       if (!res.ok) {
         const body = await res.text().catch(() => "");
+        const detail = adoErrorDetail(body);
         throw new AdoError(
-          `ADO ${method} ${u.pathname} failed: ${res.status} ${res.statusText}`,
+          `ADO ${method} ${u.pathname} failed: ${res.status} ${res.statusText}${detail ? ` — ${detail}` : ""}`,
           res.status,
-          body.slice(0, 2000),
+          redactSecrets(body.slice(0, 2000)),
         );
       }
+      // Size limit before the download, not after it. getBlob used to buffer the whole blob
+      // and only then compare it to PRR_MAX_FILE_BYTES, so a 400 MB .sql dump was fetched
+      // twice (left side and right side) purely to be skipped.
+      const limit = opts.maxBytes;
+      if (limit !== undefined && exceedsMaxBytes(res.headers.get("content-length"), limit)) {
+        await res.body?.cancel().catch(() => {});
+        throw new AdoTooLargeError(Number(res.headers.get("content-length")), limit);
+      }
       // Body read happens here, while the abort timer is still armed.
-      const buf = Buffer.from(await res.arrayBuffer());
+      const buf = opts.maxBytes
+        ? await readCapped(res, opts.maxBytes)
+        : Buffer.from(await res.arrayBuffer());
       clearTimeout(timer);
       return buf;
     } catch (e) {
@@ -189,14 +278,17 @@ async function request(url: string, opts: RequestOpts = {}): Promise<Buffer> {
     }
   }
   if (lastErr instanceof AdoError) throw lastErr;
-  throw new AdoError(`Connection to ${u.origin} failed: ${diagnose(lastErr)}`);
+  throw new AdoError(`Connection to ${u.origin} failed: ${redactSecrets(diagnose(lastErr))}`);
 }
 
 /**
  * Turns a fetch-level failure into something actionable. These are almost always
  * environmental rather than API problems, and on-prem hits every one of them.
+ *
+ * Exported for the selftest: these strings are the whole value of the function, and one of
+ * them spent a release pointing at the wrong environment variable.
  */
-function diagnose(e: unknown): string {
+export function diagnose(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e);
   const code = (e as { cause?: { code?: string } })?.cause?.code ?? (e as { code?: string })?.code ?? "";
   const all = `${msg} ${code}`;
@@ -204,7 +296,9 @@ function diagnose(e: unknown): string {
   if (/UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT|DEPTH_ZERO_SELF_SIGNED|unable to verify|self-signed/i.test(all)) {
     return (
       `TLS certificate could not be verified (${code || "cert"}). Node does not trust internal CAs by default. ` +
-      `Fix: export NODE_EXTRA_CA_CERTS=/path/to/corporate-ca.pem and rerun`
+      `Fix: set PRR_CA_CERTS=/path/to/corporate-ca.pem in .env and rerun ` +
+      `(comma-separated if the root and intermediate are separate files). ` +
+      `\`npx tsx scripts/tlsfix.ts '<PR URL>'\` fetches the chain and writes that line for you`
     );
   }
   if (/ERR_TLS_CERT_ALTNAME_INVALID|Hostname\/IP does not match/i.test(all)) {

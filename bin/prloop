@@ -45,4 +45,18 @@ EOF
   fi
 fi
 
-exec npx tsx "$TOOL_DIR/loop.ts" "$@"
+# The repo's OWN tsx, not whatever the caller's directory happens to have. `npx tsx` resolves
+# from the CURRENT working directory first, so running prloop from another project picked up
+# that project's tsx — or, finding none, silently downloaded one over the network mid-run,
+# which on an air-gapped or proxied box is a hang rather than an error.
+TSX="$TOOL_DIR/node_modules/.bin/tsx"
+if [ -x "$TSX" ]; then
+  exec "$TSX" "$TOOL_DIR/loop.ts" "$@"
+fi
+# --no-install: use an already-installed tsx if there is one, never fetch. `npm ci --omit=dev`
+# removes tsx (it is a devDependency), so this is the common failure on a CI agent.
+if npx --no-install tsx --version >/dev/null 2>&1; then
+  exec npx --no-install tsx "$TOOL_DIR/loop.ts" "$@"
+fi
+echo "prloop: tsx not found. Run 'npm ci' in $TOOL_DIR (dev dependencies included)." >&2
+exit 1

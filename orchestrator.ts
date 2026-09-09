@@ -1,16 +1,21 @@
-// The single deterministic control flow. Models are called at exactly one point (the finder
-// stage); every other decision — what to review, where a finding lives, what gets posted —
-// is made by code here (design principle: the loop never hands control to a model).
-import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, excludedCategories, isDryRun } from "./config";
+// The single deterministic control flow. Models are consulted at five fixed points — finder
+// fan-out, requirement axis, the requirement axis's dispute pass over its own accusations,
+// the skeptic, and static-analysis triage — and at every one of them a model answers a
+// question and returns. It never chooses the next step: what to review, which stages run,
+// where a finding lives and what gets posted are decided by code here (design principle: the
+// loop never hands control to a model). Adding a sixth call site is fine; adding one whose
+// answer selects the next action is not.
+import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, STRICT_COVERAGE, excludedCategories, isDryRun } from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
 import { fetchRepoConventions } from "./ado/conventions";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
-import { runRequirementGate, toRequirementFindings } from "./gates/requirement";
+import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
 import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
 import { createRunDir } from "./libs/artifacts";
+import { configSnapshot } from "./libs/configreport";
 import { tokenTotals } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
@@ -39,6 +44,48 @@ export interface ReviewRunResult {
   incomplete: string[];
 }
 
+/**
+ * Coverage gaps that make a review incomplete (PRR_STRICT_COVERAGE). Exported for the
+ * selftest.
+ *
+ * A file the finder never saw was not reviewed, whatever the finder said about the rest:
+ * left out of its context because the diff ran past PRR_MAX_DIFF_CHARS, or skipped by
+ * intake as too large to fetch. Both were logged and named in the summary, and the run
+ * still exited 0 — a green check over a PR whose largest file nobody read. Binary files
+ * are not counted: nothing in them is reviewable, so their absence hides nothing.
+ */
+export function coverageGaps(
+  omitted: string[],
+  skipped: Array<{ path: string; reason: string }>,
+  strict: boolean,
+): string[] {
+  if (!strict) return [];
+  const out: string[] = [];
+  if (omitted.length > 0) {
+    out.push(`${omitted.length} files omitted from the finder context (diff over PRR_MAX_DIFF_CHARS)`);
+  }
+  const tooLarge = skipped.filter((s) => s.reason === "too large").length;
+  if (tooLarge > 0) out.push(`${tooLarge} files skipped by intake as too large`);
+  return out;
+}
+
+/**
+ * The process exit status a finished review earns. Exported for the selftest, and extracted
+ * from loop.ts's main() for the same reason coverageGaps is here: importing loop.ts runs the
+ * CLI, so the one line CI actually acts on could not be asserted at all.
+ *
+ * Either axis can fail the run — an unimplemented requirement is as blocking as a bug — and
+ * a stage that crashed must not exit 0: "nothing blocking was found" and "the check that
+ * would have found it never ran" are different facts, and only one of them justifies a green
+ * gate. Blocking findings win over incompleteness when both are true: 2 is the stronger
+ * statement, and the incomplete stages are named in the log either way.
+ */
+export function exitCodeFor(result: Pick<ReviewRunResult, "agg" | "req" | "incomplete">): 0 | 2 | 3 {
+  const highRisk = result.agg.inline.filter((f) => f.severity === "critical" || f.severity === "high");
+  const unmet = result.req ? unmetCriteria(result.req) : [];
+  return highRisk.length > 0 || unmet.length > 0 ? 2 : result.incomplete.length > 0 ? 3 : 0;
+}
+
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {
   const started = Date.now();
 
@@ -46,6 +93,11 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const ctx = await buildReviewContext(opts.ref, opts.compareTo);
   const run = createRunDir(opts.ref, ctx.iteration.id);
   log(`artifacts: ${run.dir}`);
+
+  // Saved first, before any stage can fail: a run in runs/ is only diagnosable a week later
+  // if it recorded the settings it actually ran with — which value won, and whether it came
+  // from the shell or the file. Everything else in here records what the models did with it.
+  run.saveJson("config.json", configSnapshot());
 
   run.saveJson("context.json", {
     ref: opts.ref,
@@ -99,7 +151,9 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
         runDir: run.dir,
       },
     );
-    const incomplete: string[] = [];
+    // "No reviewable code changes" can also mean "the only changed file was too large to
+    // fetch" — that is not a clean PR, and strict coverage says so.
+    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
     if (publishResult.summaryThreadId === undefined && !isDryRun()) {
       incomplete.push("summary comment failed to post");
     }
@@ -125,22 +179,26 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             skipped: "requirement check skipped by config",
           },
         })
-      : runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: ctx.files, runner: opts.runner })
+      : runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: ctx.files, fileIndex: ctx.fileIndex, runner: opts.runner })
   ).catch((e): Awaited<ReturnType<typeof runRequirementGate>> => {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[FAIL] requirement axis threw: ${msg}`);
     return { result: { workItems: [], criteria: [], extras: [], error: msg } };
   });
 
-  // The reviewed repo's own convention docs, fetched at the iteration's commit so the
-  // rules' "repo conventions override the baseline" clause has real text to fire on
-  // instead of the model's memory of a file it was never shown. Non-fatal: most repos
-  // have none, and a failed fetch costs the finder its context bonus, not the run.
+  // The reviewed repo's own convention docs, so the rules' "repo conventions override the
+  // baseline" clause has real text to fire on instead of the model's memory of a file it
+  // was never shown. Fetched at the TARGET commit (the base branch as of this iteration),
+  // not the source: the source branch is the author's, and a CLAUDE.md edited in the same
+  // PR would otherwise steer the review of that very PR. Non-fatal: most repos have none,
+  // and a failed fetch costs the finder its context bonus, not the run.
   const conventions = renderConventions(
-    await fetchRepoConventions(opts.ref, ctx.iteration.sourceRefCommit).catch((e) => {
-      log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
-      return [];
-    }),
+    ctx.iteration.targetRefCommit
+      ? await fetchRepoConventions(opts.ref, ctx.iteration.targetRefCommit).catch((e) => {
+          log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
+          return [];
+        })
+      : [],
   );
 
   // Stages that threw outright (vs returning their own error fields); reported as
@@ -179,11 +237,21 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   run.saveJson("static.json", staticResult);
 
   const { outputs, prompt, omitted, rules } = finderOut;
+  // finder-prompt.md stays finder 0's prompt, for tooling that reads that name. Every
+  // finder reads the files in its own seeded order, so each one's prompt is saved too:
+  // a wrong-line or missed finding from finder 2 cannot be debugged against finder 0's.
   run.save("finder-prompt.md", prompt);
   outputs.forEach((o, i) => {
-    run.save(`finder-${i}-${o.model.replace(/[^\w.-]/g, "_")}-raw.txt`, o.raw || `(error: ${o.error ?? "no output"})`);
+    const tag = `finder-${i}-${o.model.replace(/[^\w.-]/g, "_")}`;
+    run.save(`${tag}-raw.txt`, o.raw || `(error: ${o.error ?? "no output"})`);
+    if (o.prompt !== undefined) run.save(`${tag}-prompt.md`, o.prompt);
   });
-  run.saveJson("finder-outputs.json", outputs.map((o) => ({ ...o, raw: undefined })));
+  // The run seed replays the whole fleet (PRR_FINDER_SEED); each finder's own seed is on
+  // its entry. Prompts live in their own files above, raw output in *-raw.txt.
+  run.saveJson("finder-outputs.json", {
+    runSeed: finderOut.seed,
+    finders: outputs.map((o) => ({ ...o, raw: undefined, prompt: undefined })),
+  });
 
   banner("Step 3/4: anchor, adversarial verification and verdicts");
   const candidates = anchorAndDedupe(outputs, ctx.fileIndex);
@@ -223,17 +291,25 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
 
   // Tool findings join the code axis after triage. They carry real line numbers, so they
   // skip anchoring, and a deterministic tool counts as its own corroboration.
-  const toolOut = await triageAndConvert(opts.runner, staticResult, ctx.fileIndex).catch((e) => {
-    stageFailures.push(`triage stage (${e instanceof Error ? e.message : String(e)})`);
-    return { findings: [], triaged: 0, dropped: 0, excluded: 0 };
-  });
-  run.saveJson("static-findings.json", toolOut);
+  const toolOut = await triageAndConvert(opts.runner, staticResult, ctx.fileIndex).catch(
+    (e): Awaited<ReturnType<typeof triageAndConvert>> => {
+      stageFailures.push(`triage stage (${e instanceof Error ? e.message : String(e)})`);
+      return { findings: [], triaged: 0, dropped: 0, excluded: 0 };
+    },
+  );
+  // A triage model that failed or answered unusably deleted every triage-tier finding; the
+  // gate returns that as an error rather than throwing, so it lands here, not in the catch.
+  if (toolOut.error) stageFailures.push(`triage stage (${toolOut.error})`);
+  // Raw output to its own file, like every other model stage: a triage pass that dropped
+  // every tool finding is argued with from what it said, not from the count it produced.
+  if (toolOut.raw !== undefined) run.save("triage-raw.txt", toolOut.raw);
+  run.saveJson("static-findings.json", { ...toolOut, raw: undefined });
 
   // knownDismissed re-enters here so finalize can route it into the summary with its
   // suppression reason — a suppressed finding must stay visible, never vanish.
   const agg = finalize(
     candidates,
-    mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings),
+    mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings, ctx.fileIndex),
     dismissedFps,
     outcomes.filter((o) => o.killed).length,
   );
@@ -307,6 +383,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   if (publishResult.summaryThreadId === undefined && !isDryRun()) {
     incomplete.push("summary comment failed to post");
   }
+  incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
 
   return { ctx, agg, req, reqFindings, publishResult, runDir: run.dir, durationSec, incomplete };
 }

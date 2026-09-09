@@ -88,6 +88,72 @@ export function escapeControlCharsInStrings(s: string): string {
   return out;
 }
 
+/**
+ * The array under `key` of a parsed object, or undefined when there is none — a top-level
+ * array, a scalar, or an object keyed some other way. Callers treat undefined as an error,
+ * never as an empty list: "the model listed nothing" and "the model answered in a shape we
+ * did not ask for" look identical once both become `[]`, and only the first is a clean
+ * result.
+ */
+export function arrayField(value: unknown, key: string): unknown[] | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const v = (value as Record<string, unknown>)[key];
+  return Array.isArray(v) ? v : undefined;
+}
+
+/**
+ * Every COMPLETE object inside the `"<field>": [ … ]` array of a possibly-truncated
+ * response, in order; the trailing partial one is ignored.
+ *
+ * Why: a response cut at max_tokens has no complete top-level object, so the balanced
+ * scanner above finds nothing and every finding the model DID finish — often a dozen of
+ * them, fully formed, before the cut — is thrown away with the fragment. This is the
+ * partial recovery for that case, not a parser: the caller still reports the call as
+ * failed (see gates/finder.ts), because a truncated response is a truncated response.
+ *
+ * The same control-character repair runs first (models hand-write real newlines into
+ * multi-line values), and an item that still will not parse is skipped rather than fatal.
+ */
+export function salvageArrayItems(text: string, field: string): unknown[] {
+  const raw = escapeControlCharsInStrings(text);
+  // First occurrence of the key: a model that repeats it inside a string value would fool
+  // this, but the alternative is parsing what by definition does not parse.
+  const key = raw.indexOf(`"${field}"`);
+  if (key < 0) return [];
+  const open = raw.indexOf("[", key + field.length + 2);
+  if (open < 0) return [];
+
+  const out: unknown[] = [];
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let escaped = false;
+  for (let i = open + 1; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}") {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const item = tryParse<unknown>(raw.slice(start, i + 1));
+        if (item.ok) out.push(item.value);
+        start = -1;
+      }
+    } else if (c === "]" && depth === 0) {
+      break; // the array closed: everything after it belongs to something else
+    }
+  }
+  return out;
+}
+
 export function parseJsonObject<T = unknown>(raw: string): ParseResult<T> {
   if (!raw || raw.trim() === "") return { ok: false, error: "model returned an empty string" };
 

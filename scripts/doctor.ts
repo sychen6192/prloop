@@ -5,6 +5,7 @@ import {
   ADO_PAT,
   AZ_BIN,
   FINDER_MODELS,
+  KNOWN_KEYS,
   LLM_BASE_URL,
   LLM_CONCURRENCY,
   MAX_INLINE_COMMENTS,
@@ -26,6 +27,7 @@ import { CA_SOURCES, caSummary } from "../libs/tls";
 import { existsSync } from "node:fs";
 import { commandExists, run } from "../libs/shell";
 import { proxySummary } from "../libs/proxy";
+import { configWarnings } from "../libs/configreport";
 import { PROFILES } from "../profiles";
 import { createRunner } from "../models/runner";
 import { FINDINGS_SCHEMA } from "../models/schemas";
@@ -73,6 +75,12 @@ async function main() {
     ok("Certificate source", "system trust store (--use-system-ca)");
   }
   ok("proxy", proxySummary());
+  // The failure this catches is silent by construction: .env cannot override a variable the
+  // shell already exported, so an edited setting that "does nothing" looks like a bug in
+  // prloop. doctor is the tool people run when something is wrong, so it says it here too.
+  const configIssues = configWarnings();
+  for (const w of configIssues) warn(w.message, w.fix);
+  if (configIssues.length === 0) ok("settings", `${KNOWN_KEYS.length} known, no shell/.env conflicts`);
 
   console.log("\nAzure DevOps auth");
   ok("Auth mode", await describeAuthMode());

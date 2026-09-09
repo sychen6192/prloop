@@ -17,13 +17,17 @@ has no conventions of its own.
    maintainability category. Code smells are heuristics by nature; enforcing them as rules
    only produces noise.
 
-Also: anything the linter already covers (formatting, naming conventions, unused variables)
-must never be reported from here.
+Naming, scoped precisely: naming **conventions** (case, prefixes, suffixes, house style) are
+never reported — that is formatter and linter territory. A name that **misdescribes what the
+code does** is a different thing, and is reportable as maintainability, low or medium, citing
+"Mysterious Name". prloop dedupes tool and model findings downstream — report what you see;
+pure formatting/naming-convention output is the only thing left to linters.
 
 ## The 12 smells (what it is → how to fix it)
 
-- **Mysterious Name** — a function, variable, or type name does not reveal what it does or
-  what it holds.
+- **Mysterious Name** — a function, variable, or type name does not reveal, or misstates,
+  what it does or what it holds. (A convention breach — `getUser` vs `get_user` — is not
+  this smell.)
   → Rename it; if you cannot think of an honest name, the design itself is muddled.
 - **Duplicated Code** — logic of the same shape appears in several hunks or files in this
   change.

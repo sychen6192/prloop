@@ -4,7 +4,8 @@ applyTo: "**/*.ts", "**/*.mts", "**/*.cts"
 
 # TypeScript review rules
 
-Anything tsc or eslint already reports **must not be reported again**. One caveat: the
+prloop dedupes tool and model findings downstream — report what you see; pure
+formatting/naming-convention output is the only thing left to linters. In particular, the
 promise checks that matter most below (`no-floating-promises`, `no-misused-promises`) are
 type-aware eslint rules that only run when `parserOptions.project` is configured — many
 projects never enable them. Do not assume the linter has async correctness covered.

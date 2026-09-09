@@ -5,13 +5,30 @@
 // anchoring regression net — so each net can grow without inflating the other.
 // Wired into `npm run check` alongside it.
 import {
+  OpenAICompatRunner,
   SseAccumulator,
+  backoffMs,
   buildChatBody,
   describeStreamedCompletion,
   isStreamingRejection,
   isTransientModelError,
+  parseRetryAfter,
+  reasoningFields,
+  resolveFlavor,
+  streamStallMessage,
+  thinkingBudget,
+  type BodyShape,
 } from "../models/runner";
-import { parseExtraBody, resolveExtraBody } from "../config";
+import {
+  parseExtraBody,
+  parseReasoning,
+  parseReasoningByModel,
+  parseTemperature,
+  parseTemperatureByModel,
+  resolveExtraBody,
+} from "../config";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 
 let passed = 0;
 let failed = 0;
@@ -214,6 +231,175 @@ section("per-model extra body: the mixed fleet's switchboard");
   eq("empty entry means send none (thinking back on)", JSON.stringify(resolveExtraBody("coder", { coder: {} }, off)), "{}");
   check("empty entry adds nothing to the request", !("chat_template_kwargs" in buildChatBody({ model: "coder", system: "s", user: "u" }, true, resolveExtraBody("coder", { coder: {} }, off))));
   check("fallback still disables thinking on the wire", JSON.stringify(buildChatBody({ model: "coder-flash", system: "s", user: "u" }, true, resolveExtraBody("coder-flash", { coder: {} }, off))).includes('"enable_thinking":false'));
+}
+
+section("reasoning: one intent, four dialects — the wrong spelling is a 400 on every call");
+{
+  const body = (model: string, shape: BodyShape, extra?: Record<string, unknown>) =>
+    buildChatBody({ model, system: "s", user: "u", maxTokens: 8192 }, false, extra, true, shape);
+
+  // OpenAI dialect. `none` OMITS the field: reasoning_effort:"none" is a recent value some
+  // servers 400 on, and an absent field already means "whatever this model does normally".
+  eq("openai low", body("m", { flavor: "openai", reasoning: "low" })["reasoning_effort"], "low");
+  eq("openai medium", body("m", { flavor: "openai", reasoning: "medium" })["reasoning_effort"], "medium");
+  eq("openai high", body("m", { flavor: "openai", reasoning: "high" })["reasoning_effort"], "high");
+  check("openai none omits the field", !("reasoning_effort" in body("m", { flavor: "openai", reasoning: "none" })));
+  check("unset sends nothing at all (the backend's own default)", !("reasoning_effort" in body("m", { flavor: "openai" })));
+  eq("unset really is nothing, not a level", JSON.stringify(reasoningFields(undefined, "anthropic", 8192)), "{}");
+
+  // Anthropic: a token budget scaled off max_tokens, and the API demands it stay under it.
+  eq("anthropic medium is an enabled budget", JSON.stringify(body("m", { flavor: "anthropic", reasoning: "medium" })["thinking"]), '{"type":"enabled","budget_tokens":4096}');
+  eq("anthropic low budget", thinkingBudget("low", 8192), 2048);
+  eq("anthropic high budget", thinkingBudget("high", 8192), 6144);
+  check("the budget always leaves answer room", thinkingBudget("high", 2048) < 2048 && thinkingBudget("high", 1024) < 1024);
+  check("anthropic none sends no thinking key", !("thinking" in body("m", { flavor: "anthropic", reasoning: "none" })));
+
+  // Qwen and Ollama take a boolean, so there `none` is a real value and IS sent — switching
+  // thinking off at the engine is the whole reason those two have a knob.
+  eq("qwen high enables thinking", JSON.stringify(body("m", { flavor: "qwen", reasoning: "high" })["chat_template_kwargs"]), '{"enable_thinking":true}');
+  eq("qwen none disables it", JSON.stringify(body("m", { flavor: "qwen", reasoning: "none" })["chat_template_kwargs"]), '{"enable_thinking":false}');
+  eq("ollama medium", body("m", { flavor: "ollama", reasoning: "medium" })["think"], true);
+  eq("ollama none", body("m", { flavor: "ollama", reasoning: "none" })["think"], false);
+
+  // Precedence: the escape hatch still wins, because it exists for what this cannot say.
+  eq(
+    "an explicit extra body overrides the translated field",
+    JSON.stringify(body("m", { flavor: "qwen", reasoning: "high" }, { chat_template_kwargs: { enable_thinking: false } })["chat_template_kwargs"]),
+    '{"enable_thinking":false}',
+  );
+  check("prloop's own fields still win over both", body("m", { flavor: "openai", reasoning: "low" }, { model: "evil" })["model"] === "m");
+}
+
+section("auto flavor: one base URL, several vendors behind it (a LiteLLM proxy)");
+{
+  eq("claude → anthropic", resolveFlavor("auto", "claude-sonnet-4"), "anthropic");
+  eq("an anthropic-prefixed alias → anthropic", resolveFlavor("auto", "us.anthropic.claude-3-5"), "anthropic");
+  eq("qwen → qwen", resolveFlavor("auto", "qwen3-coder"), "qwen");
+  eq("gpt → openai", resolveFlavor("auto", "gpt-4o"), "openai");
+  eq("o3 → openai", resolveFlavor("auto", "o3-mini"), "openai");
+  eq("an unrecognised house name → openai", resolveFlavor("auto", "reviewer-v2"), "openai");
+  eq("an explicit flavor is never second-guessed", resolveFlavor("ollama", "claude-sonnet"), "ollama");
+  check(
+    "auto reads the model NAME: a claude alias gets thinking, not reasoning_effort",
+    "thinking" in buildChatBody({ model: "claude-x", system: "s", user: "u" }, false, undefined, true, { reasoning: "low" }),
+  );
+}
+
+section("temperature: the field a backend may reject, and prloop used to force");
+{
+  const mk = (perCall: number | undefined, shape: BodyShape, extra?: Record<string, unknown>) =>
+    buildChatBody(
+      { model: "m", system: "s", user: "u", ...(perCall === undefined ? {} : { temperature: perCall }) },
+      false,
+      extra,
+      true,
+      shape,
+    );
+  const temp = (perCall: number | undefined, shape: BodyShape, extra?: Record<string, unknown>) => mk(perCall, shape, extra)["temperature"];
+
+  eq("the configured value is sent", temp(undefined, { temperature: 0.2 }), 0.2);
+  eq("a per-call value wins over it (the requirement gate asks for 0)", temp(0, { temperature: 0.2 }), 0);
+  check("the none sentinel omits the field entirely", !("temperature" in mk(undefined, { temperature: "none" })));
+  check("...even against a per-call value: what is rejected is the FIELD", !("temperature" in mk(0, { temperature: "none" })));
+  eq("an explicit extra-body temperature wins over the default", temp(undefined, { temperature: 0.2 }, { temperature: 0.9 }), 0.9);
+  eq("...and over a per-call one", temp(0, { temperature: 0.2 }, { temperature: 0.9 }), 0.9);
+
+  // Anthropic extended thinking accepts exactly 1 and 400s on anything else — including the
+  // 0 the requirement gate used to send unconditionally.
+  eq("anthropic + thinking forces 1", temp(0, { flavor: "anthropic", reasoning: "medium", temperature: 0.2 }), 1);
+  eq("...with thinking off, nothing is forced", temp(undefined, { flavor: "anthropic", reasoning: "none", temperature: 0.2 }), 0.2);
+  eq("...and with no reasoning configured either", temp(undefined, { flavor: "anthropic", temperature: 0.2 }), 0.2);
+  eq("...the extra body still wins over the forced 1", temp(0, { flavor: "anthropic", reasoning: "medium", temperature: 0.2 }, { temperature: 0.7 }), 0.7);
+  check("...and none still omits (a model that rejects the field outright)", !("temperature" in mk(0, { flavor: "anthropic", reasoning: "high", temperature: "none" })));
+  eq("no thinking forced on another dialect", temp(0, { flavor: "openai", reasoning: "high", temperature: 0.2 }), 0);
+}
+
+section("PRR_REASONING / PRR_LLM_TEMPERATURE parse at startup, never as a 400 mid-run");
+{
+  const threw = (fn: () => unknown) => {
+    try {
+      fn();
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  eq("unset means unset", parseReasoning(undefined), undefined);
+  eq("blank means unset", parseReasoning("   "), undefined);
+  eq("a level parses, case-insensitively", parseReasoning("HIGH"), "high");
+  eq("none is a level, not an absence", parseReasoning("none"), "none");
+  check("an unknown level throws", threw(() => parseReasoning("maximum")));
+  eq("per-model levels parse", JSON.stringify(parseReasoningByModel('{"a":"none","b":"high"}')), '{"a":"none","b":"high"}');
+  check("a bad level inside the map throws", threw(() => parseReasoningByModel('{"a":"lots"}')));
+  check("a non-string level throws", threw(() => parseReasoningByModel('{"a":3}')));
+
+  eq("blank temperature keeps the default", parseTemperature("", 0.2), 0.2);
+  eq("a number parses", parseTemperature("0.7", 0.2), 0.7);
+  eq("the sentinel parses", parseTemperature("none", 0.2), "none");
+  eq("...case-insensitively", parseTemperature("None", 0.2), "none");
+  check("garbage throws instead of becoming NaN", threw(() => parseTemperature("warm", 0.2)));
+  eq("per-model temperatures parse, both forms", JSON.stringify(parseTemperatureByModel('{"a":"none","b":0.5}')), '{"a":"none","b":0.5}');
+  check("a bad per-model temperature throws", threw(() => parseTemperatureByModel('{"a":true}')));
+}
+
+section("stream stall detection: a dead engine costs two minutes, not fifteen");
+{
+  eq("the message names the silence and what had arrived", streamStallMessage(120_000, 512), "stream stalled after 120s (512 chars received)");
+  check("a stall is transient, so the existing retry handles it", isTransientModelError(streamStallMessage(120_000, 0)));
+  check("...and is not mistaken for a streaming rejection (no buffered fallback)", !isStreamingRejection(streamStallMessage(120_000, 0)));
+
+  // End to end against a server that sends one chunk and then goes silent without closing
+  // the socket — the failure the per-call deadline cannot see until the full 900s are gone.
+  const server = http.createServer((req, res) => {
+    req.on("error", () => {});
+    res.on("error", () => {});
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
+    // ...and nothing more, ever.
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const res = await new OpenAICompatRunner(`http://127.0.0.1:${port}/v1`, "k", 300).chat({
+      model: "m",
+      system: "s",
+      user: "u",
+    });
+    check("a stalled stream fails as a stall", (res.error ?? "").startsWith("stream stalled after"), res.error);
+    check("...reporting what had arrived before the silence", (res.error ?? "").includes("(2 chars received)"), res.error);
+    eq("...and returns no text (a transport failure, like a cut stream)", res.text, "");
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+}
+
+section("retry discipline: jittered backoff, and Retry-After when the endpoint sent one");
+{
+  eq("delta-seconds form", parseRetryAfter("30"), 30_000);
+  eq("zero is a real answer, not an absent header", parseRetryAfter("0"), 0);
+  eq("no header", parseRetryAfter(null), undefined);
+  eq("garbage is undefined, never NaN", parseRetryAfter("soon"), undefined);
+  const now = Date.parse("2026-01-01T00:00:00Z");
+  eq("HTTP-date form", parseRetryAfter("Thu, 01 Jan 2026 00:00:30 GMT", now), 30_000);
+  eq("a date already past is now, never a negative wait", parseRetryAfter("Thu, 01 Jan 2026 00:00:00 GMT", now + 5000), 0);
+
+  // Full jitter over an exponential window: a fleet that failed together used to retry in
+  // lockstep, which is the burst the 429 was asking them to stop.
+  eq("first window is 2s", backoffMs(0, undefined, () => 1), 2000);
+  eq("...jittered", backoffMs(0, undefined, () => 0.5), 1000);
+  eq("...and can be immediate", backoffMs(0, undefined, () => 0), 0);
+  eq("the window doubles", backoffMs(1, undefined, () => 1), 4000);
+  eq("...and is capped at 60s", backoffMs(20, undefined, () => 1), 60_000);
+  check(
+    "every draw stays inside the window",
+    [0, 0.1, 0.5, 0.9, 1].every((r) => {
+      const ms = backoffMs(2, undefined, () => r);
+      return ms >= 0 && ms <= 8000;
+    }),
+  );
+  eq("Retry-After wins when it asks for longer", backoffMs(0, 30_000, () => 1), 30_000);
+  eq("...but never shortens the backoff", backoffMs(5, 1000, () => 1), 60_000);
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

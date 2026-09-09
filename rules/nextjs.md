@@ -4,8 +4,9 @@ applyTo: "**/*.tsx", "**/*.jsx", "**/app/**/*.ts", "**/app/**/*.js", "**/pages/*
 
 # React / Next.js review rules
 
-Anything already covered by eslint (including `react-hooks` and `@next/next`) and `tsc`
-**must not be reported again**. Below is what they cannot catch.
+prloop dedupes tool and model findings downstream — report what you see; pure
+formatting/naming-convention output is the only thing left to linters. Below is what needs
+judgment in context.
 
 ## Server Action security (highest priority)
 

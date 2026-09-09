@@ -13,8 +13,8 @@ import { parseJsonObject } from "../libs/json";
 import { buildDiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
 import { parseVerdict, type Verdict } from "./skeptic";
-import { VERDICT_SCHEMA } from "../models/schemas";
-import { REQ_SKEPTIC_SYSTEM, buildReqSkepticPrompt } from "../prompts/skeptic";
+import { REQ_DISPUTE_SCHEMA } from "../models/schemas";
+import { REQ_SKEPTIC_SYSTEM, buildReqDisputePrompt } from "../prompts/skeptic";
 import type {
   AnchoredFinding,
   CriterionCheck,
@@ -34,6 +34,19 @@ import { REQUIREMENT_SYSTEM, buildRequirementPrompt } from "../prompts/requireme
 const VALID_VERDICT = new Set<string>(REQ_VERDICTS);
 
 /**
+ * How damning each verdict is, harshest first. Used only to settle a model that answered
+ * the same criterion twice: keeping the last answer let a model soften its own accusation
+ * (or, worse, close a criterion it had just called missing) by repeating itself, and the
+ * softening was silent — Map.set simply overwrote.
+ */
+const HARSHNESS: ReqVerdict[] = ["misunderstood", "missing", "partial", "not-verifiable", "not-this-pr", "satisfied"];
+const harshness = (v: ReqVerdict) => HARSHNESS.indexOf(v);
+
+// Ids are case-folded on both sides: "AC2" and "ac2" name the same criterion, and a model
+// that changed its mind about capitalisation used to have its verdict dropped as invented.
+const normalizeId = (raw: string) => raw.trim().replace(/^[#[\s]+|[\]\s]+$/g, "").toLowerCase();
+
+/**
  * Binds the model's verdicts back onto the pipeline's own criterion list. Exported for
  * the selftest.
  *
@@ -47,16 +60,16 @@ const VALID_VERDICT = new Set<string>(REQ_VERDICTS);
 export function resolveJudgments(
   rawItems: unknown[],
   refs: CriterionRef[],
-): { criteria: CriterionCheck[]; unknownIds: number; unjudged: number } {
-  const byId = new Map(refs.map((r) => [r.id, r]));
+): { criteria: CriterionCheck[]; unknownIds: number; unjudged: number; duplicates: number } {
+  const byId = new Map(refs.map((r) => [normalizeId(r.id), r]));
   const judged = new Map<string, CriterionCheck>();
   let unknownIds = 0;
+  let duplicates = 0;
   for (const v of rawItems) {
     if (typeof v !== "object" || v === null) continue;
     const o = v as Record<string, unknown>;
     // Tolerate the bracketed/prefixed spellings weak models produce: "[4711-AC2]", "#4711-AC2".
-    const id =
-      typeof o["criterionId"] === "string" ? o["criterionId"].trim().replace(/^[#[\s]+|[\]\s]+$/g, "") : "";
+    const id = typeof o["criterionId"] === "string" ? normalizeId(o["criterionId"]) : "";
     const ref = byId.get(id);
     if (!ref) {
       unknownIds++;
@@ -66,8 +79,15 @@ export function resolveJudgments(
     // An unrecognised verdict must not silently become "satisfied".
     const verdict: ReqVerdict = VALID_VERDICT.has(raw) ? (raw as ReqVerdict) : "not-verifiable";
     const str = (k: string) => (typeof o[k] === "string" ? (o[k] as string) : undefined);
+    const prior = judged.get(ref.id);
+    if (prior) {
+      duplicates++;
+      // Fail toward the accusation standing: a duplicate answer is not a second opinion.
+      if (harshness(verdict) >= harshness(prior.verdict)) continue;
+    }
     judged.set(ref.id, {
       workItemId: ref.workItemId,
+      id: ref.id,
       criterion: ref.text,
       verdict,
       note: str("note") ?? "",
@@ -82,12 +102,13 @@ export function resolveJudgments(
     unjudged++;
     return {
       workItemId: r.workItemId,
+      id: r.id,
       criterion: r.text,
       verdict: "not-verifiable" as ReqVerdict,
       note: "not judged: the model returned no verdict for this criterion",
     };
   });
-  return { criteria, unknownIds, unjudged };
+  return { criteria, unknownIds, unjudged, duplicates };
 }
 
 function validateExtra(v: unknown): ExtraChange | undefined {
@@ -103,6 +124,8 @@ export interface RequirementGateInput {
   ref: PrRef;
   pr: PrInfo;
   files: FileDiff[];
+  // Anchors the evidence quote behind every "satisfied" verdict (verifySatisfiedEvidence).
+  fileIndex: FileIndex;
   runner: ModelRunner;
 }
 
@@ -149,6 +172,12 @@ export async function runRequirementGate(
     files: input.files,
     criteria: refs,
     maxExtras: MAX_EXTRAS,
+    // A parent's criteria arrive here whole (ado/workitems.ts walks up one level when the
+    // linked item has none of its own), and were then judged as if this one task owed all
+    // of them. inheritedFrom was computed and dropped on the floor; the prompt now says
+    // which work item is the parent and which one the PR is actually linked to.
+    inheritedFrom: linked.inheritedFrom,
+    linkedIds: linked.items.map((w) => w.id),
   });
   const res = await input.runner.chat({
     model: REQ_MODEL,
@@ -163,9 +192,12 @@ export async function runRequirementGate(
 
   if (res.error) {
     log(`[FAIL] requirement axis model call failed: ${res.error}`);
+    // The partial text goes to requirement-raw.txt even on failure: a truncated or refused
+    // call is diagnosed from what the model managed to say, and an empty file says nothing.
     return {
       result: { workItems: withSpec, criteria: [], extras: [], error: res.error },
       prompt,
+      raw: res.text,
     };
   }
 
@@ -190,6 +222,12 @@ export async function runRequirementGate(
         `${resolved.unjudged} listed criteria left unjudged (marked not-verifiable)`,
     );
   }
+  if (resolved.duplicates > 0) {
+    log(
+      `[WARN] requirement axis: ${resolved.duplicates} criteria received more than one verdict; ` +
+        `kept the harsher one (a repeated answer is not a correction)`,
+    );
+  }
   const extras = (Array.isArray(parsed.value.extras) ? parsed.value.extras : [])
     .map(validateExtra)
     .filter((e): e is ExtraChange => e !== undefined)
@@ -198,6 +236,10 @@ export async function runRequirementGate(
     .slice(0, MAX_EXTRAS);
 
   await disputeAccusations(input, criteria);
+  const demoted = verifySatisfiedEvidence(criteria, input.fileIndex);
+  if (demoted > 0) {
+    log(`requirement axis: ${demoted} satisfied verdicts demoted → not-verifiable (evidence quote not found in the diff)`);
+  }
 
   const counts = new Map<string, number>();
   for (const c of criteria) counts.set(c.verdict, (counts.get(c.verdict) ?? 0) + 1);
@@ -213,13 +255,15 @@ export async function runRequirementGate(
 /**
  * Adversarial pass over the axis's accusations. This axis was the one model opinion in the
  * pipeline that published with no downstream filter, and its worst outputs accuse the
- * author: "missing" and "misunderstood". Both are refutable claims about the diff, so a
+ * author: "missing", "partial" and "misunderstood" — you did not build this, you half
+ * built it, you built the wrong thing. All three are refutable claims about the diff, so a
  * skeptic (different family, cold start, kill mandate) gets one attempt at each.
  *
  * One round, first skeptic model only — deliberately narrower than the code axis's
- * majority vote: every call here re-reads the finder-sized diff payload, so rounds are
- * priced like extra finders, not like 25-line verdicts. "partial" and "satisfied" are not
- * verified: partial names its own gap with a quote, satisfied is anchored downstream.
+ * majority vote — and now ONE call for all of them: the pass used to re-send the whole
+ * finder-sized diff once per accused criterion, which priced a six-accusation PR like six
+ * extra finders. "satisfied" gets no skeptic; it must anchor its evidence quote in the diff
+ * instead (verifySatisfiedEvidence, right after this pass).
  *
  * Same asymmetries as the code skeptic: fails open (an unanswered challenge changes
  * nothing), and a refutation never flips a verdict to satisfied — it demotes it to
@@ -229,28 +273,91 @@ export async function runRequirementGate(
 async function disputeAccusations(input: RequirementGateInput, criteria: CriterionCheck[]): Promise<void> {
   const model = SKEPTIC_MODELS[0];
   if (!model) return; // no skeptic configured = no verification runs, same as the code axis
-  const accused = criteria.filter((c) => c.verdict === "missing" || c.verdict === "misunderstood");
+  const accused = criteria.filter(
+    (c) => c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood",
+  );
   if (accused.length === 0) return;
 
   const payload = buildDiffPayload(input.files).text;
-  const verdicts = await Promise.all(
-    accused.map(async (c): Promise<Verdict> => {
-      const res = await input.runner.chat({
-        model,
-        system: REQ_SKEPTIC_SYSTEM,
-        user: buildReqSkepticPrompt(c.criterion, c.verdict, c.note, payload),
-        schema: VERDICT_SCHEMA,
-        schemaName: "verdict",
-        temperature: 0,
-      });
-      if (res.error) return { refuted: false, reason: "", confidence: 0, model, error: res.error };
-      return parseVerdict(res.text, model);
-    }),
+  const res = await input.runner.chat({
+    model,
+    system: REQ_SKEPTIC_SYSTEM,
+    user: buildReqDisputePrompt(
+      accused.map((c, i) => ({ id: disputeId(c, i), criterion: c.criterion, verdict: c.verdict, note: c.note })),
+      payload,
+    ),
+    schema: REQ_DISPUTE_SCHEMA,
+    schemaName: "req_dispute",
+    temperature: 0,
+  });
+  // A dead or unparseable dispute pass leaves every accusation standing: fail open, exactly
+  // as one dead per-criterion call used to.
+  if (res.error) {
+    log(`[WARN] requirement skeptic: dispute pass failed, ${accused.length} accusations stand unchallenged: ${res.error}`);
+    return;
+  }
+  const parsed = parseJsonObject<{ verdicts?: unknown }>(res.text);
+  if (!parsed.ok) {
+    log(`[WARN] requirement skeptic: dispute output unparseable, ${accused.length} accusations stand unchallenged: ${parsed.error}`);
+    return;
+  }
+  const verdicts = resolveDisputeVerdicts(
+    Array.isArray(parsed.value.verdicts) ? parsed.value.verdicts : [],
+    accused,
+    model,
   );
   const disputed = applyReqSkepticVerdicts(accused, verdicts);
   if (disputed > 0) {
     log(`requirement skeptic: ${disputed} of ${accused.length} accusations disputed → not-verifiable (model ${model})`);
   }
+}
+
+// The id the dispute pass addresses an accusation by. Criteria resolved through
+// resolveJudgments always carry the pipeline's own id; a hand-built check (fixtures) has
+// none, and its position is the only identity available.
+const disputeId = (c: CriterionCheck, i: number) => c.id ?? `A${i + 1}`;
+
+/**
+ * Binds a batched dispute answer back onto the accused criteria, by id. Exported for the
+ * selftest. Returns one verdict per accusation, in accusation order.
+ *
+ * Reading a batched answer positionally is how a refutation lands on the wrong criterion:
+ * a model that skips one id, reorders them, or invents one shifts every verdict after it,
+ * and the resulting demotion would clear an accusation nobody challenged. An id with no
+ * answer gets an ERROR verdict, which applyReqSkepticVerdicts leaves alone — an unanswered
+ * challenge changes nothing.
+ */
+export function resolveDisputeVerdicts(
+  rawItems: unknown[],
+  accused: CriterionCheck[],
+  model: string,
+): Verdict[] {
+  const byId = new Map<string, Verdict>();
+  for (const v of rawItems) {
+    if (typeof v !== "object" || v === null) continue;
+    const o = v as Record<string, unknown>;
+    const id = typeof o["criterionId"] === "string" ? normalizeId(o["criterionId"]) : "";
+    // First answer wins. A second answer for the same id is not a second opinion, and
+    // letting it overwrite would let a model talk itself into a refutation it already
+    // declined to make.
+    if (!id || byId.has(id)) continue;
+    // Parsed through the code skeptic's own reader: same three-way vocabulary, same
+    // legacy-boolean tolerance, same "unusable output is insufficient-context, never a
+    // clearing" rule — one contract, not two that drift apart.
+    byId.set(id, parseVerdict(JSON.stringify(o), model));
+  }
+  return accused.map((c, i) => {
+    const v = byId.get(normalizeId(disputeId(c, i)));
+    return (
+      v ?? {
+        verdict: "insufficient-context",
+        reason: "",
+        confidence: 0,
+        model,
+        error: "the dispute pass returned no verdict for this criterion",
+      }
+    );
+  });
 }
 
 /**
@@ -263,7 +370,10 @@ export function applyReqSkepticVerdicts(accused: CriterionCheck[], verdicts: Ver
   for (let i = 0; i < accused.length; i++) {
     const c = accused[i];
     const v = verdicts[i];
-    if (!c || !v || v.error || !v.refuted) continue;
+    // Only a refutation disputes. "holds" and "insufficient-context" both leave the
+    // accusation standing — the second says the skeptic could not check it, which is not
+    // a reason to take a criterion out of the unmet count.
+    if (!c || !v || v.error || v.verdict !== "refuted") continue;
     c.note = `Disputed by verification (${v.model}): ${v.reason}${c.note ? ` — original note: ${c.note}` : ""}`;
     c.verdict = "not-verifiable";
     disputed++;
@@ -271,7 +381,57 @@ export function applyReqSkepticVerdicts(accused: CriterionCheck[], verdicts: Ver
   return disputed;
 }
 
-/** Verdicts that mean the PR does not yet do what was asked. */
+export const UNVERIFIED_SATISFIED_NOTE = "claimed satisfied, but the evidence quote was not found in the diff";
+
+/**
+ * Holds every "satisfied" verdict to the same quote contract as a code finding, in place.
+ * Returns how many were demoted. Exported for the selftest.
+ *
+ * "satisfied" is the one verdict that closes a criterion, and it was the one verdict
+ * nothing checked: accusations get a skeptic, "partial" names its own gap with a quote,
+ * but a satisfied verdict's quote was never anchored — the comment above used to say it
+ * was "anchored downstream", and downstream only ever anchored the unmet ones. A model
+ * that hallucinated the implementing line, or cited none, closed the criterion anyway,
+ * and the summary read "all criteria implemented". Now the quote must locate in the diff;
+ * otherwise the verdict demotes to not-verifiable, which keeps the criterion out of the
+ * all-implemented verdict without turning a missing quote into an accusation.
+ */
+export function verifySatisfiedEvidence(criteria: CriterionCheck[], index: FileIndex): number {
+  let demoted = 0;
+  for (const c of criteria) {
+    if (c.verdict !== "satisfied") continue;
+    const quote = c.quote ?? "";
+    const anchored =
+      quote.trim() !== "" &&
+      anchorFinding(
+        {
+          category: "req-mismatch",
+          severity: "low",
+          confidence: 1,
+          file: c.file ?? "",
+          quote,
+          side: "right",
+          claim: c.criterion,
+        },
+        index,
+      ).anchor !== undefined;
+    if (anchored) continue;
+    c.verdict = "not-verifiable";
+    c.note = `${UNVERIFIED_SATISFIED_NOTE}${c.note ? ` — original note: ${c.note}` : ""}`;
+    demoted++;
+  }
+  return demoted;
+}
+
+/**
+ * Verdicts that mean the PR does not yet do what was asked — the unmet count, and the
+ * reason loop.ts exits 2.
+ *
+ * "not-this-pr" is deliberately absent: it says the criterion belongs to a different task
+ * or PR, which is scope information, not a failure. Counting it here would fail the build
+ * of a task PR for its siblings' unfinished work, which is the false accusation the verdict
+ * exists to stop.
+ */
 export function unmetCriteria(result: RequirementResult): CriterionCheck[] {
   return result.criteria.filter(
     (c) => c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood",

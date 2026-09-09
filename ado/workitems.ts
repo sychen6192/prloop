@@ -32,15 +32,20 @@ function fieldText(fields: Record<string, unknown> | undefined, key: string): st
 function toWorkItem(raw: RawWorkItem): WorkItem {
   const f = raw.fields;
   const type = fieldText(f, F_TYPE);
-  // Bugs carry their spec in ReproSteps rather than AcceptanceCriteria.
-  const criteriaHtml = fieldText(f, F_AC) || fieldText(f, F_REPRO);
+  // Bugs carry their spec in ReproSteps rather than AcceptanceCriteria. Which field it came
+  // from is carried forward, not just the text: reproduction steps describe the DEFECT, and
+  // asking "is this step implemented?" of a fix diff answers "missing" every time — the
+  // prompt asks whether the diff plausibly fixes the behavior instead (WorkItem.specSource).
+  const ac = htmlToText(fieldText(f, F_AC));
+  const repro = htmlToText(fieldText(f, F_REPRO));
   return {
     id: raw.id ?? 0,
     title: fieldText(f, F_TITLE),
     type,
     state: fieldText(f, F_STATE),
     description: htmlToText(fieldText(f, F_DESC)),
-    acceptanceCriteria: htmlToText(criteriaHtml),
+    acceptanceCriteria: ac || repro,
+    specSource: ac ? "acceptance-criteria" : repro ? "repro-steps" : "description",
     url: raw._links?.html?.href ?? "",
     parentId: parentIdFrom(raw),
   };

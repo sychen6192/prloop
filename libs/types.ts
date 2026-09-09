@@ -92,23 +92,40 @@ export interface WorkItem {
   description: string;
   // Plain text, flattened from the field's HTML.
   acceptanceCriteria: string;
+  // Which field the spec above came from. A Bug's ReproSteps are read into
+  // acceptanceCriteria (that is where a Bug states what it wants), but they are steps that
+  // reproduce a defect, not criteria to implement — judging a fix diff against them as if
+  // they were acceptance criteria generates "missing" for every step. The prompt asks the
+  // different question when this says repro-steps (ado/workitems.ts sets it).
+  specSource: "acceptance-criteria" | "description" | "repro-steps";
   url: string;
   parentId?: number;
 }
 
 // Verdicts name the *way* a requirement failed, not how much of it was done. "60% covered"
 // tells a developer nothing; "you solved the wrong problem" tells them what to do.
+// "not-this-pr" is the answer to the axis's structural false-accusation generator: a work
+// item's criteria are routinely delivered across several PRs, and a parent PBI's criteria
+// are pulled into a child task's PR wholesale — so "missing" was the guaranteed verdict on
+// criteria this PR never set out to deliver, and the axis accused the author of not doing
+// work that was never theirs. It is scope information, not a failure: excluded from the
+// unmet count (gates/requirement.ts) and from exit code 2.
 export const REQ_VERDICTS = [
   "satisfied",
   "missing",
   "partial",
   "misunderstood",
+  "not-this-pr",
   "not-verifiable",
 ] as const;
 export type ReqVerdict = (typeof REQ_VERDICTS)[number];
 
 export interface CriterionCheck {
   workItemId: number;
+  // The pipeline's stable criterion id (libs/criteria.ts), when this check came from a
+  // listed criterion. The dispute pass addresses accusations by id, so it must survive
+  // resolveJudgments; absent only on checks built by hand (fixtures).
+  id?: string;
   criterion: string;
   verdict: ReqVerdict;
   note: string;
@@ -149,12 +166,21 @@ export interface RawFinding {
   claim: string;
   evidence?: string;
   suggested_fix?: string;
-  boundary_owner?: "current" | "external";
   // The checkable basis for a judgment-call finding: the named smell or the project rule it
   // invokes. Structural teeth for the rules' citation contract — a maintainability finding
   // that cites nothing is capped to low severity at validation (gates/finder.ts).
   cites?: string;
 }
+
+// --- Adversarial verification ---
+
+// A skeptic's answer has three shapes, not two. "I checked it and found no grounds to
+// refute it" and "I could not check this from what you showed me" used to collapse into
+// the same `refuted: false`, and downstream read both as an active clearing — which
+// published single-source findings on the strength of a verifier that never saw the code
+// the claim was about (another file, a caller, a line this PR deleted).
+export const SKEPTIC_VERDICTS = ["refuted", "holds", "insufficient-context"] as const;
+export type SkepticVerdictKind = (typeof SKEPTIC_VERDICTS)[number];
 
 export type AnchorFailure =
   | "quote-not-found"
@@ -180,14 +206,32 @@ export interface Anchor {
 export interface AnchoredFinding extends RawFinding {
   // Which model produced it (M3: how many independently did).
   sources: string[];
+  // Models whose finding shared these lines but made a DIFFERENT claim (findingsAgree in
+  // gates/aggregate.ts). Kept apart from `sources` so the summary can say the line was
+  // busy without the consensus gate reading "someone else said something here" as
+  // "someone else found this bug".
+  overlapping?: string[];
+  // Static-tool findings only: the tier of the tool that produced it. Decides whether a
+  // merge may raise a model finding's severity (mergeInto) — a triage-tier tool rating an
+  // error-level lint rule "high" is a policy, not a measurement of impact.
+  tier?: "fact" | "triage";
   anchor?: Anchor;
   anchorFailure?: AnchorFailure;
   // Stable identity across pushes, for dedup against already-posted threads.
   fingerprint: string;
   changeTrackingId?: number;
   // Adversarial verification results (M3); undefined when the skeptic stage didn't run.
+  // skepticVerdicts counts CLEARINGS ("holds") only — a verifier that could not check the
+  // claim is not corroboration, and counting it as one is how single-source findings got
+  // published unverified.
   skepticVerdicts?: number;
   skepticRefuted?: number;
+  // Verifiers that answered "insufficient-context": they neither killed nor cleared it.
+  skepticUnchecked?: number;
+  // Every verifier shared a model family with a finder. The clearing still counts (fail
+  // open: refusing it would delete findings on a single-family deployment, which is most
+  // of them), but the reader is told the check was weaker than it looks.
+  skepticSameFamily?: boolean;
   // Why this finding did not reach an inline comment, when it didn't.
   suppressedBy?: "severity" | "cap" | "no-corroboration" | "dismissed";
 }
@@ -213,8 +257,14 @@ export interface ChatResponse {
   model: string;
   promptTokens?: number;
   completionTokens?: number;
-  // Set when the call failed after retries; text is then empty.
+  // Set when the call failed after retries. `text` is usually empty, but a call that died
+  // mid-output (a truncated completion, a timed-out CLI run) keeps what arrived so the
+  // artifacts show it — the pair is still a failure, never an answer to parse.
   error?: string;
+  // What the endpoint's `Retry-After` asked for on a 429/503, in ms. The retry layer waits
+  // at least this long: without it the backoff guesses, and usually retries straight back
+  // into the window the endpoint just told us was closed.
+  retryAfterMs?: number;
 }
 
 export interface ModelRunner {

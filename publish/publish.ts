@@ -32,6 +32,20 @@ function findSummaryThread(threads: Thread[]): { thread: Thread; commentId: numb
   return undefined;
 }
 
+export interface PostedPosition {
+  file: string;
+  start: number;
+  end: number;
+  // Which axis the thread belongs to, read from the comment's category marker. Undefined
+  // on threads posted before the marker existed — those still block both axes, because a
+  // duplicate comment is the failure this dedupe exists to prevent and an unlabelled
+  // thread gives no basis to decide it is safe.
+  axis?: "requirement" | "code";
+}
+
+/** The requirement axis owns exactly one category; everything else is the code axis. */
+const axisOf = (category: string) => (category === "req-mismatch" ? "requirement" : "code");
+
 /**
  * Positions of our own inline threads, for cross-run dedupe by location.
  *
@@ -41,18 +55,26 @@ function findSummaryThread(threads: Thread[]): { thread: Thread; commentId: numb
  * sitting on those lines is the stronger signal: whatever we would say there, we have
  * already said.
  *
+ * Said BY THE SAME AXIS, that is. This was the one place the "two blind axes, separate
+ * budgets" invariant leaked: a requirement thread from a prior run on lines 10-12 silently
+ * swallowed a new critical code finding on line 11, and a code thread swallowed the
+ * requirement verdict on the same lines. The two axes never see each other's output
+ * anywhere else in the pipeline; they must not delete each other's comments here.
+ *
  * Human-dismissed threads (wontFix/byDesign/closed) count too: a rephrased finding on
  * lines a reviewer already said no to is the same conversation reopened. Only "fixed" is
  * left out — the code there changed, and a fresh finding on the new code may be real.
  */
-export function postedPositions(threads: Thread[], index: FileIndex): Array<{ file: string; start: number; end: number }> {
-  const out: Array<{ file: string; start: number; end: number }> = [];
+export function postedPositions(threads: Thread[], index: FileIndex): PostedPosition[] {
+  const out: PostedPosition[] = [];
+  const catRe = /<!-- prloop:cat=([a-z-]+) -->/;
   for (const t of threads) {
     if (t.status === "fixed") continue;
     const ctx = t.threadContext;
     if (!ctx?.filePath || !ctx.rightFileStart?.line) continue;
-    const ours = t.comments?.some((c) => !c.isDeleted && (c.content ?? "").includes(BOT_MARKER));
-    if (!ours) continue;
+    const ourComment = t.comments?.find((c) => !c.isDeleted && (c.content ?? "").includes(BOT_MARKER));
+    if (!ourComment) continue;
+    const cat = catRe.exec(ourComment.content ?? "")?.[1];
     out.push({
       // Thread paths come back from ADO in its own shape and may cite a pre-rename path;
       // resolve through the index so a thread on the old name still occupies the renamed
@@ -61,9 +83,29 @@ export function postedPositions(threads: Thread[], index: FileIndex): Array<{ fi
       file: index.resolvePrior(ctx.filePath)?.path ?? normalizePath(ctx.filePath),
       start: ctx.rightFileStart.line,
       end: ctx.rightFileEnd?.line ?? ctx.rightFileStart.line,
+      ...(cat ? { axis: axisOf(cat) } : {}),
     });
   }
   return out;
+}
+
+/**
+ * Whether an existing thread already covers this finding's lines. Exported for the
+ * selftest — the rule it encodes (same file, overlapping lines, SAME AXIS) is the one that
+ * used to delete a critical code finding because a requirement thread sat on the line.
+ *
+ * Right side only: left-side context isn't tracked here, and left-anchored comments are rare.
+ */
+export function coveredByThread(f: AnchoredFinding, positions: PostedPosition[]): boolean {
+  const a = f.anchor;
+  if (!a || a.side !== "right") return false;
+  return positions.some(
+    (p) =>
+      p.file === f.file &&
+      (p.axis === undefined || p.axis === axisOf(f.category)) &&
+      a.startLine <= p.end &&
+      a.endLine >= p.start,
+  );
 }
 
 function postedFingerprints(threads: Thread[]): Set<string> {
@@ -86,7 +128,6 @@ export async function publish(
   summaryInput: SummaryInput,
 ): Promise<PublishResult> {
   const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [] };
-  const summaryBody = `${renderSummary(summaryInput)}\n${iterationMarker(summaryInput.ctx.iteration.id)}`;
 
   // Requirement findings go first so that if anything below fails, the message that
   // survived is the one about the PR not doing what was asked.
@@ -130,14 +171,8 @@ export async function publish(
       continue;
     }
     if (!f.anchor) continue; // defensive: aggregate already filtered these out
-    // Location dedupe: an active prloop thread already covers these lines (right side only —
-    // left-side context isn't tracked here, and left-anchored comments are rare).
-    if (
-      f.anchor.side === "right" &&
-      positions.some(
-        (p) => p.file === f.file && f.anchor!.startLine <= p.end && f.anchor!.endLine >= p.start,
-      )
-    ) {
+    // Location dedupe: an active prloop thread from THIS axis already covers these lines.
+    if (coveredByThread(f, positions)) {
       result.alreadyPosted.push(f);
       continue;
     }
@@ -163,6 +198,13 @@ export async function publish(
   if (result.alreadyPosted.length > 0) {
     log(`${result.alreadyPosted.length} findings already commented, skipped`);
   }
+
+  // Rendered here, not before the loop: the summary asserts what reached the PR, and the
+  // loop above is the only thing that knows. Rendering it first published "commented on the
+  // relevant lines" for findings that had just failed to post or were already covered.
+  const summaryBody =
+    `${renderSummary({ ...summaryInput, posted: result.posted, alreadyPosted: result.alreadyPosted, failed: result.failed })}\n` +
+    iterationMarker(summaryInput.ctx.iteration.id);
 
   const existing = findSummaryThread(threads);
   try {

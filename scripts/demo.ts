@@ -81,6 +81,7 @@ const req: RequirementResult = {
       state: "Active",
       description: "",
       acceptanceCriteria: "",
+      specSource: "acceptance-criteria",
       url: "",
     },
   ],

@@ -4,17 +4,11 @@ applyTo: "**/*.py", "**/*.pyi"
 
 # Python review rules
 
-Ruff's **default** rule set is broad, and everything in it is already reported. Do not report
-any of these again: mutable default arguments (`B006`) and mutable class attributes
-(`RUF012`), loop variables captured by a closure (`B023`), blocking calls inside `async def`
-(`ASYNC2xx` — `time.sleep`, `open`, `subprocess`, blocking HTTP), naive `datetime.now()` /
-`utcnow()` (`DTZ003`, `DTZ005`), `functools.cache` on a method (`B019`), `except: pass`
-(`S110`), comprehension and modernisation rewrites (`C4`, `UP`). mypy owns type errors and
-bandit owns the security patterns (`pickle`, `yaml.load`, `subprocess` with `shell=True`,
-hardcoded secrets) — never restate those either.
+prloop dedupes tool and model findings downstream — report what you see; pure
+formatting/naming-convention output is the only thing left to linters.
 
-What follows is what those tools structurally cannot see: reasoning that spans functions,
-requests, or time.
+What follows needs reasoning that spans functions, requests, or time — the kind no
+pattern-matching tool can see.
 
 ## The GIL is not a transaction
 
@@ -103,8 +97,10 @@ threads between any two.
 - **`float` for money or any exact quantity.** → `Decimal`, or integer minor units.
 - **`==` between floats.** → `math.isclose`.
 
-## Widely-agreed additions (community consensus, not tool-enforced — word findings with room
-for doubt and cap severity at medium)
+## Widely-agreed additions
+
+Community consensus, not tool-enforced — word findings with room for doubt and cap severity
+at medium.
 
 - **pandas chained assignment** (`df[df.a > 1]['b'] = 3`). Under Copy-on-Write, the only mode
   from pandas 3.0, this raises `ChainedAssignmentError`. → `.loc`.

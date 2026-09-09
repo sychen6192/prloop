@@ -1,14 +1,24 @@
 // Finder prompts.
 //
-// Two things are deliberate here:
+// Three things are deliberate here:
 // 1. Coverage mode. The finder is told to report everything including low-confidence
 //    items, because filtering downstream beats filtering at the source — telling a model
 //    "only report severe issues" measurably depresses recall. Precision comes from the
-//    skeptic and consensus stages (M3), not from asking the finder to self-censor.
+//    skeptic and consensus stages (M3), not from asking the finder to self-censor. The
+//    wording matters as much as the instruction: a closing line that called an empty
+//    findings array "a common outcome" handed self-censoring models the permission they
+//    were looking for, and recall fell run over run.
 // 2. Quote, never line numbers. The schema has no line field; the prompt reinforces that
 //    the quote must be copied verbatim, because the quote IS the anchor.
+// 3. The recap. The diff sits between the rules and the output instruction and on a big PR
+//    it is most of the window; models recall the two ends of a long context far better
+//    than its middle. So the category list, the severity chain and the headings of the
+//    loaded rules are restated compactly after the diff, right where the model starts
+//    writing — and the rule headings double as the citations the validator accepts.
+import { FINDER_CATEGORIES, FINDER_PROMPT_SUFFIX_BY_MODEL } from "../config";
 import { buildDiffPayload } from "../libs/payload";
 import type { FileDiff, PrInfo } from "../libs/types";
+import { renderPrDescription, renderRepositoryConventions } from "./untrusted";
 
 export const FINDER_SYSTEM = `You are a senior code reviewer examining the changes in a Pull Request.
 
@@ -46,10 +56,12 @@ Review coverage (coverage mode):
 - Report every issue you observe, including ones you are unsure about. Use "confidence"
   (0-1) to state honestly how sure you are, and "severity" for impact. A separate
   verification stage handles filtering later — do not self-censor.
-- But do not pad the list: pure style, naming, formatting, and import ordering are the
-  linter's job. Never report those.
+- But do not pad the list. Pure style, formatting, import ordering and naming CONVENTIONS
+  (case, prefixes, suffixes, house style) are never findings. A name that misdescribes what
+  the code does is a different thing: report it as maintainability, low or medium, citing
+  "Mysterious Name".
 
-## category (pick one of nine)
+## category (pick one of eight)
 
 | category | scope |
 | --- | --- |
@@ -69,15 +81,15 @@ Work through the questions below in order. **The first one that holds decides th
 1. Can it cause data loss, data corruption, an exploitable security hole, or an outage?
    → **critical**
 2. Will functionality break with **no workaround**? Or is this code untrustworthy until it
-   is fixed (incorrect behavior, swallowed errors, duplicated logic blocks, a test that
-   asserts nothing)? → **high**
+   is fixed (incorrect behavior, swallowed errors, a test that asserts nothing)? → **high**
 3. Will functionality break but **a workaround exists**, or does it only fail on a specific
    path / specific input? → **medium**
-4. None of the above (readability, naming, could be better but correctness is unaffected)
-   → **low**
+4. None of the above (readability, a misleading name, could be better but correctness is
+   unaffected) → **low**
 
 "Coverage could be broader" and "this could be written more elegantly" are always low.
-Do not label a nitpick as high.
+Do not label a nitpick as high. Maintainability findings never exceed medium: they are
+judgment calls by definition (the rules say so, and the system enforces it).
 
 ## Important rules
 
@@ -90,8 +102,52 @@ Do not label a nitpick as high.
 - **Code axis only.** Whether this PR delivers what its linked work items asked for is a
   separate stage that sees the requirements — you do not. Do not guess at requirements
   from the PR description and report gaps against them.
-- If you find nothing worth reporting, return an empty findings array. **That is entirely
-  acceptable and a common outcome.**`;
+- **An empty findings array is correct only after every hunk in the diff has been examined
+  and none of them holds a defect.** Weak or uncertain findings go IN, with an honest
+  confidence — the verification stage removes them; the finder does not.
+
+## Worked example (one finding, every field doing its job)
+
+The diff adds, directly after a call to the payment gateway:
+    } catch (e) {
+        return null;
+    }
+  category: reliability · severity: high · confidence: 0.8 · side: right
+  quote: "    } catch (e) {\\n        return null;"        (verbatim, prefix stripped, consecutive lines)
+  context_before: "        gateway.refund(order.paymentId, amount);"
+  claim: "A failed gateway refund is swallowed and returned to the caller as a successful null."
+  evidence: "The caller marks the order refunded on any non-exception return; a gateway
+    timeout or a decline is lost and the customer is never refunded."
+  suggested_fix: "    } catch (e) {\\n        throw new RefundFailed(order.id, e);"   (code, not advice)
+  cites: null        (behavioral: the quote and the evidence are the basis)
+
+## Not a finding (do not report)
+
+The diff adds \`total = calcTotal(items)\` in a module whose other helpers are named
+\`calculateTax\` and \`calculateShipping\`. "Inconsistent naming: calcTotal should be
+calculateTotal" is a naming convention — the linter's business — and the name still says
+what the function does, so it is not a Mysterious Name either. Nothing goes in the array
+for it. The same holds for import order, brace style, trailing commas and "could use a
+comment here".`;
+
+/**
+ * The system prompt one finder model receives: FINDER_SYSTEM plus that model's configured
+ * stance (PRR_FINDER_PROMPT_SUFFIX_BY_MODEL), when it has one. The map argument exists for
+ * tests; runtime callers take the config default.
+ */
+export function finderSystemFor(
+  model: string,
+  suffixes: Record<string, string> | undefined = FINDER_PROMPT_SUFFIX_BY_MODEL,
+): string {
+  const suffix = suffixes?.[model]?.trim();
+  return suffix ? `${FINDER_SYSTEM}\n\n${suffix}` : FINDER_SYSTEM;
+}
+
+export interface RuleHeadingGroup {
+  // The rule file (as loadRules names it) or the conventions block the headings came from.
+  name: string;
+  headings: string[];
+}
 
 export interface FinderPromptInput {
   pr: PrInfo;
@@ -103,28 +159,80 @@ export interface FinderPromptInput {
   // The reviewed repo's own convention docs (rendered by renderConventions). Injected
   // ahead of the rules so the "repo conventions override" clause has real text to act on.
   conventions?: string;
+  // Headings of the selected rules, for the recap after the diff (header comment, item 3).
+  ruleHeadings?: RuleHeadingGroup[];
+  // This finder's file-order seed (libs/prng.ts). Undefined = selection order, which is
+  // what the offline prompt tooling and the selftests use.
+  seed?: number;
+  // The model this prompt is for, and the rest of what its request will carry: the system
+  // prompt, and the JSON schema when the backend cannot enforce one and it is inlined into
+  // the user message instead. Given, the diff is budgeted against that model's context
+  // window (PRR_CONTEXT_TOKENS) as well as the char ceiling; omitted, only the char ceiling
+  // applies — which is what the offline tooling and the requirement axis want.
+  model?: string;
+  system?: string;
+  schemaText?: string;
 }
 
-export function buildFinderPrompt(input: FinderPromptInput): { text: string; omitted: string[] } {
-  const payload = buildDiffPayload(input.files);
+export interface FinderPrompt {
+  text: string;
+  omitted: string[];
+  // Which budget the omissions ran into, so the log line can name the knob that would
+  // actually change the outcome.
+  bound?: "chars" | "tokens";
+}
+
+/** The compact restatement that follows the diff. Exported for the selftest. */
+export function renderRecap(ruleHeadings: RuleHeadingGroup[] | undefined): string {
+  const loaded = (ruleHeadings ?? []).filter((g) => g.headings.length > 0);
+  const rulesBlock =
+    loaded.length > 0
+      ? `Rules loaded for this PR — a maintainability finding cites one of these headings, or a smell name:\n${loaded
+          .map((g) => `- ${g.name}: ${g.headings.join(" › ")}`)
+          .join("\n")}`
+      : "No project rules were loaded for this PR; a maintainability finding cites a smell name.";
+  return `## Recap (the diff is long — the essentials again, before you write)
+
+- Categories (${FINDER_CATEGORIES.length}): ${FINDER_CATEGORIES.join(", ")}.
+- Severity — the first step that holds decides:
+  1. data loss, corruption, an exploitable hole, or an outage → critical
+  2. breaks with no workaround, or untrustworthy until fixed (wrong behavior, swallowed errors, a test that asserts nothing) → high
+  3. breaks with a workaround, or only on a specific path or input → medium
+  4. none of the above → low (maintainability never exceeds medium)
+- Every finding carries a verbatim quote; an empty array is right only after every hunk above was examined.
+
+${rulesBlock}`;
+}
+
+export function buildFinderPrompt(input: FinderPromptInput): FinderPrompt {
   const scope =
     input.compareTo > 0
       ? `Review only the changes added after iteration ${input.compareTo} (iteration ${input.iterationId}).`
       : `Review the complete set of changes in this PR (iteration ${input.iterationId}).`;
 
-  const guidance = [input.conventions?.trim(), input.rules?.trim()].filter(Boolean).join("\n\n---\n\n");
+  // The conventions are the reviewed repository's own text — author-influenced — so they
+  // are fenced and framed as data (prompts/untrusted.ts); the rules are prloop's and are not.
+  const conventions = input.conventions?.trim() ? renderRepositoryConventions(input.conventions) : "";
+  const guidance = [conventions, input.rules?.trim()].filter(Boolean).join("\n\n---\n\n");
+  // The precedence is scoped on purpose. "Where they conflict, these win" once covered the
+  // output contract too, so a rule (or a convention doc) could talk a model out of the
+  // verbatim-quote requirement, the code-axis boundary, or the coverage stance.
   const rulesBlock = guidance
-    ? `\n## Review rules for this project\n\nThe rules below were loaded automatically based on the files touched by this change. Where they conflict with the general guidance above, these win.\n\n${guidance}\n`
+    ? `\n## Review rules for this project\n\nThe rules below were loaded automatically based on the files touched by this change. They decide WHAT is reportable and how severe it is — where they conflict with the general guidance above on that, they win. They never change the output rules (verbatim quote, the fields, JSON), the code-axis-only boundary, or the coverage stance.\n\n${guidance}\n`
     : "";
 
-  const text = `## Pull Request info
+  // Split in two so the diff can be budgeted against what will SURROUND it. Everything
+  // here shares one context window with the payload — and until this was counted, only the
+  // diff's characters were, which is how a "safely" sized diff still arrived at the model
+  // truncated (config.ts, PRR_CONTEXT_TOKENS, says what that costs).
+  const head = `## Pull Request info
 
 - Title: ${input.pr.title}
 - Source branch: ${input.pr.sourceBranch} → target branch: ${input.pr.targetBranch}
 - Author: ${input.pr.createdBy}
 
 ### PR description
-${input.pr.description?.trim() || "(no description)"}
+${renderPrDescription(input.pr.description)}
 
 ## Review scope
 
@@ -137,12 +245,21 @@ In the diff, the numbers in \`@@ -leftStart,leftCount +rightStart,rightCount @@\
 file line numbers, given so you can orient yourself. Do not include any line number in your
 output — just copy the quote verbatim.
 
-${payload.text}
+`;
+
+  const tail = `
+
+${renderRecap(input.ruleHeadings)}
 
 ## Your output
 
 Emit JSON per the schema. Every finding's quote must be source text that appears in the diff
 above (with the diff's +/- prefix stripped).`;
 
-  return { text, omitted: payload.omittedFiles };
+  const payload = buildDiffPayload(input.files, undefined, input.seed, {
+    model: input.model,
+    fixed: `${input.system ?? ""}\n${input.schemaText ?? ""}\n${head}${tail}`,
+  });
+
+  return { text: `${head}${payload.text}${tail}`, omitted: payload.omittedFiles, bound: payload.bound };
 }

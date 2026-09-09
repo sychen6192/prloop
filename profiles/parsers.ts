@@ -1,6 +1,7 @@
 // Output parsers. Every tool gets normalized to ToolFinding so the rest of the pipeline
 // never knows which linter a finding came from.
 import { parseJsonObject } from "../libs/json";
+import { log } from "../libs/log";
 import type { Severity } from "../config";
 import type { OutputFormat, ToolFinding, ToolSpec } from "./types";
 
@@ -164,6 +165,23 @@ function parseCheckstyleXml(raw: string, spec: ToolSpec, workdir: string): ToolF
       if (!Number.isFinite(line) || line <= 0) continue;
       const endLine = Number(attr(a, "endline"));
       const src = attr(a, "source") ?? attr(a, "rule") ?? "";
+      // Checkstyle says `severity` in words; PMD's <violation> says `priority`, 1 = most
+      // severe down to 5. The shared numeric mapping reads the other way ("2" is high
+      // there, "1" medium), so every priority-1 PMD violation was filed as medium and
+      // every priority-2 as high — inverted, in the tier where a model then ranks them.
+      // Same direction as SpotBugs, same explicit mapping.
+      const severityWord = attr(a, "severity");
+      const priority = attr(a, "priority");
+      const severity: Severity =
+        severityWord !== undefined
+          ? mapSeverity(severityWord)
+          : priority !== undefined
+            ? priority === "1"
+              ? "high"
+              : priority === "2"
+                ? "medium"
+                : "low"
+            : mapSeverity(undefined);
       out.push({
         tool: spec.name,
         tier: spec.tier,
@@ -173,8 +191,8 @@ function parseCheckstyleXml(raw: string, spec: ToolSpec, workdir: string): ToolF
         file: rel(filePath, workdir),
         line,
         ...(Number.isFinite(endLine) && endLine >= line ? { endLine } : {}),
-        severity: mapSeverity(attr(a, "severity") ?? attr(a, "priority")),
-        rawSeverity: attr(a, "severity"),
+        severity,
+        rawSeverity: severityWord ?? (priority !== undefined ? `priority ${priority}` : undefined),
       });
     }
   }
@@ -308,8 +326,15 @@ export function parseToolOutput(raw: string, spec: ToolSpec, workdir: string): T
   if (!raw.trim()) return [];
   try {
     return PARSERS[spec.format](raw, spec, workdir);
-  } catch {
-    // A parser blowing up must not take the review down with it.
+  } catch (e) {
+    // A parser blowing up must not take the review down with it — but it must not look like
+    // a clean tool run either. An empty array is exactly what a passing linter returns, so
+    // without this line a parser bug (or a tool that changed its output format) removes a
+    // whole tool from the review and nothing anywhere says so.
+    log(
+      `[WARN] ${spec.name}: could not parse ${spec.format} output, dropping its findings ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
     return [];
   }
 }
