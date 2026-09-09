@@ -3698,6 +3698,27 @@ section("CLI entry points");
   check("...and never fetches one at run time", !/npx\s+tsx/.test(wrapperCode) && wrapperCode.includes("--no-install"));
   check("...and says what to run when tsx is missing", wrapperCode.includes("npm ci"));
 
+  // The documented install is a symlink onto PATH, and BASH_SOURCE is then the LINK's path:
+  // deriving TOOL_DIR from it without resolving the link pointed the wrapper at ~/.local and
+  // it died on "Cannot find module ~/.local/loop.ts". Run it through a symlink for real —
+  // string-matching the resolution loop would pass on a broken one.
+  {
+    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-link-"));
+    try {
+      const link = path.join(linkDir, "prloop");
+      fs.symlinkSync(path.join(PRLOOP_ROOT, "bin", "prloop"), link);
+      const r = spawnSync(link, ["--help"], { encoding: "utf8", timeout: 60_000 });
+      if (r.error && (r.error as NodeJS.ErrnoException).code === "ENOENT") {
+        skip("the wrapper works when invoked through a symlink", "no bash on this platform");
+      } else {
+        check("the wrapper works when invoked through a symlink", r.status === 0, `exit ${r.status}: ${(r.stderr ?? "").slice(0, 200)}`);
+        check("...and prints its usage from there", (r.stdout ?? "").includes("Usage: prloop"));
+      }
+    } finally {
+      fs.rmSync(linkDir, { recursive: true, force: true });
+    }
+  }
+
   const pkg = JSON.parse(fs.readFileSync(path.join(PRLOOP_ROOT, "package.json"), "utf8")) as {
     scripts?: Record<string, string>;
   };
