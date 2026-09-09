@@ -28,7 +28,7 @@ export interface ReviewContext {
 
 async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> {
   const language = detectLanguage(entry.path);
-  const base: Omit<FileDiff, "hunks" | "rightLines" | "leftLines" | "changedRightLines"> = {
+  const base: Omit<FileDiff, "hunks" | "rightLines" | "leftLines" | "changedRightLines" | "changedLeftLines"> = {
     path: entry.path,
     originalPath: entry.originalPath,
     changeType: entry.changeType,
@@ -43,20 +43,21 @@ async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> 
   ]);
 
   if (right.binary || left.binary) {
-    return { ...base, binary: true, hunks: [], rightLines: [], leftLines: [], changedRightLines: new Set() };
+    return { ...base, binary: true, hunks: [], rightLines: [], leftLines: [], changedRightLines: new Set(), changedLeftLines: new Set() };
   }
   if (right.truncated || left.truncated) {
-    return { ...base, truncated: true, hunks: [], rightLines: [], leftLines: [], changedRightLines: new Set() };
+    return { ...base, truncated: true, hunks: [], rightLines: [], leftLines: [], changedRightLines: new Set(), changedLeftLines: new Set() };
   }
 
   const edits = diffLines(left.lines, right.lines);
-  const { hunks, changedRightLines } = buildHunks(left.lines, right.lines, edits);
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(left.lines, right.lines, edits);
   return {
     ...base,
     hunks,
     rightLines: right.lines,
     leftLines: left.lines,
     changedRightLines,
+    changedLeftLines,
   };
 }
 

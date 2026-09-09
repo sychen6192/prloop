@@ -204,7 +204,7 @@ section("diff and hunk line numbers");
 {
   const left: string[] = [];
   const right = ["a", "b"];
-  const { hunks, changedRightLines } = buildHunks(left, right, diffLines(left, right));
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(left, right, diffLines(left, right));
   eq("new file: both lines changed", [...changedRightLines], [1, 2]);
   check("new file has a hunk", hunks.length === 1);
 }
@@ -216,7 +216,7 @@ section("diff and hunk line numbers");
 {
   const left = ["b", "c"];
   const right = ["a", "b", "c"];
-  const { hunks, changedRightLines } = buildHunks(left, right, diffLines(left, right));
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(left, right, diffLines(left, right));
   eq("insert at top: rightStart=1", hunks[0]?.rightStart, 1);
   eq("insert at top: leftStart=1", hunks[0]?.leftStart, 1);
   eq("insert at top: changed line = 1", [...changedRightLines], [1]);
@@ -229,7 +229,7 @@ section("diff and hunk line numbers");
   bigRight[9] = "CHANGED10();";
   bigRight.splice(100, 0, "INSERTED();");
   bigRight[180] = "CHANGED181();";
-  const { hunks, changedRightLines } = buildHunks(bigLeft, bigRight, diffLines(bigLeft, bigRight));
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(bigLeft, bigRight, diffLines(bigLeft, bigRight));
   eq("three scattered edits -> 3 hunks", hunks.length, 3);
   eq("changed line numbers correct", [...changedRightLines].sort((a, b) => a - b), [10, 101, 181]);
   // The strongest assertion available: a hunk's declared span must match the real file.
@@ -259,7 +259,7 @@ section("quote anchoring (core)");
 function mkFile(path: string, rightLines: string[], changed: number[]): FileDiff {
   const leftLines = rightLines.filter((_, i) => !changed.includes(i + 1));
   const edits = diffLines(leftLines, rightLines);
-  const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, edits);
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, edits);
   return {
     path,
     changeType: "edit",
@@ -267,6 +267,7 @@ function mkFile(path: string, rightLines: string[], changed: number[]): FileDiff
     rightLines,
     leftLines,
     changedRightLines: changedRightLines.size ? changedRightLines : new Set(changed),
+    changedLeftLines: new Set(),
     binary: false,
     truncated: false,
     language: detectLanguage(path),
@@ -340,7 +341,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
   const leftLines = [...rightLines];
   leftLines[0] = "old();";
   const edits = diffLines(leftLines, rightLines);
-  const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, edits);
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, edits);
   const f: FileDiff = {
     path: "/src/app.ts",
     changeType: "edit",
@@ -348,6 +349,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
     rightLines,
     leftLines,
     changedRightLines,
+    changedLeftLines,
     binary: false,
     truncated: false,
     language: "typescript",
@@ -385,7 +387,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
   // lands on the wrong function.
   const rightLines = ["import x;", "", "def helper():", "    return 1", "", "def main():", "    return 1"];
   const leftLines = ["import x;", "", "def helper():", "    return 1"];
-  const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
   const f: FileDiff = {
     path: "/src/m.py",
     changeType: "edit",
@@ -393,6 +395,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
     rightLines,
     leftLines,
     changedRightLines,
+    changedLeftLines,
     binary: false,
     truncated: false,
     language: "python",
@@ -416,6 +419,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
     rightLines,
     leftLines: [],
     changedRightLines: new Set([1, 2, 3]),
+    changedLeftLines: new Set(),
     binary: false,
     truncated: false,
     language: "typescript",
@@ -440,7 +444,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
   const rightLines = Array.from({ length: 60 }, (_, i) => `line${i + 1}();`);
   const leftLines = [...rightLines];
   leftLines[0] = "old();";
-  const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
   const f: FileDiff = {
     path: "/src/app.ts",
     changeType: "edit",
@@ -448,6 +452,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
     rightLines,
     leftLines,
     changedRightLines,
+    changedLeftLines,
     binary: false,
     truncated: false,
     language: "typescript",
@@ -461,7 +466,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
   // the left. The stated side is honoured on the first attempt, no fallback involved.
   const leftLines = ["setup();", "  if (!user) return;", "run();"];
   const rightLines = ["setup();", "run();"];
-  const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
   const f: FileDiff = {
     path: "/src/guard.ts",
     changeType: "edit",
@@ -469,6 +474,7 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
     rightLines,
     leftLines,
     changedRightLines,
+    changedLeftLines,
     binary: false,
     truncated: false,
     language: "typescript",
@@ -479,6 +485,58 @@ function mkFinding(over: Partial<RawFinding>): RawFinding {
   );
   eq("a deleted line anchors on the left", r.anchor?.startLine, 2);
   eq("...and stays on the left side", r.anchor?.side, "left");
+}
+{
+  // Left-side recovery used to be weaker than right-side recovery for one reason: FileDiff
+  // carried changedRightLines and nothing else, so the two rules that rest on "is this a
+  // line the PR touched" could not be asked on the left. buildHunks had computed
+  // changedLeftLines all along; it just never reached the type. These two assertions are
+  // what that costs, from both directions.
+  const mkLeft = (leftLines: string[], rightLines: string[], path: string): FileDiff => {
+    const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
+    return {
+      path, changeType: "edit", hunks, rightLines, leftLines,
+      changedRightLines, changedLeftLines, binary: false, truncated: false, language: "typescript",
+    };
+  };
+
+  // 1) Disambiguation. The quote occurs twice on the left, both inside the hunk, and the
+  //    model gave no context. Only one of them is a line this change deleted.
+  const dup = mkLeft(
+    ["a();", "  flush();", "b();", "  flush();", "c();"],
+    ["a();", "  flush();", "b();", "c();"],
+    "/src/dup.ts",
+  );
+  const picked = anchorFinding(mkFinding({ file: "/src/dup.ts", side: "left", quote: "  flush();" }), [dup]);
+  eq("a repeated left-side quote resolves to the deleted occurrence", picked.anchor?.startLine, 4);
+  eq("...on the left", picked.anchor?.side, "left");
+
+  // 2) First-line recovery. The model quotes a deleted block and paraphrases its body, so
+  //    nothing matches whole — but the opening line is verbatim, unique, and deleted.
+  const block = mkLeft(
+    ["import x;", "", "function old(a) {", "  return a + 1;", "}", "", "function keep() {", "  return 2;", "}"],
+    ["import x;", "", "function keep() {", "  return 2;", "}"],
+    "/src/block.ts",
+  );
+  const head = anchorFinding(
+    mkFinding({ file: "/src/block.ts", side: "left", quote: "function old(a) {\n  return a * 2;\n}" }),
+    [block],
+  );
+  eq("a drifted left-side block falls back to its first line", head.anchor?.startLine, 3);
+  eq("...still on the left", head.anchor?.side, "left");
+
+  // The bargain the fallback rests on is unchanged: unique AND changed. A first line that
+  // is common stays a guess, and a guess is the one thing this module refuses to make.
+  const common = mkLeft(
+    ["try {", "  a();", "} catch {}", "try {", "  b();", "} catch {}"],
+    ["try {", "  a();", "} catch {}"],
+    "/src/common.ts",
+  );
+  eq(
+    "a non-unique first line is still not evidence",
+    anchorFinding(mkFinding({ file: "/src/common.ts", side: "left", quote: "try {\n  z();\n} catch {}" }), [common]).anchor,
+    undefined,
+  );
 }
 
 // --- URL parsing ---
@@ -1766,7 +1824,7 @@ section("real PR anchoring (seeded-defect range)");
   const seeded: FileDiff[] = SEEDED_FILES.map((f) => {
     const leftLines = splitLines(Buffer.from(f.base, "utf8"));
     const rightLines = splitLines(Buffer.from(f.head, "utf8"));
-    const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
+    const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
     return {
       path: f.path,
       changeType: "edit" as const,
@@ -1774,6 +1832,7 @@ section("real PR anchoring (seeded-defect range)");
       rightLines,
       leftLines,
       changedRightLines,
+      changedLeftLines,
       binary: false,
       truncated: false,
       language: f.language,
@@ -1971,6 +2030,7 @@ section("anchoring: hunk gate uses the whole span");
     path: "/src/span.ts", changeType: "edit", binary: false, truncated: false,
     language: "typescript", rightLines: lines, leftLines: lines.slice(0, 9).concat(["  old();", "}"]),
     changedRightLines: new Set([10]),
+    changedLeftLines: new Set(),
     hunks: [{ leftStart: 4, leftCount: 8, rightStart: 4, rightCount: 8, body: "" }],
   };
   const r = anchorFinding(mkFinding({ file: "/src/span.ts", quote: lines.slice(0, 11).join("\n") }), [f]);
@@ -2158,6 +2218,7 @@ section("tool merges: only a fact-tier tool may raise severity");
   const onChanged: FileDiff = {
     path: "src/a.ts", changeType: "edit", hunks: [], rightLines: [], leftLines: [],
     changedRightLines: new Set([4]), binary: false, truncated: false, language: "typescript",
+    changedLeftLines: new Set(),
   };
   eq(
     "two tight spans on a line this PR changed merge",
@@ -4424,7 +4485,7 @@ section("anchoring: the reshapings a model applies to a quote (recovery, still f
   const seeded: FileDiff[] = SEEDED_FILES.map((f) => {
     const leftLines = splitLines(Buffer.from(f.base, "utf8"));
     const rightLines = splitLines(Buffer.from(f.head, "utf8"));
-    const { hunks, changedRightLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
+    const { hunks, changedRightLines, changedLeftLines } = buildHunks(leftLines, rightLines, diffLines(leftLines, rightLines));
     return {
       path: f.path,
       changeType: "edit" as const,
@@ -4432,6 +4493,7 @@ section("anchoring: the reshapings a model applies to a quote (recovery, still f
       rightLines,
       leftLines,
       changedRightLines,
+      changedLeftLines,
       binary: false,
       truncated: false,
       language: f.language,

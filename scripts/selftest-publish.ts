@@ -83,6 +83,7 @@ try {
     rightLines: Array.from({ length: lines }, (_, i) => `line ${i + 1}`),
     leftLines: [],
     changedRightLines: new Set(Array.from({ length: lines }, (_, i) => i + 1)),
+    changedLeftLines: new Set(),
     binary: false,
     truncated: false,
     language: "typescript",

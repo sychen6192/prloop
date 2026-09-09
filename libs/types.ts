@@ -74,9 +74,14 @@ export interface FileDiff {
   // Raw right-side content split into lines (index 0 = line 1). The anchoring SSOT.
   rightLines: string[];
   leftLines: string[];
-  // Right-side line numbers that this PR added or modified. Findings should land here;
-  // anything outside is likely the model drifting into untouched code.
+  // Line numbers this PR touched, per side: right = added or modified, left = removed.
+  // Findings should land on one of these; anything outside is likely the model drifting
+  // into untouched code. Both sides are carried because anchoring needs the same evidence
+  // whichever side a quote is on — while only the right set reached this type, left-side
+  // quotes got weaker disambiguation and no first-line recovery, purely for want of a field
+  // libs/diff.ts had already computed.
   changedRightLines: Set<number>;
+  changedLeftLines: Set<number>;
   binary: boolean;
   truncated: boolean;
   language: string;

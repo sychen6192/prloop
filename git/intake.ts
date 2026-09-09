@@ -82,7 +82,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       showFile(opts.repo, opts.head, e.path),
       showFile(opts.repo, opts.base, e.path),
     ]);
-    const { hunks, changedRightLines } = buildHunks(
+    const { hunks, changedRightLines, changedLeftLines } = buildHunks(
       leftLines,
       rightLines,
       diffLines(leftLines, rightLines),
@@ -100,6 +100,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       rightLines,
       leftLines,
       changedRightLines,
+      changedLeftLines,
       binary: false,
       truncated: false,
       language: detectLanguage(e.path),

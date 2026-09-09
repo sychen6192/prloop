@@ -8,7 +8,7 @@ import type { ReviewContext } from "../ado/intake";
 
 function mkFile(path: string, rightLines: string[], changed: number[], language: string): FileDiff {
   const leftLines = rightLines.filter((_, i) => !changed.includes(i + 1));
-  const { hunks, changedRightLines } = buildHunks(
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(
     leftLines,
     rightLines,
     diffLines(leftLines, rightLines),
@@ -20,6 +20,7 @@ function mkFile(path: string, rightLines: string[], changed: number[], language:
     rightLines,
     leftLines,
     changedRightLines,
+    changedLeftLines,
     binary: false,
     truncated: false,
     language,
