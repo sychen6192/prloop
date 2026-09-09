@@ -2487,6 +2487,70 @@ section("opencode: a killed or crashed run is a named failure, not an empty answ
   eq("the error event's message is kept for the failure", acc.lastError, "401 unauthorized");
   traceEvent('{"type":"text","part":{"type":"text","text":"{}"}}', "[t]", acc);
   eq("...and text events leave it alone", acc.lastError, "401 unauthorized");
+
+  // Token accounting on this path used to be zeros: the CLI reports usage per step-finish
+  // and traceEvent only logged it, so tokenTotals() and result.json said a run under
+  // PRR_RUNNER=opencode had cost nothing, while libs/payload.ts budgeted the diff against a
+  // ceiling nothing on the path measured.
+  const billed: Acc = { text: "", lastText: "" };
+  eq("no step-finish yet means no claim about usage", billed.inputTokens, undefined);
+  traceEvent('{"type":"step-finish","part":{"type":"step-finish","tokens":{"input":1200,"output":300}}}', "[t]", billed);
+  traceEvent('{"type":"step-finish","part":{"type":"step-finish","tokens":{"input":1500,"output":90}}}', "[t]", billed);
+  eq("every step is billed, so every step is counted", billed.inputTokens, 2700);
+  eq("...output too", billed.outputTokens, 390);
+  traceEvent('{"type":"step-finish","part":{"type":"step-finish","tokens":{"input":"lots"}}}', "[t]", billed);
+  eq("a value that is not a number does not corrupt the total", billed.inputTokens, 2700);
+}
+
+section("opencode runner: a field it cannot honour is named, not dropped");
+{
+  // ChatRequest is a contract. The opencode CLI has no sampling or output-length argument,
+  // so PRR_SKEPTIC_MAX_TOKENS and the requirement axis's temperature: 0 reached this
+  // adapter, were accepted by the type and applied to nothing. The timeout it CAN keep, and
+  // used to ignore: every skeptic call got the 15-minute agent deadline instead of its own.
+  //
+  // A fresh process, pointed at a binary that cannot spawn: config is read at import, and
+  // this must never risk invoking a real opencode on the operator's machine.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-opencode-"));
+  const probe = path.join(dir, "probe.mts");
+  const mod = pathToFileURL(path.join(PRLOOP_ROOT, "models", "opencode.ts")).href;
+  fs.writeFileSync(
+    probe,
+    `import { OpencodeRunner } from ${JSON.stringify(mod)};\n` +
+      `const r = new OpencodeRunner();\n` +
+      `const req = { model: "m", system: "s", user: "u", temperature: 0, maxTokens: 2048, timeoutMs: 1500 };\n` +
+      `await r.chat(req);\n` +
+      `await r.chat({ ...req, schemaName: "second-call" });\n`,
+  );
+  const res = spawnSync(process.execPath, [path.join(PRLOOP_ROOT, "node_modules", "tsx", "dist", "cli.mjs"), probe], {
+    encoding: "utf8",
+    env: { ...process.env, PRR_OPENCODE_BIN: "prloop-no-such-binary", PRR_AGENT_TIMEOUT_MS: "900000" },
+  });
+  const out = `${res.stdout ?? ""}${res.stderr ?? ""}`;
+  check("opencode probe ran", res.status === 0, out.slice(0, 400));
+  eq("temperature is reported as not applied, once", out.split("temperature=0 is not applied").length - 1, 1);
+  eq("maxTokens is reported as not applied, once", out.split("maxTokens=2048 is not applied").length - 1, 1);
+  check("...naming the runner it does not reach", out.includes("on the opencode runner"));
+
+  // ...and the timeout it CAN honour, against a binary that hangs. PRR_AGENT_TIMEOUT_MS is
+  // 900000 here; if req.timeoutMs were still being ignored, this probe would sit for
+  // fifteen minutes instead of naming 1500ms.
+  if (process.platform !== "win32") {
+    const hang = path.join(dir, "hang.sh");
+    fs.writeFileSync(hang, "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
+    const started = Date.now();
+    const t = spawnSync(process.execPath, [path.join(PRLOOP_ROOT, "node_modules", "tsx", "dist", "cli.mjs"), probe], {
+      encoding: "utf8",
+      env: { ...process.env, PRR_OPENCODE_BIN: hang, PRR_AGENT_TIMEOUT_MS: "900000" },
+      timeout: 60_000,
+    });
+    const took = Date.now() - started;
+    const tout = `${t.stdout ?? ""}${t.stderr ?? ""}`;
+    check("the call's own deadline is honoured, not the agent default", tout.includes("timed out after 1500ms"), tout.slice(0, 400));
+    check("...and the agent default is not what fired", !tout.includes("timed out after 900000ms"));
+    check("...so the call returns in seconds, not minutes", took < 40_000, `${took}ms`);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 section("unusable completions are named, not left to the JSON parser");

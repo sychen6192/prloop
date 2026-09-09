@@ -243,17 +243,28 @@ export interface AnchoredFinding extends RawFinding {
 
 // --- Model runner (the interface that keeps the core free of SDK imports) ---
 
+/**
+ * One model call. Two adapters satisfy it — models/runner.ts over HTTP and
+ * models/opencode.ts over a CLI — and what an adapter cannot honour it must SAY, not
+ * quietly drop: the fields below were typed as promises and treated by one adapter as
+ * advisory, so PRR_SKEPTIC_MAX_TOKENS and the requirement axis's temperature: 0 configured
+ * nothing under PRR_RUNNER=opencode while the type said they did.
+ */
 export interface ChatRequest {
   model: string;
   system: string;
   user: string;
-  // JSON Schema; backends that support guided decoding enforce it at the engine layer.
+  // JSON Schema. Enforced at the engine layer by backends with guided decoding; inlined
+  // into the prompt as text everywhere else (models/schemas.ts, inlineSchema).
   schema?: object;
   schemaName?: string;
+  // Honoured by the HTTP runner. The opencode CLI takes no sampling or output-length
+  // arguments, so that adapter warns once per process instead of pretending.
   temperature?: number;
   maxTokens?: number;
-  // Per-call timeout. Defaults to PRR_LLM_TIMEOUT_MS; the skeptic overrides it because
-  // verifying one finding against 25 lines is nothing like reading a whole diff.
+  // Per-call timeout, honoured by both adapters. Defaults to PRR_LLM_TIMEOUT_MS
+  // (PRR_AGENT_TIMEOUT_MS on the opencode path); the skeptic overrides it because verifying
+  // one finding against 25 lines is nothing like reading a whole diff.
   timeoutMs?: number;
 }
 

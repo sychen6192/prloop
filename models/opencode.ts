@@ -30,6 +30,12 @@ import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
 export interface Acc {
   text: string;
   lastText: string;
+  // Token usage, summed over the run's steps. The CLI reports it per step-finish and every
+  // step re-sends the context, so summing is what the provider billed — the same rule
+  // models/runner.ts applies across retry attempts. Without this the opencode path reported
+  // zeros, and a run's token total silently depended on which runner it used.
+  inputTokens?: number;
+  outputTokens?: number;
   // The last in-band error event's message: the CLI's own account of why a run produced
   // nothing (provider auth, rate limit), which its exit code alone does not carry.
   lastError?: string;
@@ -99,6 +105,10 @@ export function traceEvent(line: string, prefix: string, acc: Acc): void {
     if (oneLine) logVerbose(`${prefix} ${oneLine.length > 160 ? `${oneLine.slice(0, 160)}…` : oneLine}`);
   } else if (kind === "step-finish") {
     const tokens = (part["tokens"] ?? {}) as Record<string, unknown>;
+    const add = (v: unknown, was: number | undefined): number | undefined =>
+      typeof v === "number" && Number.isFinite(v) && v >= 0 ? (was ?? 0) + v : was;
+    acc.inputTokens = add(tokens["input"], acc.inputTokens);
+    acc.outputTokens = add(tokens["output"], acc.outputTokens);
     if (tokens["output"] !== undefined) {
       logVerbose(`${prefix} -- step finished (output tokens=${String(tokens["output"])})`);
     }
@@ -142,7 +152,7 @@ export function buildInvocation(
   return args;
 }
 
-async function runOnce(label: string, model: string, prompt: string): Promise<ChatResponse> {
+async function runOnce(label: string, model: string, prompt: string, timeoutMs: number): Promise<ChatResponse> {
   log(`[${label}] opencode session started (model=${model || "(agent default)"})`);
   const stopHeartbeat = startHeartbeat(`[${label}]`);
   const started = Date.now();
@@ -157,7 +167,7 @@ async function runOnce(label: string, model: string, prompt: string): Promise<Ch
   // grandchild holding an inherited pipe from hanging the run, and an idempotent
   // completion. This used to be a second copy of all of it — one that had dropped the
   // output cap — because run() could not write stdin or stream stdout by line. It can now.
-  const res = await run(OPENCODE_BIN, args, AGENT_TIMEOUT_MS, PRLOOP_ROOT, {
+  const res = await run(OPENCODE_BIN, args, timeoutMs, PRLOOP_ROOT, {
     // opencode blocks reading stdin to EOF before it prompts the model.
     stdin: prompt,
     onStdoutLine: (line: string) => {
@@ -170,7 +180,7 @@ async function runOnce(label: string, model: string, prompt: string): Promise<Ch
     // case where a reader needs to know the run is over before the process is.
     onTimeout: () =>
       log(
-        `[${label}] timed out after ${AGENT_TIMEOUT_MS}ms, killing the opencode process tree ` +
+        `[${label}] timed out after ${timeoutMs}ms, killing the opencode process tree ` +
           `(raise PRR_AGENT_TIMEOUT_MS for slower models)`,
       ),
     killEscalationMs: 10_000,
@@ -193,7 +203,7 @@ async function runOnce(label: string, model: string, prompt: string): Promise<Ch
   // arrived, for the artifacts.
   const error = runFailure({
     timedOut: res.timedOut === true,
-    timeoutMs: AGENT_TIMEOUT_MS,
+    timeoutMs,
     code: res.code,
     signal: res.signal ?? null,
     lastError: acc.lastError,
@@ -206,7 +216,21 @@ async function runOnce(label: string, model: string, prompt: string): Promise<Ch
         ? `[${label}] [FAIL] ${error} (elapsed ${secs}s)`
         : `[${label}] done (elapsed ${secs}s, ${text.length} chars)`,
   );
-  return error === undefined ? { text, model } : { text, model, error };
+  const usage = {
+    ...(acc.inputTokens === undefined ? {} : { promptTokens: acc.inputTokens }),
+    ...(acc.outputTokens === undefined ? {} : { completionTokens: acc.outputTokens }),
+  };
+  return error === undefined ? { text, model, ...usage } : { text, model, ...usage, error };
+}
+
+// Said once per process, not per call: a fleet of finders would otherwise print the same
+// line a dozen times a run, and the point is that the operator learns their setting is not
+// reaching the model — once is enough for that.
+const warnedUnsupported = new Set<string>();
+function warnUnsupported(field: string, value: unknown, why: string): void {
+  if (warnedUnsupported.has(field)) return;
+  warnedUnsupported.add(field);
+  log(`[WARN] ${field}=${String(value)} is not applied on the opencode runner: ${why}`);
 }
 
 export class OpencodeRunner implements ModelRunner {
@@ -216,6 +240,21 @@ export class OpencodeRunner implements ModelRunner {
     // discovery", because a loop cannot depend on probabilistic skill loading.
     const prompt = `${req.system}\n\n---\n\n${inlineSchema(req)}`;
     const label = req.schemaName ?? "opencode";
-    return runOnce(label, req.model, prompt);
+
+    // ChatRequest is a contract, and the two fields below are the half of it `opencode run`
+    // has no argument for. Ignoring them silently is what made PRR_SKEPTIC_MAX_TOKENS and
+    // the requirement axis's temperature: 0 configure nothing on this path while the type
+    // said otherwise — the caller sets a field, the type accepts it, and nothing anywhere
+    // says it did not arrive. Naming them is the least this adapter owes.
+    if (req.temperature !== undefined) {
+      warnUnsupported("temperature", req.temperature, "the opencode CLI takes no sampling arguments; it uses the model's own default");
+    }
+    if (req.maxTokens !== undefined) {
+      warnUnsupported("maxTokens", req.maxTokens, "the opencode CLI takes no output-length argument; the agent's own limit applies");
+    }
+    // This one it CAN keep. The skeptic sets it because verifying one finding against 25
+    // lines is nothing like reading a whole diff, and under this runner every such call was
+    // getting the 15-minute agent deadline instead.
+    return runOnce(label, req.model, prompt, req.timeoutMs ?? AGENT_TIMEOUT_MS);
   }
 }
