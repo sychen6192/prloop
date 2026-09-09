@@ -577,6 +577,27 @@ section("model output parsing (fail-closed)");
   check("valid JSON survives the repair unchanged", escapeControlCharsInStrings('{"a":"b\\n","c":[1,2]}') === '{"a":"b\\n","c":[1,2]}');
 }
 {
+  // The first bracket in a reply is very often not the answer. Both of these failed a whole
+  // stage on one real run: the requirement prompt numbers its criteria "[4711-AC1]", and a
+  // skeptic quoted the regex "[a-zA-Z]" while explaining a refutation — each in a sentence
+  // BEFORE the JSON, each extracted and parsed instead of it.
+  const withId = parseJsonObject<{ criteria: unknown[] }>(
+    'Looking at [4711-AC1], the diff implements it.\n{"criteria":[{"criterionId":"4711-AC1"}],"extras":[]}',
+  );
+  check("a bracketed id in a preamble does not shadow the object", withId.ok, withId.ok ? "" : withId.error);
+  const withRegex = parseJsonObject<{ verdict: string }>(
+    'The pattern [a-zA-Z]+ already guards it.\n{"verdict":"refuted","reason":"x"}',
+  );
+  check("a quoted regex in a preamble does not either", withRegex.ok && withRegex.value.verdict === "refuted");
+  // A genuine top-level array still parses, and prose brackets before it do not win.
+  const arr = parseJsonObject<number[]>("see [note] below\n[1,2,3]");
+  check("a real top-level array is still found", arr.ok && Array.isArray(arr.value) && arr.value.length === 3);
+  // Nothing parseable anywhere still fails, and reports a parse error rather than a silence.
+  const none = parseJsonObject("[a] [b] [c] no json here");
+  check("still fails when no candidate parses", !none.ok);
+}
+
+{
   const r = parseJsonObject("not JSON at all");
   check("non-JSON -> failure, not a throw", !r.ok);
 }
