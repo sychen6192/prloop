@@ -3761,6 +3761,35 @@ section("static-tool subprocesses: the timeout kills the tree, not just the chil
   const missing = await run("prloop-no-such-binary", [], 10_000);
   check("a command that does not exist is still a failure", missing.code !== 0);
   check("...and now says which failure it was", missing.stderr.includes("not found"));
+  // "never started" and "ran and exited non-zero" are different failures with different
+  // fixes, and only the first is worth telling someone to install something about.
+  check("...flagged as never having started", missing.spawnFailed === true);
+  check("a tool that ran and failed is not a spawn failure", nonZero.spawnFailed === undefined);
+
+  // The two parameters models/opencode.ts had to fork run() to get. Without them it carried
+  // its own copy of the kill escalation, the drain and the idempotent completion — minus
+  // the output cap, which the copy had quietly dropped.
+  const echoed = await run(
+    process.execPath,
+    ["-e", "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write('got:'+s))"],
+    10_000,
+    undefined,
+    { stdin: "a prompt\nover two lines" },
+  );
+  eq("stdin is written and closed", echoed.stdout, "got:a prompt\nover two lines");
+
+  const lines: string[] = [];
+  const errLines: string[] = [];
+  const streamed = await run(
+    process.execPath,
+    ["-e", "process.stdout.write('one\\ntwo\\nthree');process.stderr.write('warn\\n')"],
+    10_000,
+    undefined,
+    { onStdoutLine: (l) => lines.push(l), onStderrLine: (l) => errLines.push(l) },
+  );
+  eq("stdout arrives line by line, trailing partial included", lines, ["one", "two", "three"]);
+  eq("...and stderr too", errLines, ["warn"]);
+  eq("...while the whole buffer is still returned", streamed.stdout, "one\ntwo\nthree");
 
   if (process.platform !== "win32") {
     // The regression. Every TypeScript-profile tool is `npx <tool>`, which execs the real

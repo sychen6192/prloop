@@ -7,21 +7,15 @@
 // One consequence is load-bearing and must not be forgotten: **opencode does not pass
 // `response_format` through to the engine**, so guided decoding (vLLM/xgrammar) is not
 // available on this path. Schema conformity drops from "enforced at the token layer" to
-// "asked for in the prompt". We compensate by injecting the schema as text and retrying
-// once on a parse failure — but a weak model will still comply less reliably here than on
-// the openai path. Prefer the openai runner when the endpoint supports guided decoding.
-import { spawn } from "node:child_process";
-import {
-  DETACH_CHILDREN,
-  explainSpawnError,
-  killTree,
-  planSpawn,
-  scrubbedEnv,
-  trackForShutdown,
-} from "../libs/shell";
-
-// After the child exits, how long to wait for its stdio pipes to close before finishing anyway.
-const EXIT_DRAIN_MS = 2_000;
+// "asked for in the prompt". We compensate by injecting the schema as text (schemas.ts,
+// inlineSchema) — and by nothing else: a parse failure is NOT retried, here or anywhere.
+// models/runner.ts wraps this runner in withRetries like any other, but
+// isTransientModelError returns false for parse-shaped failures on purpose, because asking
+// the same model the same question again is not a fix for an answer it was capable of
+// giving wrongly. So a weak model complies less reliably here than on the openai path, and
+// a non-conforming answer costs the whole call. Prefer the openai runner when the endpoint
+// supports guided decoding.
+import { run } from "../libs/shell";
 import {
   AGENT_TIMEOUT_MS,
   OPENCODE_AGENT,
@@ -148,163 +142,71 @@ export function buildInvocation(
   return args;
 }
 
-function runOnce(label: string, model: string, prompt: string): Promise<ChatResponse> {
-  return new Promise((resolve) => {
-    log(`[${label}] opencode session started (model=${model || "(agent default)"})`);
-    const stopHeartbeat = startHeartbeat(`[${label}]`);
-    const started = Date.now();
+async function runOnce(label: string, model: string, prompt: string): Promise<ChatResponse> {
+  log(`[${label}] opencode session started (model=${model || "(agent default)"})`);
+  const stopHeartbeat = startHeartbeat(`[${label}]`);
+  const started = Date.now();
 
-    const args = buildInvocation(model, {
-      jsonEvents: OPENCODE_JSON_EVENTS,
-      agent: OPENCODE_AGENT,
-    });
-    logVerbose(`[${label}] prompt (${prompt.length} chars) passed via stdin`);
+  const args = buildInvocation(model, { jsonEvents: OPENCODE_JSON_EVENTS, agent: OPENCODE_AGENT });
+  logVerbose(`[${label}] prompt (${prompt.length} chars) passed via stdin`);
 
-    // Windows also needs the command resolved through PATHEXT, and .cmd shims routed via
-    // cmd.exe — Node refuses to spawn them directly since the CVE-2024-27980 fix.
-    const plan = planSpawn(OPENCODE_BIN, args);
-    if (plan.error) {
-      log(`[${label}] [FAIL] ${plan.error}`);
-      stopHeartbeat();
-      resolve({ text: "", model, error: plan.error });
-      return;
-    }
-
-    // The prompt carries the reviewed diff — text the PR author controls — and an agent
-    // with tools acts on what it reads. prloop's ADO token and LLM key have no business in
-    // a third-party CLI's environment, and neither does any other credential-shaped
-    // variable: the same deny-list the static tools get (libs/shell.ts). opencode's own
-    // provider auth lives in its auth store, not in the environment it inherits here.
-    const child = spawn(plan.file, plan.args, {
-      cwd: PRLOOP_ROOT,
-      env: scrubbedEnv(),
-      windowsVerbatimArguments: plan.windowsVerbatimArguments,
-      stdio: ["pipe", "pipe", "pipe"],
-      // POSIX only: makes the child a process-group leader so a timeout can kill the whole
-      // tree, not just the process we happen to hold. See libs/shell.ts.
-      detached: DETACH_CHILDREN,
-    });
-    trackForShutdown(child);
-
-    // opencode blocks on reading stdin to EOF before it prompts the model, so this has to be
-    // written and closed unconditionally — a piped-but-never-closed stdin hangs the run.
-    // EPIPE is expected if the child dies first (bad flag, missing auth); the close handler
-    // reports that, so swallow it here rather than let it surface as an unhandled error.
-    child.stdin.on("error", () => {});
-    child.stdin.end(prompt, "utf8");
-
-    const acc: Acc = { text: "", lastText: "" };
-    let rawStdout = "";
-    let stdoutBuf = "";
-    let spawnError: string | undefined;
-
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      rawStdout += chunk;
-      stdoutBuf += chunk;
-      const lines = stdoutBuf.split("\n");
-      stdoutBuf = lines.pop() ?? ""; // keep the partial line for the next chunk
-      for (const line of lines) if (line.trim()) traceEvent(line, `[${label}]`, acc);
-    });
-
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      for (const line of chunk.trim().split("\n")) if (line.trim()) logVerbose(`[${label}] ${line}`);
-    });
-
-    // Timeout: kill the whole process tree. The old code signalled only the process we
-    // spawned, which on Windows is the cmd.exe wrapper rather than opencode itself.
-    let timedOut = false;
-    let killEscalation: ReturnType<typeof setTimeout> | undefined;
-    const timer = setTimeout(() => {
-      timedOut = true;
+  const acc: Acc = { text: "", lastText: "" };
+  // libs/shell.ts owns the whole child-process failure taxonomy: PATHEXT and .cmd routing
+  // through planSpawn, the credential-scrubbed environment, the detached group leader, the
+  // 8 MB output cap, SIGTERM → SIGKILL escalation, the exit/close drain that stops a
+  // grandchild holding an inherited pipe from hanging the run, and an idempotent
+  // completion. This used to be a second copy of all of it — one that had dropped the
+  // output cap — because run() could not write stdin or stream stdout by line. It can now.
+  const res = await run(OPENCODE_BIN, args, AGENT_TIMEOUT_MS, PRLOOP_ROOT, {
+    // opencode blocks reading stdin to EOF before it prompts the model.
+    stdin: prompt,
+    onStdoutLine: (line: string) => {
+      if (line.trim()) traceEvent(line, `[${label}]`, acc);
+    },
+    onStderrLine: (line: string) => {
+      if (line.trim()) logVerbose(`[${label}] ${line}`);
+    },
+    // Said when it happens, not at the end: a fifteen-minute agent deadline is exactly the
+    // case where a reader needs to know the run is over before the process is.
+    onTimeout: () =>
       log(
         `[${label}] timed out after ${AGENT_TIMEOUT_MS}ms, killing the opencode process tree ` +
           `(raise PRR_AGENT_TIMEOUT_MS for slower models)`,
-      );
-      killTree(child, "SIGTERM");
-      // Only POSIX has anything to escalate to: on Windows taskkill /F was already a hard
-      // kill, and repeating it would just log a second failure against a dead pid.
-      if (DETACH_CHILDREN) {
-        killEscalation = setTimeout(() => {
-          logVerbose(`[${label}] process tree still alive, sending SIGKILL`);
-          killTree(child, "SIGKILL");
-        }, 10_000);
-      }
-    }, AGENT_TIMEOUT_MS);
-
-    // How the child ended, for the failure message. Recorded from whichever of 'exit' and
-    // 'close' fires first; both carry the same pair.
-    let exitCode: number | null = null;
-    let exitSignal: NodeJS.Signals | null = null;
-    const recordExit = (code: number | null, signal: NodeJS.Signals | null) => {
-      exitCode = code;
-      exitSignal = signal;
-    };
-
-    let finished = false;
-    let drainTimer: ReturnType<typeof setTimeout> | undefined;
-    const finish = () => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      if (killEscalation) clearTimeout(killEscalation);
-      if (drainTimer) clearTimeout(drainTimer);
-      stopHeartbeat();
-      if (stdoutBuf.trim()) traceEvent(stdoutBuf, `[${label}]`, acc); // flush partial line
-
-      const secs = Math.round((Date.now() - started) / 1000);
-      const text = OPENCODE_JSON_EVENTS ? (acc.text.trim() ? acc.text : acc.lastText) : rawStdout;
-      if (spawnError) {
-        resolve({ text: "", model, error: spawnError });
-        return;
-      }
-      // A killed or crashed run is not a completed one: it resolves WITH an error (so the
-      // transient retry can fire and the stage is reported as failed) and still hands back
-      // what arrived, for the artifacts.
-      const error = runFailure({
-        timedOut,
-        timeoutMs: AGENT_TIMEOUT_MS,
-        code: exitCode,
-        signal: exitSignal,
-        lastError: acc.lastError,
-        text,
-      });
-      log(
-        timedOut
-          ? `[${label}] timed out (elapsed ${secs}s, ${text.length} chars kept)`
-          : error
-            ? `[${label}] [FAIL] ${error} (elapsed ${secs}s)`
-            : `[${label}] done (elapsed ${secs}s, ${text.length} chars)`,
-      );
-      resolve(error === undefined ? { text, model } : { text, model, error });
-    };
-
-    // 'close' waits for the stdio pipes to close as well as for the process to exit, so any
-    // survivor holding an inherited pipe keeps it from ever firing — that is what turned a
-    // Windows timeout into a permanent hang. 'exit' always fires; let the pipes drain briefly,
-    // then finish regardless. finish() is idempotent, so the usual ordering ('close' first,
-    // promptly) is unaffected.
-    child.on("exit", (code, signal) => {
-      recordExit(code, signal);
-      drainTimer = setTimeout(() => {
-        logVerbose(`[${label}] process exited but its output pipes are still open; not waiting`);
-        finish();
-      }, EXIT_DRAIN_MS);
-    });
-    child.on("close", (code, signal) => {
-      recordExit(code, signal);
-      finish();
-    });
-    child.on("error", (err) => {
-      // The old message blamed a missing install for every errno, which is wrong for the
-      // two failures that actually bite on Windows (EINVAL on a .cmd, and an oversized
-      // command line) and sends people to reinstall a CLI that is already there.
-      spawnError = `${explainSpawnError(err, OPENCODE_BIN)} — install the opencode CLI, or set PRR_OPENCODE_BIN`;
-      logVerbose(`[${label}] ${spawnError}`);
-      finish();
-    });
+      ),
+    killEscalationMs: 10_000,
   });
+  stopHeartbeat();
+
+  const secs = Math.round((Date.now() - started) / 1000);
+  if (res.spawnFailed) {
+    // The old message blamed a missing install for every errno, which is wrong for the two
+    // failures that actually bite on Windows (EINVAL on a .cmd, and an oversized command
+    // line) and sends people to reinstall a CLI that is already there.
+    const spawnError = `${res.stderr.trim()} — install the opencode CLI, or set PRR_OPENCODE_BIN`;
+    log(`[${label}] [FAIL] ${spawnError}`);
+    return { text: "", model, error: spawnError };
+  }
+
+  const text = OPENCODE_JSON_EVENTS ? (acc.text.trim() ? acc.text : acc.lastText) : res.stdout;
+  // A killed or crashed run is not a completed one: it resolves WITH an error (so the
+  // transient retry can fire and the stage is reported as failed) and still hands back what
+  // arrived, for the artifacts.
+  const error = runFailure({
+    timedOut: res.timedOut === true,
+    timeoutMs: AGENT_TIMEOUT_MS,
+    code: res.code,
+    signal: res.signal ?? null,
+    lastError: acc.lastError,
+    text,
+  });
+  log(
+    res.timedOut
+      ? `[${label}] timed out (elapsed ${secs}s, ${text.length} chars kept)`
+      : error
+        ? `[${label}] [FAIL] ${error} (elapsed ${secs}s)`
+        : `[${label}] done (elapsed ${secs}s, ${text.length} chars)`,
+  );
+  return error === undefined ? { text, model } : { text, model, error };
 }
 
 export class OpencodeRunner implements ModelRunner {
