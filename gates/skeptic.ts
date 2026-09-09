@@ -15,10 +15,11 @@ import {
   SKEPTIC_TIMEOUT_MS,
   severityRank,
 } from "../config";
+import type { FileIndex } from "../libs/fileindex";
 import { parseJsonObject } from "../libs/json";
 import { log, logVerbose } from "../libs/log";
 import { SEVERITIES, type Severity } from "../config";
-import { SKEPTIC_VERDICTS, type AnchoredFinding, type FileDiff, type ModelRunner, type SkepticVerdictKind } from "../libs/types";
+import { SKEPTIC_VERDICTS, type AnchoredFinding, type ModelRunner, type SkepticVerdictKind } from "../libs/types";
 import { VERDICT_SCHEMA } from "../models/schemas";
 import { SKEPTIC_SYSTEM, buildSkepticPrompt } from "../prompts/skeptic";
 
@@ -249,7 +250,7 @@ export interface SkepticOptions {
 export async function runSkeptic(
   runner: ModelRunner,
   findings: AnchoredFinding[],
-  files: FileDiff[],
+  index: FileIndex,
   opts: SkepticOptions = {},
 ): Promise<SkepticOutcome[]> {
   const configured = opts.models ?? SKEPTIC_MODELS;
@@ -304,7 +305,12 @@ export async function runSkeptic(
   }
 
   const jobs: Array<Promise<SkepticOutcome>> = toVerify.map(async (finding) => {
-    const file = files.find((f) => f.path === finding.file);
+    // Exact lookup, not a scan: anchorAndDedupe re-keyed finding.file onto the resolved
+    // FileDiff.path before this stage, so the one resolver CONTEXT.md names is the whole
+    // answer here. The linear files.find this replaced returned verdicts: [] on a miss —
+    // which finalize reads as "not cleared", and deadSkeptics (verdicts.length > 0) cannot
+    // see, so a path mismatch turned an inline comment into a summary line in silence.
+    const file = index.exact(finding.file);
     if (!file || !finding.anchor) return { finding, verdicts: [], killed: false };
 
     const { prompt, snippet } = buildSkepticPrompt({

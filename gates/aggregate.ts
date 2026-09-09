@@ -269,12 +269,15 @@ export function mergeToolFindings(
   survivors: AnchoredFinding[],
   tools: AnchoredFinding[],
   // For the agreement check's changed-lines rule; tool findings sit on the diff's own paths.
-  index?: FileIndex,
+  // Required, not optional: without it findingsAgree's changed-lines clause silently cannot
+  // fire, so whether a tool finding merges or stands alone depended on whether a caller
+  // remembered to pass an argument.
+  index: FileIndex,
 ): AnchoredFinding[] {
   const out = [...survivors];
   for (const t of tools) {
     const hit = out.find((m) => sameIssue(m, t));
-    if (hit && findingsAgree(hit, t, index?.exact(hit.file)?.changedRightLines)) {
+    if (hit && findingsAgree(hit, t, index.exact(hit.file)?.changedRightLines)) {
       mergeInto(hit, t, true);
       // A tool's sighting counts as an active clearing, like it does standalone.
       hit.skepticVerdicts = Math.max(hit.skepticVerdicts ?? 0, t.skepticVerdicts ?? 0);

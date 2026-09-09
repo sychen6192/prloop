@@ -268,7 +268,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // over-report; this is the stage that does the killing. A skeptic stage that throws must
   // degrade to "nothing verified" (recorded as incomplete below), not abort a run that has
   // already paid for its finder calls.
-  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.files).catch(
+  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.fileIndex).catch(
     (e): import("./gates/skeptic").SkepticOutcome[] => {
       stageFailures.push(`skeptic stage (${e instanceof Error ? e.message : String(e)})`);
       return freshCandidates.map((f) => ({ finding: f, verdicts: [], killed: false }));

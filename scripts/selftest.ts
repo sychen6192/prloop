@@ -2130,12 +2130,12 @@ section("tool merges: only a fact-tier tool may raise severity");
 
   // The skeptic just argued this finding down to low; eslint rating an error-level rule
   // "high" is policy, not evidence, and must not undo that.
-  const triage = mergeToolFindings([model()], [tool("triage")]);
+  const triage = mergeToolFindings([model()], [tool("triage")], new FileIndex([]));
   eq("an agreeing triage-tier tool merges", triage.length, 1);
   eq("...corroborates", triage[0]?.sources, ["m1", "eslint"]);
   eq("...but cannot re-escalate", triage[0]?.severity, "low");
 
-  const fact = mergeToolFindings([model()], [tool("fact")]);
+  const fact = mergeToolFindings([model()], [tool("fact")], new FileIndex([]));
   eq("a fact-tier tool raises", fact[0]?.severity, "high");
 
   // A tool that overlaps with a different message saw a different problem: it stays a
@@ -2143,10 +2143,32 @@ section("tool merges: only a fact-tier tool may raise severity");
   const other = mergeToolFindings(
     [{ ...model(), quote: "x();\ny();", claim: "loop never terminates", anchor: { ...line1, endLine: 2 }, skepticVerdicts: 0 }],
     [tool("fact", { claim: "Argument of type 'string' is not assignable to parameter of type 'number'" })],
+    new FileIndex([]),
   );
   eq("a disagreeing tool finding is kept separately", other.length, 2);
   eq("...and the model finding stays single-source", other[0]?.sources, ["m1"]);
   eq("...uncleared by the tool's sighting", other[0]?.skepticVerdicts, 0);
+
+  // The index is a required argument, not an optional one. findingsAgree's changed-lines
+  // rule is the only thing that merges two tight spans whose quotes and claims differ, and
+  // it reads changedRightLines out of the index — so when the index was optional, whether
+  // these two became one comment or two depended on whether the caller passed it.
+  const spanA = { ...model(), quote: "a();", claim: "one thing", anchor: { ...line1, startLine: 4, endLine: 4 } };
+  const spanB = { ...tool("fact"), quote: "b();", claim: "another matter", anchor: { ...line1, startLine: 4, endLine: 4 } };
+  const onChanged: FileDiff = {
+    path: "src/a.ts", changeType: "edit", hunks: [], rightLines: [], leftLines: [],
+    changedRightLines: new Set([4]), binary: false, truncated: false, language: "typescript",
+  };
+  eq(
+    "two tight spans on a line this PR changed merge",
+    mergeToolFindings([spanA], [spanB], new FileIndex([onChanged])).length,
+    1,
+  );
+  eq(
+    "...and stay separate when the line is untouched",
+    mergeToolFindings([spanA], [spanB], new FileIndex([{ ...onChanged, changedRightLines: new Set([9]) }])).length,
+    2,
+  );
 }
 
 section("strict-mode schema invariant");
@@ -3983,7 +4005,7 @@ section("skeptic votes: only refuted kills, only holds clears, a tie does neithe
     chat: async (req: ChatRequest) => ({ model: req.model, text: byModel[req.model] ?? "" }),
   });
   const verify = async (byModel: Record<string, string>, findings = [finding()]) =>
-    runSkeptic(scripted(byModel), findings, [file], {
+    runSkeptic(scripted(byModel), findings, new FileIndex([file]), {
       models: Object.keys(byModel),
       rounds: Object.keys(byModel).length,
       finders: ["finder-a"],
@@ -4033,7 +4055,7 @@ section("skeptic votes: only refuted kills, only holds clears, a tie does neithe
   await runSkeptic(
     { chat: async (req: ChatRequest) => (prompts.push(req.user), { model: req.model, text: HOLDS }) },
     [finding()],
-    [file],
+    new FileIndex([file]),
     { models: ["alpha"], rounds: 1, finders: ["finder-a"] },
   );
   check("the skeptic is shown the hunk, both sides", (prompts[0] ?? "").includes("both sides of this hunk"));
@@ -4060,7 +4082,7 @@ section("skeptic rounds: a model may not vote twice");
   const out = await runSkeptic(
     { chat: async (req: ChatRequest) => ({ model: req.model, text: '{"verdict":"holds","reason":"","confidence":0.7}' }) },
     [f("f1"), f("f2")],
-    [file],
+    new FileIndex([file]),
     { models: ["alpha", "beta"], rounds: 3, finders: ["finder-a"] },
   );
   detachLogSink();
@@ -4098,7 +4120,7 @@ section("model families: same-family verification is weak verification");
   const out = await runSkeptic(
     { chat: async (req: ChatRequest) => ({ model: req.model, text: '{"verdict":"holds","reason":"","confidence":0.7}' }) },
     [finding],
-    [file],
+    new FileIndex([file]),
     { models: ["qwen2.5-coder"], rounds: 1, finders: ["qwen3-coder"] },
   );
   detachLogSink();
