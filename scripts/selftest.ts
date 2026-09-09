@@ -1,7 +1,7 @@
 // Offline self-test. Anchoring is the piece that decides whether comments land on the right
 // line, so it gets the most coverage here — these assertions are the regression net for the
 // class of bug that motivated the whole project.
-import { splitLines } from "../ado/blobs";
+import { splitLines } from "../libs/text";
 import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
@@ -3558,7 +3558,7 @@ section("config SSOT: registry, readers, .env.example and the README settings ta
     [],
   );
 
-  // 2. Documented in both places, or in neither (CLAUDE.md's rule; the drift it caught the
+  // 2. Documented in both places, or in neither (ARCHITECTURE.md's rule; the drift it caught the
   //    first time it ran was 21 knobs missing from .env.example and 43 from the README).
   const documented = KNOWN_KEYS.filter((k) => !k.internal).map((k) => k.name);
   const declared = new Set<string>();

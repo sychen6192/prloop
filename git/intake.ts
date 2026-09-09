@@ -7,7 +7,7 @@
 import { FileIndex } from "../libs/fileindex";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildHunks, diffLines } from "../libs/diff";
-import { splitLines } from "../ado/blobs";
+import { splitLines } from "../libs/text";
 import { log, logVerbose } from "../libs/log";
 import { run } from "../libs/shell";
 import type { ChangeType, FileDiff, PrInfo } from "../libs/types";

@@ -22,7 +22,7 @@ import {
   severityRank,
   type Severity,
 } from "../config";
-import { splitLines } from "../ado/blobs";
+import { splitLines } from "../libs/text";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { arrayField, parseJsonObject } from "../libs/json";
 import { log, logVerbose } from "../libs/log";

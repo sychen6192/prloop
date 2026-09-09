@@ -4,6 +4,7 @@
 // every line number after the first CRLF difference.
 import { AdoTooLargeError, adoGetBytes, repoBase } from "./client";
 import { MAX_FILE_BYTES } from "../config";
+import { splitLines } from "../libs/text";
 import type { PrRef } from "../libs/types";
 
 export interface BlobContent {
@@ -20,21 +21,6 @@ function looksBinary(buf: Buffer): boolean {
   const n = Math.min(buf.length, 8000);
   for (let i = 0; i < n; i++) if (buf[i] === 0) return true;
   return false;
-}
-
-/**
- * Splits raw bytes into lines the way a diff viewer counts them.
- * - Keeps a trailing \r on the line content (CRLF files stay byte-faithful).
- * - Strips a leading UTF-8 BOM, which would otherwise corrupt column offsets on line 1.
- * - A trailing newline does NOT create a phantom final line.
- */
-export function splitLines(buf: Buffer): string[] {
-  let text = buf.toString("utf8");
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  if (text === "") return [];
-  const lines = text.split("\n");
-  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  return lines;
 }
 
 export async function getBlob(ref: PrRef, objectId: string | undefined): Promise<BlobContent> {
