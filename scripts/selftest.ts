@@ -1370,6 +1370,50 @@ section("broken toolchain detection");
   check("the TS2792 wording of cannot-find-module also trips", vWhy !== undefined);
   check("...taking the genuine type error down with it", vWhy!.includes("all 2"));
 
+  // mypy is fact-tier too and had no guard at all, so a checkout whose dependencies were
+  // never installed produced one inline comment per third-party import — about the
+  // reviewer's environment, posted with no model in the loop to catch it.
+  const py = PROFILES.find((p) => p.language === "python")!;
+  const mypy = py.tools.find((t) => t.name === "mypy")!;
+  const mypyOut = [
+    '{"file":"app/main.py","line":3,"column":1,"severity":"error","message":"Cannot find implementation or library stub for module named fastapi","code":"import-not-found"}',
+    '{"file":"app/main.py","line":41,"column":9,"severity":"error","message":"Argument 1 to send has incompatible type str; expected int","code":"arg-type"}',
+  ].join("\n");
+  const mypyParsed = parseToolOutput(mypyOut, mypy, "/w");
+  eq("both mypy lines parse", mypyParsed.length, 2);
+  const mypyWhy = environmentFailure(mypy, mypyParsed, "app");
+  check("an uninstalled python checkout is detected", mypyWhy !== undefined);
+  check("...naming the code", mypyWhy!.includes("import-not-found"));
+  check("...and discarding the whole run", mypyWhy!.includes("all 2"));
+
+  // Matched on the message too: mypy 1.5 split `import` into subcodes, so which code a
+  // given version attaches is not something a rule list can predict.
+  const stubs = parseToolOutput(
+    '{"file":"a.py","line":1,"column":1,"severity":"error","message":"Library stubs not installed for requests","code":"import"}',
+    mypy,
+    "/w",
+  );
+  check("the stubs-not-installed wording trips too", environmentFailure(mypy, stubs, "app") !== undefined);
+
+  // NOT import-untyped: that means the dependency IS installed and simply ships no types, a
+  // real project condition. Discarding on it would suppress genuine type errors in every
+  // project with one untyped dependency.
+  const untyped = parseToolOutput(
+    '{"file":"a.py","line":1,"column":1,"severity":"error","message":"Skipping analyzing yaml: module is installed, but missing library stubs or py.typed marker","code":"import-untyped"}',
+    mypy,
+    "/w",
+  );
+  eq(
+    "an installed-but-unstubbed dependency is not a broken toolchain",
+    environmentFailure(mypy, untyped, "app"),
+    undefined,
+  );
+  eq(
+    "a clean mypy run is left alone",
+    environmentFailure(mypy, mypyParsed.filter((f) => f.ruleId === "arg-type"), "app"),
+    undefined,
+  );
+
   // The message backstop has to survive a code the list has never seen.
   const unlisted = parseToolOutput(
     `tests/a.ts(1,1): error TS9999: Cannot find module 'x' or its corresponding type declarations.`,

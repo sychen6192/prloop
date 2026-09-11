@@ -24,6 +24,24 @@ const python: Profile = {
       format: "mypy-json",
       tier: "fact",
       allowNonZeroExit: true,
+      // The same guard tsc has, and for the same reason: run against a checkout whose
+      // dependencies were never installed, mypy reports one of these per third-party import
+      // and then every type that came from those modules degrades to Any or to an error.
+      // This tier is posted inline with no model in the loop, so without this the PR gets a
+      // wall of fact-tier comments about the reviewer's environment.
+      //
+      // Deliberately NOT import-untyped ("module is installed, but missing library stubs").
+      // That one means the dependency IS there and simply ships no types — a real and
+      // common project condition, not a broken checkout. Discarding the run on it would
+      // suppress genuine type errors in every project that has one untyped dependency.
+      environmentRules: [
+        "import-not-found", // Cannot find implementation or library stub for module named 'x'
+        "import", // the umbrella code older mypy emits for the same failure
+      ],
+      // Which specific code a given mypy version attaches is not something a rule list can
+      // predict — mypy 1.5 split `import` into subcodes — so match the message family too.
+      environmentMessages:
+        /^(Cannot find implementation or library stub|Library stubs not installed|Source file found twice under different module names)/,
     },
     {
       // Bandit is the high-recall/high-FP member of the set — exactly the profile that
