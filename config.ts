@@ -103,6 +103,9 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_REQUIRE_CORROBORATION", kind: "bool", section: S_SKEPTIC, description: "0 = publish single-source unverified findings" },
 
   { name: "PRR_WORKDIR", kind: "string", section: S_STATIC, description: "checkout of the PR source branch; unset = gate skips" },
+  { name: "PRR_WORKTREE_REPO", kind: "string", section: S_STATIC, description: "clone to cut a throwaway worktree from" },
+  { name: "PRR_WORKTREE_SETUP_CMD", kind: "string", section: S_STATIC, description: "install command run in a fresh worktree" },
+  { name: "PRR_WORKTREE_SETUP_TIMEOUT_MS", kind: "number", section: S_STATIC, description: "deadline for the worktree install command" },
   { name: "PRR_SKIP_STATIC", kind: "bool", section: S_STATIC, description: "1 = skip static analysis entirely" },
   { name: "PRR_STATIC_TIMEOUT_MS", kind: "number", section: S_STATIC, description: "deadline for one linter invocation" },
   { name: "PRR_TRIAGE_MODEL", kind: "string", section: S_STATIC, description: "judges high-FP tools; unset = those are dropped" },
@@ -825,6 +828,34 @@ export const REQUIRE_CORROBORATION = switchEnv("PRR_REQUIRE_CORROBORATION");
 // A checkout of the PR's source branch. Linters need files on disk; without this the
 // static gate skips. In an Azure pipeline this is the agent's own checkout.
 export const WORKDIR = strEnv("PRR_WORKDIR", "");
+
+/**
+ * A clone of the reviewed repository. Set it and prloop cuts its own throwaway worktree,
+ * detached at the iteration's sourceRefCommit, instead of asking for PRR_WORKDIR.
+ *
+ * This exists because the manual alternative is wrong more often than it looks: pulling and
+ * checking out a branch by name lands on whatever the branch points at NOW, which is not the
+ * iteration under review the moment the author pushes again. The static gate compares every
+ * file against the iteration's bytes and skips the ones that differ (staleFiles), so a
+ * checkout one commit ahead does not fail — it silently analyses less.
+ *
+ * A worktree rather than a checkout: it leaves the clone's own working copy alone, several
+ * can exist at once (one PR list, reviewed in parallel), and it is pinned to a commit rather
+ * than tracking a branch.
+ */
+export const WORKTREE_REPO = strEnv("PRR_WORKTREE_REPO", "");
+
+/**
+ * Run once inside a fresh worktree, before any linter. A worktree has no node_modules and no
+ * venv, and the fact-tier tools (tsc, mypy) report one error per unresolvable import when
+ * dependencies are missing — the failure their environmentRules exist to catch. Unset means
+ * the tools run against an uninstalled tree, which for those two means their whole run is
+ * discarded with that reason named.
+ */
+export const WORKTREE_SETUP_CMD = strEnv("PRR_WORKTREE_SETUP_CMD", "");
+// An install has no business being unbounded: the case this whole feature is for is a cron
+// reviewing a PR list, where one wedged `npm ci` would hold the queue until someone noticed.
+export const WORKTREE_SETUP_TIMEOUT_MS = numEnv("PRR_WORKTREE_SETUP_TIMEOUT_MS", 10 * 60 * 1000, 1000);
 export const SKIP_STATIC = flagEnv("PRR_SKIP_STATIC");
 export const STATIC_TIMEOUT_MS = numEnv("PRR_STATIC_TIMEOUT_MS", 5 * 60 * 1000, 1000);
 // Model that judges high-false-positive tool findings. Unset = those findings are dropped

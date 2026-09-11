@@ -221,6 +221,37 @@ found it never ran) · `1` fatal.
 `--since auto` reads the last reviewed iteration back out of prloop's own summary comment —
 state lives on the PR, so a pipeline agent, your laptop and a cron box need no shared disk.
 
+### Unattended, over a list of PRs
+
+Static analysis needs the code on disk. Point `PRR_WORKTREE_REPO` at a clone and prloop cuts
+its own throwaway git worktree, detached at the iteration's own commit, then removes it:
+
+```bash
+git clone <repo> /repos/myrepo          # once
+
+PRR_WORKTREE_REPO=/repos/myrepo
+PRR_WORKTREE_SETUP_CMD='npm ci'         # a worktree has no node_modules and no venv
+```
+
+Then the whole daily job is a loop, with no checkout to manage and nothing to edit per PR:
+
+```bash
+while read -r url; do prloop "$url" --since auto || true; done < prs.txt
+```
+
+Prefer this to `PRR_WORKDIR` for anything unattended. `git checkout <branch>` lands on
+whatever the branch points at **now**, which stops being the iteration under review the
+moment the author pushes again — and a file whose content no longer matches is *skipped, not
+analysed*, so a stale checkout quietly reviews less and says so in one warning line. A
+worktree pinned to the commit cannot drift, leaves your own working copy alone, and several
+can exist at once.
+
+`PRR_WORKTREE_SETUP_CMD` matters more than it looks: `mypy` and `tsc` are fact-tier, posted
+inline with no model in the loop, and against an uninstalled tree they report one error per
+unresolvable import. Both name that case and discard their whole run rather than publish it
+(see `environmentRules` in `profiles/index.ts`), so the failure is loud rather than wrong —
+but you lose the tool. A failing setup command is a warning, never a failed review.
+
 Without ADO credentials at all, review two git branches through the identical diff and
 anchoring path:
 
@@ -291,6 +322,9 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_REQUIRE_CORROBORATION` | `1` | `0` publishes unverified single-source findings |
 | `PRR_STRICT_COVERAGE` | `1` | files the finder never saw (over `PRR_MAX_DIFF_CHARS`, or too large to fetch) make the run incomplete (exit 3); `0` = a partial review can still exit 0 |
 | `PRR_WORKDIR` | — | checkout at the iteration's `sourceRefCommit`; unset = static analysis skips. Files whose content differs from the iteration under review are skipped, not analysed. Tools execute the reviewed branch's code, with a secret-scrubbed environment |
+| `PRR_WORKTREE_REPO` | — | a clone of the reviewed repo; prloop cuts its own throwaway worktree at the iteration's commit and removes it afterwards. Takes precedence over `PRR_WORKDIR` — prefer it for anything unattended |
+| `PRR_WORKTREE_SETUP_CMD` | — | shell string run once in a fresh worktree before any linter (`npm ci`, `uv sync`); a worktree has no `node_modules` and no venv |
+| `PRR_WORKTREE_SETUP_TIMEOUT_MS` | `600000` | deadline for that command |
 | `PRR_TRIAGE_MODEL` | — | unset = high-FP tool findings are dropped |
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |
 | `PRR_DRY_RUN` | — | `1` = compute, publish nothing |

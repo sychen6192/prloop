@@ -3,6 +3,7 @@
 // class of bug that motivated the whole project.
 import { splitLines } from "../libs/text";
 import { buildLocalReviewContext } from "../git/intake";
+import { isWorktreeFailure, prepareWorktree } from "../git/worktree";
 import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
@@ -2508,6 +2509,108 @@ section("opencode invocation: prompt delivery");
 
   // Whatever the prompt looks like, a flags-only argv cannot hit the cmd.exe limit.
   check("flags-only argv is always within the cmd.exe limit", planSpawn("opencode.cmd", args, "win32").error === undefined);
+}
+
+section("worktree: the static gate gets the commit under review, not whatever the branch points at");
+{
+  const gitOk = (await run("git", ["--version"], 10_000)).code === 0;
+  if (!gitOk) {
+    skip("a worktree is cut at the iteration's own commit", "no git on this platform");
+  } else {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-wt-test-"));
+    const g = async (...args: string[]) => run("git", ["-C", repo, ...args], 20_000);
+    await g("init", "-q", "-b", "main");
+    await g("config", "user.email", "selftest@example.invalid");
+    await g("config", "user.name", "selftest");
+    fs.writeFileSync(path.join(repo, "a.ts"), "export const v = 1;\n");
+    await g("add", "-A");
+    await g("commit", "-qm", "one");
+    const reviewed = (await g("rev-parse", "HEAD")).stdout.trim();
+    // The author pushes again while the review is queued — the case the whole feature is for.
+    fs.writeFileSync(path.join(repo, "a.ts"), "export const v = 999;\n");
+    await g("add", "-A");
+    await g("commit", "-qm", "two");
+
+    const prepared = await prepareWorktree(repo, reviewed, 42);
+    check("a worktree is prepared", !isWorktreeFailure(prepared), JSON.stringify(prepared));
+    if (!isWorktreeFailure(prepared)) {
+      check("...at a path of its own, not the clone's", prepared.dir !== repo && fs.existsSync(prepared.dir));
+      // The assertion the feature exists for. A `git checkout <branch>` here would have
+      // given v = 999, and gates/static.ts would then have skipped a.ts as stale — the
+      // review quietly covering one fewer file, with one warning line to show for it.
+      eq(
+        "...holding the reviewed commit's content, not the branch tip's",
+        fs.readFileSync(path.join(prepared.dir, "a.ts"), "utf8"),
+        "export const v = 1;\n",
+      );
+      check("...and the clone's own working copy is untouched",
+        fs.readFileSync(path.join(repo, "a.ts"), "utf8").includes("999"));
+
+      await prepared.cleanup();
+      check("cleanup removes the directory", !fs.existsSync(prepared.dir));
+      const listed = (await g("worktree", "list")).stdout;
+      check("...and git no longer lists it", !listed.includes(prepared.dir), listed);
+      await prepared.cleanup(); // idempotent: a finally that already ran must not throw
+    }
+
+    // Failures are named and returned, never thrown: a review whose static gate could not
+    // get a checkout is a review with one gate skipped, not a crashed run.
+    const missingCommit = await prepareWorktree(repo, "0".repeat(40), 42);
+    check("an absent commit is a named failure", isWorktreeFailure(missingCommit));
+    check("...quoting the sha", isWorktreeFailure(missingCommit) && missingCommit.error.includes("000000000000"));
+    check("...and saying where to look", isWorktreeFailure(missingCommit) && missingCommit.error.includes("pushed to this remote"));
+
+    const notRepo = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-notrepo-"));
+    const notARepo = await prepareWorktree(notRepo, reviewed, 42);
+    check("a path that is not a git repository is named", isWorktreeFailure(notARepo));
+    const absent = await prepareWorktree(path.join(notRepo, "nope"), reviewed, 42);
+    check("...as is one that does not exist", isWorktreeFailure(absent) && absent.error.includes("does not exist"));
+
+    // PRR_WORKTREE_SETUP_CMD, in a fresh process: config is read at import. A worktree has
+    // no node_modules and no venv, and mypy and tsc are fact-tier — without an install they
+    // report one error per unresolvable import, which is a wall of inline comments about the
+    // reviewer's environment.
+    if (process.platform !== "win32") {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-wtprobe-"));
+      const probe = path.join(dir, "probe.mts");
+      const mod = pathToFileURL(path.join(PRLOOP_ROOT, "git", "worktree.ts")).href;
+      fs.writeFileSync(
+        probe,
+        `import { prepareWorktree, isWorktreeFailure } from ${JSON.stringify(mod)};\n` +
+          `const r = await prepareWorktree(${JSON.stringify(repo)}, ${JSON.stringify(reviewed)}, 7);\n` +
+          `if (isWorktreeFailure(r)) { console.log("FAILED:" + r.error); process.exit(1); }\n` +
+          `console.log("MARKER:" + (await import("node:fs")).readFileSync(r.dir + "/installed.txt", "utf8").trim());\n` +
+          `await r.cleanup();\n`,
+      );
+      const tsxCli = path.join(PRLOOP_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+      const ran = spawnSync(process.execPath, [tsxCli, probe], {
+        encoding: "utf8",
+        env: { ...process.env, PRR_WORKTREE_SETUP_CMD: "echo deps > installed.txt", PRR_QUIET: "1" },
+        timeout: 120_000,
+      });
+      check(
+        "the setup command runs inside the worktree, not the clone",
+        (ran.stdout ?? "").includes("MARKER:deps"),
+        `${ran.stdout ?? ""}${ran.stderr ?? ""}`.slice(0, 300),
+      );
+      check("...and writes nothing into the clone", !fs.existsSync(path.join(repo, "installed.txt")));
+
+      // A failing install is a warning, not a dead review: the fact-tier tools name an
+      // uninstalled tree themselves and discard their own findings.
+      const failed = spawnSync(process.execPath, [tsxCli, probe], {
+        encoding: "utf8",
+        env: { ...process.env, PRR_WORKTREE_SETUP_CMD: "exit 3", PRR_QUIET: "" },
+        timeout: 120_000,
+      });
+      const out = `${failed.stdout ?? ""}${failed.stderr ?? ""}`;
+      check("a failing setup command still yields a worktree", !out.includes("FAILED:"), out.slice(0, 300));
+      check("...and says so", out.includes("setup command failed (exit 3)"), out.slice(0, 300));
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    fs.rmSync(notRepo, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 }
 
 section("local intake: the second provider at the ReviewContext seam, held to the contract");

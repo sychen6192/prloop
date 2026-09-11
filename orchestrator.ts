@@ -5,7 +5,15 @@
 // where a finding lives and what gets posted are decided by code here (design principle: the
 // loop never hands control to a model). Adding a sixth call site is fine; adding one whose
 // answer selects the next action is not.
-import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, STRICT_COVERAGE, excludedCategories, isDryRun } from "./config";
+import {
+  LEARN_FROM_DISMISSALS,
+  SKIP_REQUIREMENT,
+  SKIP_STATIC,
+  STRICT_COVERAGE,
+  WORKTREE_REPO,
+  excludedCategories,
+  isDryRun,
+} from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
 import { fetchRepoConventions } from "./ado/conventions";
 import { renderConventions } from "./libs/rules";
@@ -14,6 +22,7 @@ import { runFinders } from "./gates/finder";
 import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
 import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
+import { isWorktreeFailure, prepareWorktree, type PreparedWorktree } from "./git/worktree";
 import { createRunDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
 import { tokenTotals } from "./models/runner";
@@ -213,6 +222,25 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // Stages that threw outright (vs returning their own error fields); reported as
   // incomplete so the run exits 3 instead of pretending the stage passed.
   const stageFailures: string[] = [];
+
+  // The code on disk for the static gate. With PRR_WORKTREE_REPO set, prloop cuts its own
+  // worktree detached at this iteration's commit — which is the only way to be sure the
+  // files analysed are the files under review, since a branch checked out by name moves the
+  // moment the author pushes again. Failing to get one skips the gate with the reason
+  // named; it never fails the run, because a missing linter is not a missing review.
+  let worktree: PreparedWorktree | undefined;
+  let worktreeError: string | undefined;
+  if (WORKTREE_REPO && !SKIP_STATIC) {
+    const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, opts.ref.prId).catch(
+      (e): { error: string } => ({ error: `worktree preparation failed: ${e instanceof Error ? e.message : String(e)}` }),
+    );
+    if (isWorktreeFailure(prepared)) {
+      worktreeError = prepared.error;
+      log(`[WARN] static: ${prepared.error}`);
+    } else {
+      worktree = prepared;
+    }
+  }
   const [staticResult, finderOut] = await Promise.all([
     (SKIP_STATIC
       ? Promise.resolve<StaticResult>({
@@ -225,11 +253,22 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           unresolved: 0,
           skippedReason: "static analysis skipped by config",
         })
-      : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit)
-    ).catch((e): StaticResult => {
-      stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
-      return { facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason: "crashed" };
-    }),
+      : worktreeError !== undefined
+        ? Promise.resolve<StaticResult>({
+            facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0,
+            skippedReason: worktreeError,
+          })
+        : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir)
+    )
+      .catch((e): StaticResult => {
+        stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
+        return { facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason: "crashed" };
+      })
+      // The worktree's whole life is this gate. Triage reads its source windows out of the
+      // FileIndex (intake's bytes), not off disk, so nothing after this needs the tree —
+      // and `finally` rather than a line after the await means a crashed gate does not
+      // leave one behind, which on a cron over a PR list would accumulate every day.
+      .finally(() => worktree?.cleanup()),
     runFinders(opts.runner, {
       pr: ctx.pr,
       files: ctx.files,

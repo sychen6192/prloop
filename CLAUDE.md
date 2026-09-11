@@ -49,6 +49,7 @@ and closes its server in a `finally`.
 | --- | --- |
 | `orchestrator.ts` | the one control flow: intake → gates → publish |
 | `ado/` | Azure DevOps REST (auth, blobs, threads, work items, conventions) |
+| `git/` | local intake from a working tree, and the throwaway worktree the static gate runs in |
 | `gates/` | finder, skeptic, requirement, static analysis, aggregation |
 | `anchoring/` | quote → line resolution (the reason this tool exists) |
 | `models/` | runner adapters (OpenAI-compatible HTTP, opencode CLI) + JSON schemas |

@@ -1,7 +1,8 @@
 // Static-analysis gate.
 //
 // Requires a working tree: linters need files on disk, and prloop otherwise reads blobs
-// straight from Azure DevOps. Point PRR_WORKDIR at a checkout of the source branch — in a
+// straight from Azure DevOps. Set PRR_WORKTREE_REPO to a clone and prloop cuts its own
+// worktree at the iteration's commit; or point PRR_WORKDIR at a checkout you manage — in a
 // pipeline that's just the agent's checkout. Without one this gate skips loudly rather than
 // pretending it ran.
 //
@@ -75,7 +76,7 @@ const EMPTY: StaticResult = {
  * Tool findings bypass quote anchoring — they carry line numbers straight from the linter,
  * and those numbers are then filtered against changedRightLines computed from ADO blobs. A
  * linter does not hallucinate a location, but it reports the location in the file IT read;
- * if PRR_WORKDIR sits on a different commit (behind the PR head, uncommitted edits, the
+ * if the working directory sits on a different commit (behind the PR head, uncommitted edits, the
  * target branch) the two coordinate systems silently disagree and every tool comment lands
  * on the wrong line. This is the only guard on the one path that has no anchoring.
  *
@@ -361,12 +362,23 @@ export async function runStaticGate(
   // it is source merged with target, which differs from the blobs under review on every
   // file the target branch also touched.
   sourceCommit?: string,
+  // Where the code under review is on disk. The orchestrator decides: a worktree it cut
+  // itself at sourceCommit (PRR_WORKTREE_REPO), else PRR_WORKDIR. A parameter rather than a
+  // config read so the gate has one answer to work from and no opinion about where it came
+  // from — the two sources need different skip messages, and only the caller knows which
+  // one it tried.
+  workdir: string = WORKDIR,
 ): Promise<StaticResult> {
-  if (!WORKDIR) {
-    return { ...EMPTY, skippedReason: "PRR_WORKDIR not set; static analysis needs a source working directory" };
+  if (!workdir) {
+    return {
+      ...EMPTY,
+      skippedReason:
+        "no source working directory: set PRR_WORKTREE_REPO to a clone (prloop cuts its own " +
+        "worktree at the iteration's commit), or PRR_WORKDIR to a checkout you manage",
+    };
   }
-  if (!fs.existsSync(WORKDIR)) {
-    return { ...EMPTY, skippedReason: `PRR_WORKDIR does not exist: ${WORKDIR}` };
+  if (!fs.existsSync(workdir)) {
+    return { ...EMPTY, skippedReason: `source working directory does not exist: ${workdir}` };
   }
 
   // Intake guarantees canonical paths on FileDiff (no leading slash, forward separators),
@@ -394,7 +406,7 @@ export async function runStaticGate(
 
   for (const profile of profiles) {
     const targets = filesForProfile(profile, changedPaths).filter((p) => {
-      const abs = path.join(WORKDIR, p);
+      const abs = path.join(workdir, p);
       if (!fs.existsSync(abs)) return false;
       analysable++;
       const fd = index.exact(p);
@@ -452,7 +464,7 @@ export async function runStaticGate(
           ];
         }
         const spec = profile.tools[i]!;
-        const projects = projectDirsFor(spec, targets, WORKDIR);
+        const projects = projectDirsFor(spec, targets, workdir);
         if (projects.length === 0) {
           return [
             Promise.resolve({
@@ -465,7 +477,7 @@ export async function runStaticGate(
         }
         return projects.map(async (p) => ({
           spec,
-          ...(await runTool(spec, profile, p.files, WORKDIR, p.dir, index)),
+          ...(await runTool(spec, profile, p.files, workdir, p.dir, index)),
         }));
       }),
     );
@@ -491,7 +503,7 @@ export async function runStaticGate(
       ...EMPTY,
       staleFiles: stale,
       skippedReason:
-        `PRR_WORKDIR does not contain the code under review: all ${stale.length} checkable ` +
+        `${workdir} does not contain the code under review: all ${stale.length} checkable ` +
         `files differ from iteration content` +
         (unreadable > 0 ? ` (${unreadable} more were never fetched: binary or over the size limit)` : "") +
         (unreadableOnDisk.length > 0
@@ -501,7 +513,7 @@ export async function runStaticGate(
         (sourceCommit
           ? `Run \`git checkout ${sourceCommit}\` there`
           : `Check it out at the iteration's source commit`) +
-        `, or clear PRR_WORKDIR to disable static analysis`,
+        `, point PRR_WORKTREE_REPO at a clone and let prloop cut its own, or clear both to disable static analysis`,
     };
   }
 
@@ -525,7 +537,7 @@ export async function runStaticGate(
   for (const s of skipped) logVerbose(`  skipped ${s.tool}: ${s.reason}`);
   if (stale.length > 0) {
     log(
-      `[WARN] static: ${stale.length} files skipped, PRR_WORKDIR content differs from the ` +
+      `[WARN] static: ${stale.length} files skipped, working-directory content differs from the ` +
         `iteration under review — check out ${sourceCommit ?? "the iteration's source commit"} ` +
         `there, and check for uncommitted changes or a build step that rewrites sources ` +
         `(${stale.slice(0, 5).join(", ")}${stale.length > 5 ? ", ..." : ""})`,
@@ -538,7 +550,7 @@ export async function runStaticGate(
     // Deliberately not the stale-checkout message: the commit is fine, the file is not
     // readable. Pointing this at `git checkout` sent people to fix the wrong thing.
     log(
-      `[WARN] static: ${unreadableOnDisk.length} files exist in PRR_WORKDIR but could not be read ` +
+      `[WARN] static: ${unreadableOnDisk.length} files exist in the working directory but could not be read ` +
         `(permissions, or not a regular file) — not analysed, and not evidence of a stale checkout ` +
         `(${unreadableOnDisk.slice(0, 5).join(", ")}${unreadableOnDisk.length > 5 ? ", ..." : ""})`,
     );
