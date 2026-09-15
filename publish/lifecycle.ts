@@ -36,6 +36,89 @@ export async function resolveLastReviewedIteration(ref: PrRef): Promise<number |
   }
 }
 
+/** What a run decided to leave in the summary as the `--since auto` resume point. */
+export interface WatermarkDecision {
+  /** The iteration to record, or absent to write no marker at all. */
+  record?: number;
+  /** True when this run refused to move the resume point forward. */
+  held: boolean;
+  /** Why, worded for the summary and the log. Absent unless held. */
+  reason?: string;
+}
+
+/**
+ * Whether this run has earned the right to move the `--since auto` resume point.
+ *
+ * The failure this exists for: every run used to write its own iteration into the summary
+ * unconditionally, and `updateComment` replaces the whole body, so the previous marker was
+ * gone. A finder outage on one cron tick therefore advanced the watermark past a push
+ * nothing had read — and the next run started after it. The CLI exited 3 and said so, but
+ * exit codes do not survive `|| true` in the loop the README documents, and nothing on the
+ * PR remembered. That push was never reviewed by anyone, ever, and nothing looked wrong.
+ *
+ * What holds it is deliberately narrower than "something went wrong": only a stage that
+ * PRODUCES the review, failing wholesale. Named sources, not a scan of the incomplete list,
+ * so a stage added to that list later cannot join this set by accident.
+ *
+ * What does NOT hold it, and why:
+ *
+ *  - **A static or triage crash.** orchestrator.ts already says a missing linter is not a
+ *    missing review, and such a crash is deterministic over the same code — it recurs
+ *    identically next run, which is the same argument that keeps coverage gaps out.
+ *  - **A partly degraded fleet, or one finding whose verifier died.** One 429 on one verdict
+ *    out of forty would hold the whole push. On the documented cron that quietly turns
+ *    `--since auto` into a full review on a large share of runs, at full finder cost. Exit 3
+ *    already names both, and that is the signal an operator acts on.
+ *  - **A comment ADO refused with a 4xx.** ado/client.ts does not retry below 500, so the
+ *    rejection reproduces byte-for-byte on the next run — and the finding left no thread, so
+ *    nothing dedupes it either. Holding on that pins the watermark on one iteration forever,
+ *    which is the wedge this function is otherwise built to avoid. Only a transport-class
+ *    failure (no status, 5xx, 429) can plausibly succeed next time.
+ *  - **Coverage gaps.** Same reason: re-running does not make the diff smaller.
+ *
+ * And the bound. Holding widens the next run's compare range, which grows the diff, which
+ * eventually trips PRR_MAX_DIFF_CHARS — at which point files drop out of every finder's
+ * context and become coverage gaps, which do not hold, so the run that finally advances
+ * would be the one that reviewed the least. So a run that has ALREADY lost files to size
+ * does not hold: widening the range further cannot buy back what the budget is refusing.
+ * A finder stage that crashed reports no omissions at all (its outputs are empty), so the
+ * case this function exists for is not affected by the bound.
+ */
+export function watermarkFor(input: {
+  /** Reasons the push itself went unreviewed, named by the orchestrator before publishing. */
+  unreviewed: readonly string[];
+  /** Comments ADO refused in a way that could succeed next time. */
+  transientPostFailures: number;
+  /** Files no finder saw because the diff outgrew its budget. */
+  omittedForSize: number;
+  /** The iteration this run reviewed. */
+  current: number;
+  /** The resume point already on the PR, or absent if this is the first run. */
+  prior?: number;
+}): WatermarkDecision {
+  const reasons = [...input.unreviewed];
+  if (input.transientPostFailures > 0) {
+    reasons.push(
+      `${input.transientPostFailures} comment${input.transientPostFailures === 1 ? "" : "s"} ADO could not accept`,
+    );
+  }
+  if (reasons.length === 0) return { record: input.current, held: false };
+  if (input.omittedForSize > 0) {
+    // Named rather than silent: this is the one case where an unreviewed push is allowed
+    // past, and the reason is that holding it would make the next review worse.
+    return {
+      record: input.current,
+      held: false,
+      reason: `not held despite ${reasons[0]}: the diff is already over budget, so widening the range would review less, not more`,
+    };
+  }
+  return {
+    ...(input.prior === undefined ? {} : { record: input.prior }),
+    held: true,
+    reason: reasons.join("; "),
+  };
+}
+
 export interface StaleThread {
   threadId: number;
   file: string;

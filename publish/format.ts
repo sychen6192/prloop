@@ -7,6 +7,7 @@ import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
 import type { AggregateResult } from "../gates/aggregate";
 import type { CategoryHint } from "../libs/learnings";
+import type { WatermarkDecision } from "./lifecycle";
 import type { ReviewContext } from "../ado/intake";
 import type { StaticResult } from "../gates/static";
 
@@ -113,6 +114,9 @@ export interface SummaryInput {
   posted?: AnchoredFinding[];
   alreadyPosted?: AnchoredFinding[];
   failed?: Array<{ finding: AnchoredFinding; error: string }>;
+  // What publish() decided about the `--since auto` resume point. Absent means no decision
+  // was taken (dry run, local-review, demo), which is not the same as "it advanced".
+  watermark?: WatermarkDecision;
   durationSec: number;
   runDir: string;
 }
@@ -343,6 +347,20 @@ export function renderSummary(input: SummaryInput): string {
     notes.push(
       `${agg.stats.excluded} findings dropped, category excluded by config (PRR_EXCLUDE_CATEGORIES=${excludedCategories().join(",")})`,
     );
+  }
+  // Worded from the decision, not from the list of reasons, because the two cases read
+  // oppositely: with a resume point already on the PR the next run re-reviews this push,
+  // and without one it reviews the whole PR. The reasons themselves are already a bullet
+  // each above — repeating them here would say the same thing twice.
+  const wm = input.watermark;
+  if (wm?.held) {
+    notes.push(
+      wm.record === undefined
+        ? `This push was not fully reviewed (${wm.reason}), and no resume point was recorded, so the next \`--since auto\` run reviews the whole PR`
+        : `This push was not fully reviewed (${wm.reason}), so the \`--since auto\` resume point stays at iteration ${wm.record} and the next run re-reviews from there`,
+    );
+  } else if (wm?.reason) {
+    notes.push(wm.reason);
   }
   for (const h of input.dismissalHints ?? []) {
     notes.push(

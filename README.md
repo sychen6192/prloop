@@ -226,6 +226,16 @@ found it never ran) · `1` fatal.
 `--since auto` reads the last reviewed iteration back out of prloop's own summary comment —
 state lives on the PR, so a pipeline agent, your laptop and a cron box need no shared disk.
 
+**A run that did not review the push does not move that resume point.** If the finder stage
+crashed, every finder failed, the skeptic stage crashed, the requirement axis errored, or a
+comment came back with a 5xx, the summary keeps the previous iteration marker and the next
+run reviews the same push again; the summary says so in its run notes. Deliberately narrow:
+a crashed linter, one model out of three timing out, one finding whose verifier died, a 4xx
+ADO will refuse identically next time, and files dropped for diff size all still advance it —
+they are reported by exit `3`, not by re-reviewing. A run that has already lost files to
+`PRR_MAX_DIFF_CHARS` also advances whatever else failed, because holding would widen the next
+run's range and review less, not more.
+
 ### Unattended, over a list of PRs
 
 Static analysis needs the code on disk. Point `PRR_WORKTREE_REPO` at a clone and prloop cuts

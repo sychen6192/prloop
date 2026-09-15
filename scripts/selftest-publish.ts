@@ -70,6 +70,7 @@ try {
   const { publish } = await import("../publish/publish");
   const { BOT_MARKER, SUMMARY_MARKER, findingMarkers, summaryMarkers, iterationMarker, readMarkers } =
     await import("../publish/markers");
+  const { watermarkFor } = await import("../publish/lifecycle");
   const { FINDING_CATEGORIES } = await import("../config");
   const { fingerprint } = await import("../gates/aggregate");
   const { FileIndex } = await import("../libs/fileindex");
@@ -403,9 +404,119 @@ try {
       eq("...and nothing is claimed as posted", result.posted.length, 0);
       eq("...nor as already posted", result.alreadyPosted.length, 0);
       eq("...and there is no summary thread to point at", result.summaryThreadId, undefined);
+      // "held: false" would read as "it advanced the resume point". A dry run takes no
+      // decision at all, and publish.json records the difference.
+      eq("...and no watermark decision was taken", result.watermark, undefined);
     } finally {
       delete process.env["PRR_DRY_RUN"];
     }
+  }
+
+  section("the --since auto resume point: a push nothing reviewed must not be stepped over");
+  {
+    // The decision itself, before any wire. Everything here is a rule that cost a real
+    // failure to learn, so each case says which one.
+    const wm = (over: Partial<Parameters<typeof watermarkFor>[0]> = {}) =>
+      watermarkFor({ unreviewed: [], transientPostFailures: 0, omittedForSize: 0, current: 7, prior: 4, ...over });
+
+    eq("a complete run records the iteration it reviewed", wm(), { record: 7, held: false });
+    eq(
+      "a run whose review-producing stage died keeps the old resume point",
+      wm({ unreviewed: ["finder stage (boom)"] }),
+      { record: 4, held: true, reason: "finder stage (boom)" },
+    );
+    // No marker at all, rather than a fabricated one: the next --since auto run then finds
+    // nothing and reviews the whole PR, which is the safe direction.
+    eq(
+      "...and writes no marker when there was none to keep",
+      wm({ unreviewed: ["finder stage (boom)"], prior: undefined }),
+      { held: true, reason: "finder stage (boom)" },
+    );
+    // ado/client.ts does not retry below 500, so a 4xx is refused identically next run:
+    // holding on it would pin the watermark on this iteration forever.
+    eq("a 5xx on a comment holds it", wm({ transientPostFailures: 1 }), {
+      record: 4,
+      held: true,
+      reason: "1 comment ADO could not accept",
+    });
+    eq("...but a 4xx does not, because it will be refused again", wm({ transientPostFailures: 0 }), {
+      record: 7,
+      held: false,
+    });
+    // The bound. Holding widens the next compare range, which eventually trips the diff
+    // budget and drops files from every finder's context — so a run that has already lost
+    // files to size advances, and says why.
+    const bounded = wm({ unreviewed: ["skeptic stage (boom)"], omittedForSize: 3 });
+    eq("a run already over the diff budget advances anyway", bounded.record, 7);
+    eq("...without claiming it was held", bounded.held, false);
+    check("...and says why it was let through", (bounded.reason ?? "").includes("would review less"), bounded.reason);
+
+    // On the wire. The marker bytes are what --since auto reads back, so the assertion is
+    // about the body that reached ADO, not about the decision object.
+    const summaryWith = (iteration: number): FakeThread => ({
+      id: 4100,
+      status: "closed",
+      comments: [{ id: 91, content: `${BOT_MARKER}${SUMMARY_MARKER}\n## previous run\n<!-- prloop:iteration=${iteration} -->` }],
+    });
+
+    setState({ threads: [summaryWith(2)] });
+    const { value: held } = await capture(() =>
+      publish(ref, { requirement: [], code: [] }, summaryInput(), ["finder stage (endpoint unreachable)"]),
+    );
+    const heldBody = String(commentPatches()[0]?.body?.["content"] ?? "");
+    check("a held run leaves the old marker on the PR", heldBody.includes("<!-- prloop:iteration=2 -->"), heldBody.slice(-120));
+    check("...and does not write this iteration's", !heldBody.includes("<!-- prloop:iteration=3 -->"), heldBody.slice(-120));
+    eq("...and reports the hold to the caller", held.watermark?.held, true);
+    check(
+      "...and tells the reader on the PR that the next run re-reviews this push",
+      heldBody.includes("resume point stays at iteration 2"),
+      heldBody.slice(0, 400),
+    );
+
+    setState({ threads: [summaryWith(2)] });
+    const { value: clean } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), []));
+    check(
+      "a complete run still carries the marker forward",
+      String(commentPatches()[0]?.body?.["content"] ?? "").includes("<!-- prloop:iteration=3 -->"),
+    );
+    eq("...and says it was not held", clean.watermark, { record: 3, held: false });
+
+    // First run on the PR, and it died: no marker is written at all, so the next run sees
+    // no resume point and reviews everything rather than starting after an unread push.
+    setState({ threads: [] });
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), ["finder stage (endpoint unreachable)"]));
+    const created = contentOf(threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER)) ?? {});
+    check("a first run that died records no resume point", !/<!-- prloop:iteration=\d+ -->/.test(created), created.slice(-120));
+    check("...and says the next run reviews the whole PR", created.includes("reviews the whole PR"), created.slice(0, 400));
+
+    // A comment ADO refused with 500 might land next time, so the push is re-reviewed.
+    setState({
+      threads: [summaryWith(2)],
+      rejectThreadPost: (body) => {
+        const comments = (body["comments"] as Array<{ content?: string }> | undefined) ?? [];
+        return (comments[0]?.content ?? "").includes("<!-- prloop:fp=aaaa5555 -->") ? 500 : undefined;
+      },
+    });
+    const doomed = finding({ fingerprint: "aaaa5555" });
+    const { value: refused } = await capture(() =>
+      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), []),
+    );
+    eq("a 5xx on a comment is kept with its status", refused.failed[0]?.status, 500);
+    eq("...and holds the resume point, because the retry can succeed", refused.watermark?.held, true);
+
+    // The same rejection as a 400: permanent, so it must not wedge the watermark.
+    setState({
+      threads: [summaryWith(2)],
+      rejectThreadPost: (body) => {
+        const comments = (body["comments"] as Array<{ content?: string }> | undefined) ?? [];
+        return (comments[0]?.content ?? "").includes("<!-- prloop:fp=aaaa5555 -->") ? 400 : undefined;
+      },
+    });
+    const { value: rejected } = await capture(() =>
+      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), []),
+    );
+    eq("a 4xx on a comment is kept with its status", rejected.failed[0]?.status, 400);
+    eq("...and does not hold the resume point", rejected.watermark, { record: 3, held: false });
   }
 } finally {
   await ado.close();

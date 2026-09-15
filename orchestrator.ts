@@ -222,6 +222,12 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // Stages that threw outright (vs returning their own error fields); reported as
   // incomplete so the run exits 3 instead of pretending the stage passed.
   const stageFailures: string[] = [];
+  // Kept apart from stageFailures on purpose. Only a stage that PRODUCES the review can
+  // hold the `--since auto` resume point (publish/lifecycle.ts watermarkFor), and reading
+  // that set back out of stageFailures by matching its strings would quietly enrol the next
+  // stage somebody adds to it — including the linters, whose crash is explicitly not a
+  // missing review.
+  const unreviewed: string[] = [];
 
   // The code on disk for the static gate. With PRR_WORKTREE_REPO set, prloop cuts its own
   // worktree detached at this iteration's commit — which is the only way to be sure the
@@ -276,7 +282,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       compareTo: ctx.compareTo,
       conventions,
     }).catch((e): Awaited<ReturnType<typeof runFinders>> => {
-      stageFailures.push(`finder stage (${e instanceof Error ? e.message : String(e)})`);
+      const why = `finder stage (${e instanceof Error ? e.message : String(e)})`;
+      stageFailures.push(why);
+      // Nothing read the diff, so nothing about this push is known.
+      unreviewed.push(why);
       return { outputs: [], prompt: "", omitted: [], rules: [] };
     }),
   ]);
@@ -318,7 +327,11 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // already paid for its finder calls.
   const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.fileIndex).catch(
     (e): import("./gates/skeptic").SkepticOutcome[] => {
-      stageFailures.push(`skeptic stage (${e instanceof Error ? e.message : String(e)})`);
+      const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
+      stageFailures.push(why);
+      // Fails open, so the findings survive — but unverified, which is not the review the
+      // run was configured to produce, and a re-run can still produce it.
+      unreviewed.push(why);
       return freshCandidates.map((f) => ({ finding: f, verdicts: [], killed: false }));
     },
   );
@@ -388,6 +401,15 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     .filter((o) => o.error)
     .map((o) => ({ model: o.model, error: o.error! }));
 
+  // The last two named sources for the watermark decision, both "nobody produced this half
+  // of the review". A PARTLY degraded fleet is not here: the finders that answered did read
+  // the diff, and holding the resume point because one model out of three timed out would
+  // widen every subsequent run's range on a routine failure. Exit 3 already names it.
+  if (outputs.length > 0 && finderErrors.length === outputs.length) {
+    unreviewed.push(`all ${outputs.length} finders failed`);
+  }
+  if (req.error) unreviewed.push(`requirement axis (${req.error})`);
+
   const publishResult = await publish(
     opts.ref,
     { requirement: reqFindings, code: agg.inline },
@@ -403,14 +425,18 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       durationSec,
       runDir: run.dir,
     },
+    unreviewed,
   );
   const tokens = tokenTotals();
   log(`model usage: ${tokens.calls} calls, ${tokens.promptTokens} in / ${tokens.completionTokens} out tokens`);
   run.saveJson("publish.json", {
     summaryThreadId: publishResult.summaryThreadId,
+    // Absent on a dry run, which decides nothing — the answer to "did this run move the
+    // resume point" is then "it never got that far", not "no".
+    watermark: publishResult.watermark,
     posted: publishResult.posted.map((f) => ({ fp: f.fingerprint, file: f.file, line: f.anchor?.startLine })),
     alreadyPosted: publishResult.alreadyPosted.map((f) => f.fingerprint),
-    failed: publishResult.failed.map((x) => ({ fp: x.finding.fingerprint, error: x.error })),
+    failed: publishResult.failed.map((x) => ({ fp: x.finding.fingerprint, error: x.error, status: x.status })),
     resolved: publishResult.resolved,
     dismissals: publishResult.dismissals,
     tokenUsage: tokens,

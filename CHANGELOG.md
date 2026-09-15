@@ -65,6 +65,17 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **A review that did not happen no longer advances the `--since auto` resume point.** Every
+  run wrote its own iteration into the sticky summary unconditionally, and editing that
+  comment replaces the whole body, so the previous marker was gone. A finder outage on one
+  cron tick therefore stepped the resume point past a push nothing had read, and the next run
+  started after it — that push was never reviewed by anyone, and only the exit code said so,
+  which the documented `|| true` loop discards. The hold is narrow on purpose and the summary
+  names it: only a whole review-producing stage failing (finder, every finder, skeptic,
+  requirement axis) or a comment ADO refused with a 5xx. A crashed linter, a partly degraded
+  fleet, one finding whose verifier died, a 4xx that will be refused identically, and coverage
+  gaps all still advance it. So does a run that already dropped files for diff size, because
+  holding would widen the next run's range and review less rather than more.
 - **The credential scrub now survives `PRR_WORKTREE_SETUP_CMD`.** It ran through `sh -lc`, a
   login shell, which re-sources `/etc/profile` and `~/.profile` — where operators export
   `OPENAI_API_KEY`, `GITHUB_TOKEN`, `AZURE_DEVOPS_EXT_PAT` — so every name `scrubbedEnv()` had
