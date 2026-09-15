@@ -12,16 +12,19 @@ import {
   REQUIRE_CORROBORATION,
   SHOW_CONFIG,
   SKEPTIC_MODELS,
+  POST_STATUS,
   excludedCategories,
   isDryRun,
 } from "./config";
 import { parsePrUrl } from "./ado/client";
+import { postStatus } from "./ado/statuses";
 import { unmetCriteria } from "./gates/requirement";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
 import { buildResultSummary, openRunDir } from "./libs/artifacts";
 import { parseArgs } from "./libs/cli";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
+import type { PrRef } from "./libs/types";
 import { createRunner, tokenTotals } from "./models/runner";
 import { exitCodeFor, runReview } from "./orchestrator";
 
@@ -76,6 +79,10 @@ async function main() {
   if (cli.dryRun) process.env["PRR_DRY_RUN"] = "1";
 
   const ref = parsePrUrl(url);
+  // Kept where the fatal handler can reach it: a run that dies before publish() posts no
+  // status at all, so whatever an earlier run left on the PR still stands — and on a re-run
+  // of the same iteration that is quite possibly a green one gating the merge.
+  fatalRef = ref;
   banner(`prloop: ${ref.org}/${ref.project}/${ref.repoId} PR !${ref.prId}`);
   // Said once, before anything is spent: an edit to .env that a shell export is quietly
   // discarding, and a setting name that configures nothing. Both used to be visible only to
@@ -172,6 +179,22 @@ async function main() {
   process.exit(exitCode);
 }
 
-main().catch((e) => {
-  die(e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e));
+/** Set once the PR URL parses, so the fatal path below knows which PR to redden. */
+let fatalRef: PrRef | undefined;
+
+main().catch(async (e) => {
+  const msg = e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e);
+  // A crash leaves the branch-policy status showing whatever the last run posted. Exit 1 is
+  // invisible to a policy, so without this a run that died on its second iteration merges
+  // behind the first one's green check. Best effort and never allowed to replace the real
+  // error: if ADO is what just failed, this will fail too, and the fatal message is the one
+  // worth keeping.
+  if (POST_STATUS && fatalRef && !isDryRun()) {
+    try {
+      await postStatus(fatalRef, "error", `Review crashed: ${String(e instanceof Error ? e.message : e)}`);
+    } catch (inner) {
+      log(`[WARN] could not report the crash as a PR status: ${inner instanceof Error ? inner.message : String(inner)}`);
+    }
+  }
+  die(msg);
 });

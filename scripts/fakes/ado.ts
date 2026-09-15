@@ -57,6 +57,12 @@ export interface FakeAdoState {
    * (PublishResult.failed), not an exception the run dies on.
    */
   rejectThreadPost?: (body: Record<string, unknown>) => number | undefined;
+  /**
+   * Rejects the status POST with this HTTP status. A branch-policy check that could not be
+   * updated is its own outcome: the gate on the PR then shows whatever the previous run
+   * left there, which may be green over a review that never ran.
+   */
+  rejectStatusPost?: number;
 }
 
 export interface AdoRequest {
@@ -165,6 +171,9 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
     }
     // --- status checks ---------------------------------------------------------------
     if (method === "POST" && /\/pullRequests\/\d+\/statuses$/.test(path)) {
+      if (state.rejectStatusPost !== undefined) {
+        return sendJson(res, state.rejectStatusPost, { message: "TF401027: the status could not be created" });
+      }
       return sendJson(res, 200, { id: 1, ...(body ?? {}) });
     }
     // --- work items ------------------------------------------------------------------

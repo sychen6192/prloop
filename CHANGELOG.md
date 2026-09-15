@@ -65,6 +65,23 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **The branch-policy status no longer goes green on a review that did not run.** It was decided
+  from unmet criteria and high-risk findings alone, so a run whose finder fleet died posted
+  `succeeded — no blockers in requirements or code` while the same run exited `3`. A branch policy
+  cannot see an exit code, and PROPOSAL §10 chose this status over a bot vote precisely because it
+  is what gates the merge. It now has three states, decided by one function that the exit code also
+  derives from: `failed` (2), `error` (3, the review did not fully run), `succeeded` (0).
+  **Behaviour change:** a policy already bound to `ai-review` starts blocking merges on runs that
+  previously went green — a crashed stage, a comment ADO refused, or, with `PRR_STRICT_COVERAGE` on
+  (the default), a PR over `PRR_MAX_DIFF_CHARS`. Nothing new is being detected; those runs were
+  already exiting `3`. `PRR_STRICT_COVERAGE=0` removes the coverage half, but it removes the exit-3
+  signal with it — there is deliberately no setting that lets the gate and the exit code disagree.
+  Also fixed alongside it: a status ADO refused is now reported as incompleteness instead of being
+  logged and dropped, and a run that dies before publishing posts `error` rather than leaving an
+  earlier run's green check standing over an unreviewed push. One further change worth knowing: the
+  incompleteness list is now assembled before publishing and publish appends its own half, so when
+  the only two reasons are a coverage gap and a refused comment, the first-named reason — and the
+  status description's headline — is now the coverage gap rather than the refused comment.
 - **A review that did not happen no longer advances the `--since auto` resume point.** Every
   run wrote its own iteration into the sticky summary unconditionally, and editing that
   comment replaces the whole body, so the previous marker was gone. A finder outage on one

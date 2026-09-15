@@ -71,6 +71,7 @@ try {
   const { BOT_MARKER, SUMMARY_MARKER, findingMarkers, summaryMarkers, iterationMarker, readMarkers } =
     await import("../publish/markers");
   const { watermarkFor } = await import("../publish/lifecycle");
+  const { exitCodeFor } = await import("../orchestrator");
   const { FINDING_CATEGORIES } = await import("../config");
   const { fingerprint } = await import("../gates/aggregate");
   const { FileIndex } = await import("../libs/fileindex");
@@ -144,11 +145,16 @@ try {
   });
 
   const setState = (partial: Partial<FakeAdoState>) => {
-    Object.assign(ado.state, { threads: [], rejectThreadPost: undefined, ...partial });
+    Object.assign(ado.state, { threads: [], rejectThreadPost: undefined, rejectStatusPost: undefined, ...partial });
     ado.reset();
   };
 
+  /** publish()'s fourth argument: what the orchestrator already knew, as two lists. */
+  const known = (unreviewed: string[] = [], incomplete: string[] = unreviewed) => ({ unreviewed, incomplete });
+
   const threadPosts = () => ado.matching("POST", /\/threads$/);
+  const statusPosts = () => ado.matching("POST", /\/statuses$/);
+  const statusOf = (r?: { body?: Record<string, unknown> }) => String(r?.body?.["state"] ?? "<none>");
   const commentPatches = () => ado.matching("PATCH", /\/threads\/\d+\/comments\/\d+$/);
   const contentOf = (r: { body?: Record<string, unknown> }) =>
     String(((r.body?.["comments"] as Array<{ content?: string }> | undefined) ?? [])[0]?.content ?? "");
@@ -388,6 +394,106 @@ try {
     eq("a clean run reports succeeded", clean[0]?.body?.["state"], "succeeded");
   }
 
+  section("PR status: the merge gate must not go green on a review that did not run");
+  {
+    // The failure: the status was decided from unmet criteria and high-risk findings alone,
+    // so a run whose finder fleet died posted `succeeded — no blockers` while the same run
+    // exited 3. A branch policy cannot see an exit code, and PROPOSAL §10 picked this status
+    // over a bot vote precisely because it is what gates the merge.
+    //
+    // The assertion is on the byte that reached the wire, compared against the exit code the
+    // CLI would return over the SAME list. Comparing the decision object with itself would
+    // hold for every input, including a swapped one.
+    const rows: Array<{ name: string; incomplete: string[]; inline: AnchoredFinding[]; state: string; exit: 0 | 2 | 3 }> = [
+      { name: "a clean, complete run", incomplete: [], inline: [], state: "succeeded", exit: 0 },
+      {
+        name: "a run whose finder stage died and found nothing",
+        incomplete: ["finder stage (endpoint unreachable)"],
+        inline: [],
+        state: "error",
+        exit: 3,
+      },
+      {
+        name: "a run with a blocking finding",
+        incomplete: [],
+        inline: [finding({ fingerprint: "bbbb1111", severity: "critical" })],
+        state: "failed",
+        exit: 2,
+      },
+      {
+        name: "a run that is both blocking and incomplete",
+        incomplete: ["skeptic stage (boom)"],
+        inline: [finding({ fingerprint: "bbbb2222", severity: "critical" })],
+        state: "failed",
+        exit: 2,
+      },
+    ];
+    for (const r of rows) {
+      setState({ threads: [] });
+      await capture(() =>
+        publish(
+          ref,
+          { requirement: [], code: r.inline },
+          summaryInput({ agg: { ...summaryInput().agg, inline: r.inline } }),
+          known([], r.incomplete),
+        ),
+      );
+      eq(`${r.name} posts ${r.state}`, statusOf(statusPosts()[0]), r.state);
+      // Literal expected pairs, not a lookup through the same table the code uses: swap two
+      // branches in reviewOutcome and this fails, where a self-comparison would not.
+      eq(
+        `...and the exit code agrees (${r.exit})`,
+        exitCodeFor({
+          agg: { ...summaryInput().agg, inline: r.inline },
+          incomplete: r.incomplete,
+        } as Parameters<typeof exitCodeFor>[0]),
+        r.exit,
+      );
+    }
+
+    // Both true: the blocking reasons lead, because they are what a reviewer acts on, but
+    // the incompleteness must still be visible.
+    const bothDesc = String(statusPosts()[0]?.body?.["description"] ?? "");
+    check("a blocking-and-incomplete run still admits it is incomplete", bothDesc.includes("also incomplete"), bothDesc);
+
+    // ADO cuts the description at 400 characters, and a relayed gateway body runs past that
+    // on its own — so the count lives in the prefix, where truncation cannot reach it.
+    setState({ threads: [] });
+    await capture(() =>
+      publish(ref, { requirement: [], code: [] }, summaryInput(), known([], [`HTTP 500: ${"x".repeat(900)}`, "and another"])),
+    );
+    const longDesc = String(statusPosts()[0]?.body?.["description"] ?? "");
+    check("a 900-char reason does not delete the reason count", longDesc.startsWith("Review incomplete (2 reasons):"), longDesc.slice(0, 60));
+    check("...and what ADO stores is still within its 400-char cut", longDesc.length <= 400, String(longDesc.length));
+
+    // publish() is the one producer of the publish-side reasons; the orchestrator appends
+    // them rather than working them out again from the result, which is how the two lists
+    // came to disagree.
+    setState({
+      threads: [],
+      rejectThreadPost: (body) => {
+        const comments = (body["comments"] as Array<{ content?: string }> | undefined) ?? [];
+        return (comments[0]?.content ?? "").includes("<!-- prloop:fp=cccc3333 -->") ? 500 : undefined;
+      },
+    });
+    const doomed = finding({ fingerprint: "cccc3333", severity: "medium" });
+    const { value: refused } = await capture(() =>
+      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
+    );
+    eq("a comment ADO refused is named once, by publish", refused.gaps, ["1 comments failed to post"]);
+    eq("...and turns the gate red even with nothing blocking", refused.status, "error");
+
+    // The status POST itself failing is a named failure, not a log line: the gate on the PR
+    // now shows whatever an earlier run left, and only the exit code can say otherwise.
+    setState({ threads: [], rejectStatusPost: 503 });
+    const { value: noStatus } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    check(
+      "a status that could not be posted is reported as incompleteness",
+      noStatus.gaps.includes("PR status failed to post"),
+      JSON.stringify(noStatus.gaps),
+    );
+  }
+
   section("PRR_DRY_RUN: computes everything, writes nothing at all");
   {
     // Not "posts no comments" — issues no REQUESTS. A dry run that still read threads, or
@@ -461,7 +567,7 @@ try {
 
     setState({ threads: [summaryWith(2)] });
     const { value: held } = await capture(() =>
-      publish(ref, { requirement: [], code: [] }, summaryInput(), ["finder stage (endpoint unreachable)"]),
+      publish(ref, { requirement: [], code: [] }, summaryInput(), known(["finder stage (endpoint unreachable)"])),
     );
     const heldBody = String(commentPatches()[0]?.body?.["content"] ?? "");
     check("a held run leaves the old marker on the PR", heldBody.includes("<!-- prloop:iteration=2 -->"), heldBody.slice(-120));
@@ -474,7 +580,7 @@ try {
     );
 
     setState({ threads: [summaryWith(2)] });
-    const { value: clean } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), []));
+    const { value: clean } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
     check(
       "a complete run still carries the marker forward",
       String(commentPatches()[0]?.body?.["content"] ?? "").includes("<!-- prloop:iteration=3 -->"),
@@ -484,7 +590,7 @@ try {
     // First run on the PR, and it died: no marker is written at all, so the next run sees
     // no resume point and reviews everything rather than starting after an unread push.
     setState({ threads: [] });
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), ["finder stage (endpoint unreachable)"]));
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known(["finder stage (endpoint unreachable)"])));
     const created = contentOf(threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER)) ?? {});
     check("a first run that died records no resume point", !/<!-- prloop:iteration=\d+ -->/.test(created), created.slice(-120));
     check("...and says the next run reviews the whole PR", created.includes("reviews the whole PR"), created.slice(0, 400));
@@ -499,7 +605,7 @@ try {
     });
     const doomed = finding({ fingerprint: "aaaa5555" });
     const { value: refused } = await capture(() =>
-      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), []),
+      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
     );
     eq("a 5xx on a comment is kept with its status", refused.failed[0]?.status, 500);
     eq("...and holds the resume point, because the retry can succeed", refused.watermark?.held, true);
@@ -513,7 +619,7 @@ try {
       },
     });
     const { value: rejected } = await capture(() =>
-      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), []),
+      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
     );
     eq("a 4xx on a comment is kept with its status", rejected.failed[0]?.status, 400);
     eq("...and does not hold the resume point", rejected.watermark, { record: 3, held: false });

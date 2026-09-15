@@ -30,6 +30,7 @@ import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
 import type { AnchoredFinding, ModelRunner, PrRef, RequirementResult } from "./libs/types";
 import { publish, type PublishResult } from "./publish/publish";
+import { reviewOutcome } from "./publish/status";
 
 export interface ReviewRunOptions {
   ref: PrRef;
@@ -99,9 +100,15 @@ export function coverageGaps(
  * statement, and the incomplete stages are named in the log either way.
  */
 export function exitCodeFor(result: Pick<ReviewRunResult, "agg" | "req" | "incomplete">): 0 | 2 | 3 {
-  const highRisk = result.agg.inline.filter((f) => f.severity === "critical" || f.severity === "high");
-  const unmet = result.req ? unmetCriteria(result.req) : [];
-  return highRisk.length > 0 || unmet.length > 0 ? 2 : result.incomplete.length > 0 ? 3 : 0;
+  // Delegated rather than duplicated: publish() decides the branch-policy status from the
+  // same function over the same list, so the two cannot say different things about one run.
+  // They used to, and a merge policy can only see the status.
+  return reviewOutcome({
+    unmet: result.req ? unmetCriteria(result.req).length : 0,
+    highRisk: result.agg.inline.filter((f) => f.severity === "critical" || f.severity === "high").length,
+    incomplete: result.incomplete,
+    filesReviewed: 0,
+  }).exitCode;
 }
 
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {
@@ -144,6 +151,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
     };
     const durationSec = Math.round((Date.now() - started) / 1000);
+    // "No reviewable code changes" can also mean "the only changed file was too large to
+    // fetch" — that is not a clean PR, and the status must say so too, not just the exit
+    // code. Computed before publishing for the same reason as on the main path.
+    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
     const publishResult = await publish(
       opts.ref,
       { requirement: [], code: [] },
@@ -168,13 +179,9 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
         durationSec,
         runDir: run.dir,
       },
+      { unreviewed: [], incomplete },
     );
-    // "No reviewable code changes" can also mean "the only changed file was too large to
-    // fetch" — that is not a clean PR, and strict coverage says so.
-    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
-    if (publishResult.summaryThreadId === undefined && !isDryRun()) {
-      incomplete.push("summary comment failed to post");
-    }
+    incomplete.push(...publishResult.gaps);
     return { ctx, agg, reqFindings: [], publishResult, runDir: run.dir, durationSec, incomplete };
   }
 
@@ -410,6 +417,21 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   }
   if (req.error) unreviewed.push(`requirement axis (${req.error})`);
 
+  // Assembled BEFORE publishing, because the branch-policy status is decided in there and a
+  // status that says "no blockers" about a run whose finder fleet died is the one artifact
+  // a merge policy can see. publish() appends its own half and hands it back, so the list
+  // the status saw and the list the exit code sees are the same list rather than two
+  // derivations that have to be kept in step by hand.
+  const incomplete: string[] = [...stageFailures];
+  if (req.error) incomplete.push(`requirement axis (${req.error})`);
+  for (const e of finderErrors) incomplete.push(`finder ${e.model} (${e.error})`);
+  const deadSkeptics = outcomes.reduce(
+    (n, o) => n + (o.verdicts.length > 0 && o.verdicts.every((v) => v.error) ? 1 : 0),
+    0,
+  );
+  if (deadSkeptics > 0) incomplete.push(`${deadSkeptics} findings whose verifier failed`);
+  incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
+
   const publishResult = await publish(
     opts.ref,
     { requirement: reqFindings, code: agg.inline },
@@ -425,8 +447,13 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       durationSec,
       runDir: run.dir,
     },
-    unreviewed,
+    { unreviewed, incomplete },
   );
+  // The publish-side half, produced once by publish() rather than read back off its result
+  // here. Appending after the coverage gaps reorders the list against older runs: when the
+  // only two reasons are a coverage gap and a refused comment, the first-named reason — and
+  // so the status description's headline — is now the coverage gap.
+  incomplete.push(...publishResult.gaps);
   const tokens = tokenTotals();
   log(`model usage: ${tokens.calls} calls, ${tokens.promptTokens} in / ${tokens.completionTokens} out tokens`);
   run.saveJson("publish.json", {
@@ -441,23 +468,6 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     dismissals: publishResult.dismissals,
     tokenUsage: tokens,
   });
-
-  const incomplete: string[] = [...stageFailures];
-  if (req.error) incomplete.push(`requirement axis (${req.error})`);
-  for (const e of finderErrors) incomplete.push(`finder ${e.model} (${e.error})`);
-  const deadSkeptics = outcomes.reduce(
-    (n, o) => n + (o.verdicts.length > 0 && o.verdicts.every((v) => v.error) ? 1 : 0),
-    0,
-  );
-  if (deadSkeptics > 0) incomplete.push(`${deadSkeptics} findings whose verifier failed`);
-  // A run that computed findings and could not post them must not look like a clean PR.
-  if (publishResult.failed.length > 0) {
-    incomplete.push(`${publishResult.failed.length} comments failed to post`);
-  }
-  if (publishResult.summaryThreadId === undefined && !isDryRun()) {
-    incomplete.push("summary comment failed to post");
-  }
-  incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
 
   return { ctx, agg, req, reqFindings, publishResult, runDir: run.dir, durationSec, incomplete };
 }

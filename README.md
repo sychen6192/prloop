@@ -391,7 +391,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_SKIP_REQUIREMENT` | — | `1` = skip the requirement axis |
 | `PRR_DISMISSAL_HINT_THRESHOLD` | `3` | dismissals in one category before the summary suggests excluding it |
 | `PRR_MAX_INLINE_REQ_COMMENTS` | `3` | requirement-axis budget, separate so code findings cannot crowd it out |
-| `PRR_POST_STATUS` | — | `1` = also post a PR status (needs a branch policy to gate merges) |
+| `PRR_POST_STATUS` | — | `1` = also post a PR status (needs a branch policy to gate merges). Three states, matching the exit code: `failed` (2) · `error` (3, the review did not fully run) · `succeeded` (0) |
 | `PRR_STATUS_GENRE` | `prloop` | genre of that status |
 | `PRR_STATUS_NAME` | `ai-review` | name of that status |
 | `PRR_HTTPS_PROXY` | — | overrides `HTTPS_PROXY` from the shell (Node's fetch reads neither by itself) |

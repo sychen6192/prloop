@@ -5,7 +5,8 @@ import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun } from "../config";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { AdoError } from "../ado/client";
 import { createThread, listThreads, updateComment, type Thread } from "../ado/threads";
-import { postStatus } from "../ado/statuses";
+import { postStatus, type StatusState } from "../ado/statuses";
+import { reviewOutcome } from "./status";
 import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
 import { log } from "../libs/log";
@@ -32,6 +33,20 @@ export interface PublishResult {
    * the two are not the same answer.
    */
   watermark?: WatermarkDecision;
+  /**
+   * Publish-side reasons this review is incomplete: comments ADO refused, a summary that
+   * never landed, a status that never landed. The ONE producer of these — the orchestrator
+   * appends them to its own list rather than working them out a second time from this
+   * object, because two places deriving the same list is how the status and the exit code
+   * came to disagree in the first place.
+   *
+   * A status that failed to post is appended AFTER the status decision was taken, so the
+   * returned list can be one longer than what the status saw. That is the point: the gate
+   * on the PR is then stale, and only the exit code can say so.
+   */
+  gaps: string[];
+  /** The branch-policy status this run decided on. Absent when PRR_POST_STATUS is off. */
+  status?: StatusState;
 }
 
 function findSummaryThread(threads: Thread[]): { thread: Thread; commentId: number } | undefined {
@@ -133,15 +148,20 @@ export async function publish(
   axes: { requirement: AnchoredFinding[]; code: AnchoredFinding[] },
   summaryInput: SummaryInput,
   /**
-   * Reasons the push itself went unreviewed — a whole review-producing stage that failed,
-   * as named by the orchestrator before this call. A fourth argument rather than a field on
-   * SummaryInput: the three publish-time fields there are filled in BY publish and are
-   * optional for the renderers that never publish (demo, local-review), and this is an input
-   * to a decision, not a rendering fact. Defaulted so those callers stay untouched.
+   * What the orchestrator already knows, as two lists that answer two different questions.
+   * A fourth argument rather than fields on SummaryInput: the publish-time fields there are
+   * filled in BY publish and are optional for the renderers that never publish (demo,
+   * local-review), whereas these are inputs to decisions, not rendering facts. Defaulted so
+   * those callers stay untouched.
    */
-  unreviewed: readonly string[] = [],
+  known: {
+    /** Reasons the push itself went unreviewed. Decides the `--since auto` resume point. */
+    unreviewed: readonly string[];
+    /** Every reason this review is incomplete so far. Decides the branch-policy status. */
+    incomplete: readonly string[];
+  } = { unreviewed: [], incomplete: [] },
 ): Promise<PublishResult> {
-  const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [] };
+  const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [], gaps: [] };
 
   // Requirement findings go first so that if anything below fails, the message that
   // survived is the one about the PR not doing what was asked.
@@ -231,7 +251,7 @@ export async function publish(
     (f) => f.status === undefined || f.status >= 500 || f.status === 429,
   ).length;
   const watermark = watermarkFor({
-    unreviewed,
+    unreviewed: known.unreviewed,
     transientPostFailures,
     omittedForSize: summaryInput.omittedFiles.length,
     current: ctx.iteration.id,
@@ -275,26 +295,34 @@ export async function publish(
     log(`[FAIL] Summary comment failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  // Computed here, once, and returned: a run that computed findings and could not post them
+  // is not a clean PR, and neither is one whose summary never landed. Outside the
+  // POST_STATUS branch on purpose — the exit code needs these whether or not a status is
+  // configured.
+  if (result.failed.length > 0) {
+    result.gaps.push(`${result.failed.length} comments failed to post`);
+  }
+  if (result.summaryThreadId === undefined) {
+    result.gaps.push("summary comment failed to post");
+  }
+
   if (POST_STATUS) {
-    // Either axis can fail the status, and the description names which one — a single
-    // "3 issues" message would hide that the real problem is an unimplemented requirement.
-    const unmet = summaryInput.req ? unmetCriteria(summaryInput.req) : [];
-    const risky = axes.code.filter((f) => f.severity === "critical" || f.severity === "high");
-    const reasons: string[] = [];
-    if (unmet.length > 0) reasons.push(`${unmet.length} unmet acceptance criteria`);
-    if (risky.length > 0) reasons.push(`${risky.length} high-risk code issues`);
+    const outcome = reviewOutcome({
+      unmet: summaryInput.req ? unmetCriteria(summaryInput.req).length : 0,
+      highRisk: axes.code.filter((f) => f.severity === "critical" || f.severity === "high").length,
+      incomplete: [...known.incomplete, ...result.gaps],
+      filesReviewed: ctx.files.length,
+    });
+    result.status = outcome.state;
     try {
-      await postStatus(
-        ref,
-        reasons.length > 0 ? "failed" : "succeeded",
-        reasons.length > 0
-          ? reasons.join(", ")
-          : `Reviewed ${ctx.files.length} files, no blockers in requirements or code`,
-        { iterationId: ctx.iteration.id },
-      );
-      log(`Reported PR status: ${reasons.length > 0 ? `failed (${reasons.join(", ")})` : "succeeded"}`);
+      await postStatus(ref, outcome.state, outcome.description, { iterationId: ctx.iteration.id });
+      log(`Reported PR status: ${outcome.state} (${outcome.description})`);
     } catch (e) {
       log(`[FAIL] PR status report failed: ${e instanceof Error ? e.message : String(e)}`);
+      // Named, not just logged. The gate on the PR now shows whatever an earlier run left
+      // there — on a re-run of the same iteration, quite possibly a green one — and the
+      // exit code is the only thing left that can say the check was never updated.
+      result.gaps.push("PR status failed to post");
     }
   }
 
