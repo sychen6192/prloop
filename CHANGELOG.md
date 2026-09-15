@@ -65,6 +65,16 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **The credential scrub now survives `PRR_WORKTREE_SETUP_CMD`.** It ran through `sh -lc`, a
+  login shell, which re-sources `/etc/profile` and `~/.profile` — where operators export
+  `OPENAI_API_KEY`, `GITHUB_TOKEN`, `AZURE_DEVOPS_EXT_PAT` — so every name `scrubbedEnv()` had
+  just dropped came back before the reviewed branch's own install line ran. Now `sh -c`.
+  Windows used `cmd.exe /d /s /c`, which reads no profile, and is unaffected. **Behaviour
+  change:** the setup command inherits prloop's own `PATH` and nothing else, as the linters
+  already did, so a toolchain reachable only from `~/.profile` (nvm, pyenv, sdkman) must have
+  its `PATH` exported in the environment prloop starts from. prloop is itself launched through
+  node, so node and npm are already on that `PATH`; the case that breaks is a cron or systemd
+  unit with a minimal `PATH` and an absolute node.
 - Findings lost to a reshaped quote, and a payload budget that counted the wrong thing.
 - `insufficient-context` no longer counts as verification — "I could not check this" was being
   reported as "I checked it and it holds".

@@ -3,7 +3,7 @@
 // class of bug that motivated the whole project.
 import { splitLines } from "../libs/text";
 import { buildLocalReviewContext } from "../git/intake";
-import { isWorktreeFailure, prepareWorktree } from "../git/worktree";
+import { isWorktreeFailure, planSetupShell, prepareWorktree } from "../git/worktree";
 import { anchorFinding as anchorWithIndex } from "../anchoring/locate";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
@@ -2513,6 +2513,21 @@ section("opencode invocation: prompt delivery");
 
 section("worktree: the static gate gets the commit under review, not whatever the branch points at");
 {
+  // The setup command must not go through a LOGIN shell. `sh -lc` re-sources ~/.profile,
+  // which is where operators export OPENAI_API_KEY / GITHUB_TOKEN / AZURE_DEVOPS_EXT_PAT,
+  // so every name scrubbedEnv() had just dropped came back — and was then handed to the
+  // reviewed branch's own build script. Asserted on the argv rather than by grepping
+  // worktree.ts for "-lc", because the argv catches a reinstated -l however it is spelled.
+  // Needs no git and no shell, so it runs on every platform.
+  eq("the setup command goes through a non-login shell", planSetupShell("npm ci", "linux"), {
+    file: "sh",
+    args: ["-c", "npm ci"],
+  });
+  eq("...and cmd.exe on Windows, which reads no profile either", planSetupShell("npm ci", "win32"), {
+    file: "cmd.exe",
+    args: ["/d", "/s", "/c", "npm ci"],
+  });
+
   const gitOk = (await run("git", ["--version"], 10_000)).code === 0;
   if (!gitOk) {
     skip("a worktree is cut at the iteration's own commit", "no git on this platform");
@@ -2574,18 +2589,46 @@ section("worktree: the static gate gets the commit under review, not whatever th
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-wtprobe-"));
       const probe = path.join(dir, "probe.mts");
       const mod = pathToFileURL(path.join(PRLOOP_ROOT, "git", "worktree.ts")).href;
+      // Evidence is printed from INSIDE the probe, before cleanup(): the worktree is an
+      // mkdtemp path the child alone knows, and cleanup() removes it, so a parent that
+      // tried to read these files afterwards would assert against a file that is never
+      // there — a test that passes by finding nothing.
       fs.writeFileSync(
         probe,
         `import { prepareWorktree, isWorktreeFailure } from ${JSON.stringify(mod)};\n` +
+          `const fsp = (await import("node:fs"));\n` +
           `const r = await prepareWorktree(${JSON.stringify(repo)}, ${JSON.stringify(reviewed)}, 7);\n` +
           `if (isWorktreeFailure(r)) { console.log("FAILED:" + r.error); process.exit(1); }\n` +
-          `console.log("MARKER:" + (await import("node:fs")).readFileSync(r.dir + "/installed.txt", "utf8").trim());\n` +
+          `const read = (n) => { try { return fsp.readFileSync(r.dir + "/" + n, "utf8").trim(); } catch { return "<missing>"; } };\n` +
+          `console.log("MARKER:" + read("installed.txt"));\n` +
+          `console.log("TOKEN:" + read("token.txt").split("\\n").join("|"));\n` +
           `await r.cleanup();\n`,
       );
       const tsxCli = path.join(PRLOOP_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+
+      // The setup command runs the reviewed branch's own install line, so a credential must
+      // not reach it by EITHER route, and the two routes fail differently. The name is set
+      // in the parent (scrubbedEnv must drop it) AND exported by a ~/.profile (a login shell
+      // must not re-source it back). The planted values differ so a failure says which one
+      // leaked rather than only that something did.
+      const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-wthome-"));
+      fs.writeFileSync(path.join(fakeHome, ".profile"), "export LEAK_API_KEY=leaked-from-profile\n");
+      // The trailing sentinel separates "the variable was not set" from "the file was never
+      // written": printenv on an unset name prints nothing and exits 1, leaving an empty
+      // file that an emptiness check could not tell from a missing one.
+      const setupCmd =
+        "echo deps > installed.txt; printenv LEAK_API_KEY > token.txt; echo SENTINEL >> token.txt";
+      const childEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        PRR_WORKTREE_SETUP_CMD: setupCmd,
+        PRR_QUIET: "1",
+        HOME: fakeHome,
+        LEAK_API_KEY: "leaked-from-parent-env",
+      };
+
       const ran = spawnSync(process.execPath, [tsxCli, probe], {
         encoding: "utf8",
-        env: { ...process.env, PRR_WORKTREE_SETUP_CMD: "echo deps > installed.txt", PRR_QUIET: "1" },
+        env: childEnv,
         timeout: 120_000,
       });
       check(
@@ -2594,6 +2637,32 @@ section("worktree: the static gate gets the commit under review, not whatever th
         `${ran.stdout ?? ""}${ran.stderr ?? ""}`.slice(0, 300),
       );
       check("...and writes nothing into the clone", !fs.existsSync(path.join(repo, "installed.txt")));
+
+      // Without this control the profile half of the assertion below passes on any box whose
+      // /bin/sh does not read ~/.profile under -l (busybox ash, a hardened /etc/profile that
+      // bails) — i.e. it would pass for the wrong reason. The variable is unset here so that
+      // what the control observes can only have come from the profile. A skip rather than a
+      // check: such a box is not a box with a bug, and CLAUDE.md wants this net
+      // offline-deterministic.
+      const control = spawnSync("sh", ["-lc", "printenv LEAK_API_KEY"], {
+        encoding: "utf8",
+        env: { ...childEnv, LEAK_API_KEY: undefined },
+        timeout: 10_000,
+      });
+      const token = /^TOKEN:(.*)$/m.exec(ran.stdout ?? "")?.[1] ?? "<no TOKEN line>";
+      if (!(control.stdout ?? "").includes("leaked-from-profile")) {
+        // The scrub half still holds on such a box, so assert it rather than skipping both.
+        eq("a credential in prloop's own environment never reaches the setup command", token, "SENTINEL");
+        skip(
+          "...and neither does one a ~/.profile re-exports",
+          "this box's /bin/sh does not source ~/.profile under -l",
+        );
+      } else {
+        // A failure prints the planted value, so it names which route leaked:
+        // "leaked-from-parent-env" is the scrub, "leaked-from-profile" is the login shell.
+        eq("a credential reaches the setup command by neither the environment nor ~/.profile", token, "SENTINEL");
+      }
+      fs.rmSync(fakeHome, { recursive: true, force: true });
 
       // A failing install is a warning, not a dead review: the fact-tier tools name an
       // uninstalled tree themselves and discard their own findings.

@@ -30,7 +30,13 @@ checkout of the repositories you review.
   `PRR_WORKDIR` is a checkout of the PR's *source branch*, and linters execute that branch's
   code — an eslint config, a Maven plugin or a lint hook is a program the PR author wrote. Every
   variable whose name looks like a credential is dropped before the tool starts; the `opencode`
-  runner's child process gets the same treatment.
+  runner's child process gets the same treatment, and so does `PRR_WORKTREE_SETUP_CMD`, which
+  runs the reviewed branch's own install line. That command goes through a **non-login** shell
+  for the same reason: `sh -lc` re-sources `/etc/profile` and `~/.profile` before running, and a
+  profile that exports `OPENAI_API_KEY` or `GITHUB_TOKEN` puts back every name the scrub just
+  removed. `HOME` itself is passed through by design, so files under it (`~/.npmrc`,
+  `~/.git-credentials`, the `~/.azure` token cache) remain readable by the setup command and by
+  the linters.
 - **prloop never writes its own configuration** and never votes on a PR. It posts comments and,
   optionally, a status.
 

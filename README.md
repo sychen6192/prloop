@@ -140,7 +140,12 @@ name looks like a credential (`*_PAT`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_A
 `*_ACCESS_KEY`, `*_PRIVATE_KEY`, `SYSTEM_ACCESSTOKEN`, prloop's own PAT and LLM key) is
 dropped, and everything else (`PATH`, `JAVA_HOME`, `M2_HOME`, `npm_config_*`, proxies, CA
 paths) passes through, because build tools legitimately need it. The `opencode` runner's
-child process gets the same treatment.
+child process gets the same treatment, and so does `PRR_WORKTREE_SETUP_CMD` — which is why
+that command runs in a **non-login** shell: a login shell re-reads `~/.profile`, and a
+profile that exports a key would hand back everything the scrub just dropped. It therefore
+inherits prloop's own `PATH` and nothing else, exactly as the linters do, so a toolchain that
+exists only inside `~/.profile` (nvm, pyenv, sdkman) needs its `PATH` exported in the
+environment prloop itself starts from.
 
 ---
 
