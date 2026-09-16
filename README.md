@@ -479,6 +479,15 @@ read-only and offline, counts each finding once no matter how often the PR was r
 and skips (counting) any artifact it cannot read, so an old or half-written `runs/` tree
 still yields a report. Pass a directory to point it somewhere other than `PRR_RUNS_DIR`.
 
+Each of those three tables also carries a **`killed`** column: how many of that bucket's
+findings the skeptic majority refuted. A refuted finding reaches no comment and appears in no
+`findings.json`, so it is read out of `skeptic.json` and joined back in — without it a finder
+whose output the verifier throws away looks exactly like one that found nothing to throw
+away. Read `killed` against `findings` in the same row: that ratio, per finder and per
+category, is what says whether a finder is earning the verification it costs. Runs written
+before `skeptic.json` recorded a finding's identity still count toward the per-model verdict
+table; they simply cannot be attributed to a finder or a category.
+
 `scripts/selftest.ts` is the regression net for anchoring — **run it after touching
 `libs/diff.ts` or `anchoring/locate.ts`**. Its assertions map directly onto the causes of
 "comment on the wrong line".

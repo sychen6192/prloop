@@ -1859,6 +1859,33 @@ section("calibration: joining what we published to what humans rejected");
   const empty = calibrate({ findings: [], verdicts: [], dismissed: new Set() });
   eq("an empty store divides by nothing", [empty.findings, empty.published, empty.publishedDismissed], [0, 0, 0]);
   eq("...and reports no buckets", [empty.byConfidence.length, empty.byCategory.length, empty.skeptics.length], [0, 0, 0]);
+  eq("...and nothing was killed either", empty.killed, 0);
+
+  // A refuted finding reaches neither inline, belowBar nor degraded — applyVerdicts drops it
+  // before finalize runs — so it appears in NO findings.json and has to be carried in from
+  // skeptic.json, or the finder that produced it looks identical to one that produced
+  // nothing for the verifier to throw away.
+  const killedReport = calibrate({
+    findings: [f("survivor", "correctness", 0.9, ["m1"], true)],
+    verdicts: [],
+    outcomes: [
+      { fingerprint: "ghost", category: "security", confidence: 0.6, sources: ["m2"], killed: true },
+      { fingerprint: "survivor", category: "correctness", confidence: 0.9, sources: ["m1"], killed: false },
+      // Written before the row carried a finding's identity: its verdicts still count, but
+      // it can be attributed to no finder and no category, which is the honest answer.
+      { killed: true },
+    ],
+    dismissed: new Set(),
+  });
+  eq("a refuted finding joins the population it was missing from", killedReport.findings, 2);
+  eq("...and is counted as killed", killedReport.killed, 1);
+  eq("...without ever counting as published", killedReport.published, 1);
+  const kCat = new Map(killedReport.byCategory.map((b) => [b.key, b]));
+  eq("the kill lands in its own category", [kCat.get("security")?.findings, kCat.get("security")?.killed], [1, 1]);
+  eq("...and not in the survivor's", kCat.get("correctness")?.killed, 0);
+  const kFinder = new Map(killedReport.byFinder.map((b) => [b.key, b]));
+  eq("the finder whose output was refuted is named", [kFinder.get("m2")?.findings, kFinder.get("m2")?.killed], [1, 1]);
+  eq("...and the one whose output survived is not blamed", kFinder.get("m1")?.killed, 0);
 }
 
 // --- realistic seeded PR ---

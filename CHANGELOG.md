@@ -63,6 +63,20 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 - The pipeline, not the model, owns the criteria list, so the requirement axis's denominator
   stops moving between runs.
 
+### Added
+
+- **The skeptic's work can be measured per finder and per category.** `skeptic.json` rows now
+  carry the finding's fingerprint, category, severity, confidence and sources, and
+  `scripts/calibrate.ts` joins them back into the population it reports on. A refuted finding
+  is dropped before `finalize` runs, so it appears in no `findings.json` at all — which meant
+  every rate the tool printed was computed over the survivors alone, and a finder whose output
+  the verifier threw away was indistinguishable from one that produced nothing to throw away.
+  The three bucket tables gain a `killed` column, and the headline reports how much of
+  everything found the skeptic refuted before anyone saw it. No behaviour change in the
+  pipeline, no model call, no new knob; old `runs/` trees still produce a report, with rows
+  that predate the new fields counting toward the per-model verdict table and attributed to
+  no finder.
+
 ### Fixed
 
 - **prloop's hidden markers are no longer trusted on the markers alone.** `readMarkers` decided

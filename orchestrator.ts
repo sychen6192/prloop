@@ -350,6 +350,18 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       line: o.finding.anchor?.startLine,
       claim: o.finding.claim,
       killed: o.killed,
+      // The finding's identity, so a refuted one can be counted at all. applyVerdicts drops
+      // a killed finding before finalize sees it, so it reaches neither `inline`, `belowBar`
+      // nor `degraded` in findings.json — it exists only as this row. Without a fingerprint
+      // to join on and a category and sources to group by, the skeptic is the pipeline's
+      // main precision mechanism and the one stage nothing could measure per finder or per
+      // category: scripts/calibrate.ts could only report a kill rate per skeptic MODEL, and
+      // its byFinder table counted a finder's killed findings as if they had never existed.
+      fingerprint: o.finding.fingerprint,
+      category: o.finding.category,
+      severity: o.finding.severity,
+      confidence: o.finding.confidence,
+      sources: o.finding.sources,
       verdicts: o.verdicts,
       // The prompt is the audit trail for a wrong refutation — without it, a killed real
       // finding cannot be debugged.
