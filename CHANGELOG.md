@@ -65,6 +65,19 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **`scripts/evaluate.ts`: the golden-set evaluation PROPOSAL §12 has asked for since the first
+  draft.** Write a `golden.json` beside a PR's run directories listing the defects you know it
+  contains, and it scores the newest run against them — offline, read-only, no new dependency.
+  The output is not a single recall number, because a miss is not one event: every defect is
+  filed under the furthest stage it reached (`inline`, `cap`, `severity`, `no-corroboration`,
+  `dismissed`, `refuted`, `anchor-failed`, `not-found`), and each of those names a different
+  file to open. `mustNotFlag` regions are what make precision measurable at all — a comment
+  matching no listed defect may be a false positive or a real bug the golden set does not know
+  about, so only comments inside a region a reviewer declared clean are counted as mistakes and
+  the rest are reported as unattributed. A per-finder table turns the multi-model question into
+  a number you can compare across runs. `fixtures/seeded-pr.ts` now exports `SEEDED_DEFECTS`,
+  derived from the anchoring vectors it already verified with `grep -n` so the two cannot
+  drift.
 - **The skeptic's work can be measured per finder and per category.** `skeptic.json` rows now
   carry the finding's fingerprint, category, severity, confidence and sources, and
   `scripts/calibrate.ts` joins them back into the population it reports on. A refuted finding

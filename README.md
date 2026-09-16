@@ -488,6 +488,33 @@ category, is what says whether a finder is earning the verification it costs. Ru
 before `skeptic.json` recorded a finding's identity still count toward the per-model verdict
 table; they simply cannot be attributed to a finder or a category.
 
+`scripts/evaluate.ts` answers the other half of PROPOSAL §12: not "did a human reject what we
+published" but "did we publish what is actually there". Write a `golden.json` beside a PR's
+iteration directories listing the defects you know it contains, and it scores the newest run
+against them:
+
+```json
+{
+  "defects": [{ "file": "src/pay.ts", "lines": [25, 25], "note": "gateway call inside the transaction" }],
+  "mustNotFlag": [{ "file": "src/util.ts", "lines": [1, 80], "note": "reviewed clean" }]
+}
+```
+
+The output is not one recall number, because a miss is not one event. Each defect is filed
+under the furthest stage it reached — `inline`, `cap`, `severity`, `no-corroboration`,
+`dismissed`, `refuted`, `anchor-failed`, `not-found` — and each of those names a different
+file to open. A defect nothing mentioned is a finder-prompt or model problem; one whose quote
+would not anchor is `anchoring/locate.ts`; one the skeptic killed is verification; one held
+back for want of a second finder is the corroboration gate. "Recall 60%" hides which.
+
+`mustNotFlag` is what makes precision measurable at all: a comment matching no listed defect
+may be a false positive or a real bug the golden set does not know about, and nothing in the
+artifacts can tell those apart. Only a comment inside a region a reviewer has declared clean
+is a measured mistake; the rest are reported as unattributed and counted against nothing.
+
+The per-finder table is the multi-model question in numbers. Run the same golden set with
+`PRR_FINDER_MODELS=a` and then `a,b` into different `PRR_RUNS_DIR`s and compare.
+
 `scripts/selftest.ts` is the regression net for anchoring — **run it after touching
 `libs/diff.ts` or `anchoring/locate.ts`**. Its assertions map directly onto the causes of
 "comment on the wrong line".

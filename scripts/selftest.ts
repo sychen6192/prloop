@@ -63,7 +63,7 @@ import type { ToolFinding } from "../profiles/types";
 import type { PrRef } from "../libs/types";
 import type { ToolSpec } from "../profiles/types";
 import type { AnchoredFinding, ChatRequest, FileDiff, RawFinding } from "../libs/types";
-import { SEEDED_FILES, EXPECTED_ANCHORS } from "../fixtures/seeded-pr";
+import { SEEDED_FILES, EXPECTED_ANCHORS, SEEDED_DEFECTS } from "../fixtures/seeded-pr";
 import { buildTriagePrompt } from "../prompts/triage";
 import { load, sourcePaths } from "../libs/tls";
 import { Semaphore } from "../libs/limit";
@@ -90,6 +90,7 @@ import { buildReqDisputePrompt } from "../prompts/skeptic";
 import { coveredByThread } from "../publish/publish";
 import { rankForVerification } from "../gates/skeptic";
 import { calibrate } from "./calibrate";
+import { evaluateRun, totalsOf, STAGES, type EvaluatedFinding, type GoldenSet } from "./evaluate";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
 import type { CriterionCheck, ReqVerdict, RequirementResult, WorkItem } from "../libs/types";
 import { FINDINGS_SCHEMA, REQ_DISPUTE_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
@@ -1886,6 +1887,94 @@ section("calibration: joining what we published to what humans rejected");
   const kFinder = new Map(killedReport.byFinder.map((b) => [b.key, b]));
   eq("the finder whose output was refuted is named", [kFinder.get("m2")?.findings, kFinder.get("m2")?.killed], [1, 1]);
   eq("...and the one whose output survived is not blamed", kFinder.get("m1")?.killed, 0);
+}
+
+section("golden-set evaluation: which stage lost the defect, not just that one was lost");
+{
+  const at = (file: string, start: number, over: Partial<EvaluatedFinding> = {}): EvaluatedFinding => ({
+    file,
+    start,
+    end: start,
+    sources: ["m1"],
+    ...over,
+  });
+  const golden: GoldenSet = {
+    defects: [
+      { file: "src/a.ts", lines: [10, 10], note: "reported" },
+      { file: "src/a.ts", lines: [20, 20], note: "capped" },
+      { file: "src/a.ts", lines: [30, 30], note: "single finder" },
+      { file: "src/b.ts", lines: [40, 40], note: "skeptic killed it" },
+      { file: "src/c.ts", lines: [50, 50], note: "quote would not anchor" },
+      { file: "src/d.ts", lines: [60, 60], note: "nobody said anything" },
+    ],
+    mustNotFlag: [{ file: "src/e.ts", lines: [1, 99], note: "reviewed clean" }],
+  };
+  const e = evaluateRun(golden, {
+    inline: [
+      at("src/a.ts", 10, { sources: ["m1", "m2"] }),
+      // Inside a region a reviewer declared clean: a measured mistake, not a guess.
+      at("src/e.ts", 7),
+      // Matches neither a defect nor a clean region — unknown, and must not be counted
+      // against precision, because the golden set does not claim to be exhaustive.
+      at("src/z.ts", 3),
+    ],
+    belowBar: [
+      at("src/a.ts", 20, { suppressedBy: "cap" }),
+      at("src/a.ts", 30, { suppressedBy: "no-corroboration" }),
+    ],
+    // A degraded finding has no line at all — that is what makes it degraded — so it can
+    // only be matched on the file.
+    degraded: [{ file: "src/c.ts", sources: ["m1"], anchorFailure: "quote-ambiguous" }],
+    refuted: [at("src/b.ts", 40, { sources: ["m2"] })],
+  });
+  const stages = new Map(e.outcomes.map((o) => [o.defect.note, o.stage]));
+  eq("a defect that reached a comment is a hit", stages.get("reported"), "inline");
+  eq("...one cut by the cap names the cap", stages.get("capped"), "cap");
+  eq("...one held for want of a second finder names corroboration", stages.get("single finder"), "no-corroboration");
+  eq("...one the skeptic killed is not 'not found'", stages.get("skeptic killed it"), "refuted");
+  eq("...one whose quote would not anchor blames anchoring", stages.get("quote would not anchor"), "anchor-failed");
+  eq("...and only silence is not-found", stages.get("nobody said anything"), "not-found");
+  eq("recall counts comments, not attempts", e.hits, 1);
+  eq("but five of six were seen by something", e.found, 4);
+
+  // Precision's denominator is the honest part. A comment matching no known defect is not
+  // evidence of a false positive unless a reviewer said that region was clean.
+  eq("a comment in a declared-clean region is a false positive", e.falsePositives.length, 1);
+  eq("...and one nobody has ruled on is unattributed, not wrong", e.unattributed.length, 1);
+
+  // Furthest stage wins: the kill is a fact about one finding, not about the defect.
+  const both = evaluateRun(
+    { defects: [{ file: "src/a.ts", lines: [10, 10], note: "x" }] },
+    { inline: [at("src/a.ts", 10)], belowBar: [], degraded: [], refuted: [at("src/a.ts", 10, { sources: ["m2"] })] },
+  );
+  eq("a defect one finder found and another had refuted still counts as reported", both.outcomes[0]?.stage, "inline");
+
+  // Paths come from a golden file a human typed; findings.json stores them canonically.
+  const slashed = evaluateRun(
+    { defects: [{ file: "/src/a.ts", lines: [10, 10], note: "x" }] },
+    { inline: [at("src/a.ts", 10)], belowBar: [], degraded: [], refuted: [] },
+  );
+  eq("a leading slash in the golden file does not lose the match", slashed.outcomes[0]?.stage, "inline");
+
+  const t = totalsOf([e]);
+  eq("every stage is a row, even at zero", Object.keys(t.byStage).length, STAGES.length);
+  eq("totals carry the defect count", t.defects, 6);
+  eq("both finders on one defect are both credited", [t.byFinder.get("m1"), t.byFinder.get("m2")], [4, 2]);
+
+  // The fixture is the golden set that ships with the repo; it must stay in step with the
+  // anchoring vectors it is derived from rather than drifting into a hand-written copy.
+  eq("the seeded PR ships eight known defects", SEEDED_DEFECTS.length, 8);
+  check(
+    "...every one of them naming a line the anchoring net also pins",
+    SEEDED_DEFECTS.every((d) =>
+      EXPECTED_ANCHORS.some((a) => a.file === d.file && a.expect === d.lines[0] && a.defect === true),
+    ),
+  );
+  check(
+    "...and none of the anchoring boundary cases among them",
+    !SEEDED_DEFECTS.some((d) => d.note.includes("->")),
+    SEEDED_DEFECTS.map((d) => d.note).join(" | "),
+  );
 }
 
 // --- realistic seeded PR ---

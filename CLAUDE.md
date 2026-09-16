@@ -16,6 +16,7 @@ npx tsx scripts/selftest-cli.ts      # argument grammar and exit codes
 npx tsx scripts/selftest-docs.ts     # claims the docs make about the code
 npx tsx scripts/demo.ts              # render comments from fake data, no network
 npx tsx scripts/calibrate.ts         # dismissal / kill rates from runs/ + dismissals.jsonl
+npx tsx scripts/evaluate.ts          # golden-set recall: which stage lost each known defect
 ```
 
 Everything is offline-testable; no test needs ADO credentials or a model endpoint. The four
