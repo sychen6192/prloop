@@ -94,7 +94,7 @@ import { REQUIREMENT_SYSTEM } from "../prompts/requirement";
 import { buildReqDisputePrompt } from "../prompts/skeptic";
 import { coveredByThread } from "../publish/publish";
 import { rankForVerification } from "../gates/skeptic";
-import { calibrate } from "./calibrate";
+import { calibrate, groupReasons } from "./calibrate";
 import { evaluateRun, totalsOf, STAGES, type EvaluatedFinding, type GoldenSet } from "./evaluate";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
 import type { CriterionCheck, ReqVerdict, RequirementResult, WorkItem } from "../libs/types";
@@ -1915,6 +1915,31 @@ section("calibration: joining what we published to what humans rejected");
   eq("...and a comment nobody answered counts as nothing", aCat.get("performance")?.actedOn, 0);
   const aFinder = new Map(acted.byFinder.map((b) => [b.key, b]));
   eq("per finder, how much of its output was acted on", [aFinder.get("m1")?.actedOn, aFinder.get("m2")?.actedOn], [2, 0]);
+
+  // A dismissal rate says how often prloop is wrong; only the reviewer's words say in what
+  // way, and until now the only thing kept about a dismissal was that it happened.
+  const withReasons = calibrate({
+    findings: [f("a", "performance", 0.8, ["m1"], true)],
+    verdicts: [],
+    dismissed: new Set(["a"]),
+    dismissalReasons: ["This is a test fixture.", "this is a test fixture", "  This is a test fixture  ", "Intentional, see ADR-7"],
+    reasonlessDismissals: 6,
+  });
+  eq(
+    "the same objection typed three ways is one reason",
+    withReasons.reasons,
+    [{ reason: "This is a test fixture.", count: 3 }, { reason: "Intentional, see ADR-7", count: 1 }],
+  );
+  eq("...and the reviewers who said nothing are counted too", withReasons.reasonless, 6);
+  // Case and trailing punctuation only. Anything cleverer merges two different reasons and
+  // reports a consensus nobody expressed.
+  eq(
+    "two different objections stay two",
+    groupReasons(["wrong line", "wrong file"]).map((r) => r.count),
+    [1, 1],
+  );
+  eq("blank replies are not a reason", groupReasons(["   ", ""]), []);
+  eq("nothing recorded is an empty list, not a zero row", calibrate({ findings: [], verdicts: [], dismissed: new Set() }).reasons, []);
 }
 
 section("golden-set evaluation: which stage lost the defect, not just that one was lost");
@@ -3877,6 +3902,14 @@ section("source hygiene: no raw control characters in tracked sources");
     });
   }
   check("no control characters other than \\t \\n \\r in tracked *.ts / *.md", offenders.length === 0, offenders.slice(0, 10).join(", "));
+
+  // A dismissal now carries a reviewer's own words, and those must never reach a model. The
+  // guarantee is structural rather than a rule somebody remembers: no prompt builder imports
+  // the store at all, so there is no path from a reply on a pull request into a prompt.
+  const promptFiles = tracked.filter((f) => f.startsWith("prompts/") && f.endsWith(".ts"));
+  check("there are prompt modules to check", promptFiles.length >= 4, String(promptFiles.length));
+  const readers = promptFiles.filter((f) => /from "[^"]*libs\/learnings"/.test(fs.readFileSync(path.join(PRLOOP_ROOT, f), "utf8")));
+  eq("no prompt builder can read the dismissal store", readers, []);
 }
 
 section("prompt-injection surface: fenced author text, scoped rules precedence");

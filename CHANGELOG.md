@@ -144,6 +144,18 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   a thread this run is about to close is not also booked as a reviewer's fix, off markers
   alone so a pipeline run still counts a laptop run's comments, and not printed at all on a
   first run or a PR where nothing has been settled.
+- **A dismissal keeps the reviewer's reason.** The first reply in the thread that prloop did
+  not write is the person explaining why they rejected the finding, and it was discarded — the
+  store that the whole suppression feature rests on recorded only that a dismissal happened.
+  "We dismiss a lot of performance findings" and "we dismiss them because the quoted line is
+  always in a test fixture" are different problems with different fixes. `scripts/calibrate.ts`
+  gains a table of what reviewers actually said, folded on case and trailing punctuation only
+  (anything cleverer merges two reasons and reports a consensus nobody expressed), with the
+  count of dismissals that came with no reply beside it. The reply is author-controlled text:
+  it is flattened to one line and capped on the way in, it reaches no prompt — no module under
+  `prompts/` can read the store, and the selftest pins that — and `recordDismissals` now writes
+  through `redactSecrets`, which it had been bypassing by appending its own bytes rather than
+  going through `libs/artifacts.ts`.
 
 ### Changed
 

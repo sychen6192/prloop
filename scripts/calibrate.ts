@@ -72,6 +72,21 @@ export interface CalibrationInput {
   // flagged line having gone away, which is narrow but not a person saying anything — so the
   // headline rate counts only the first, and the second is reported beside it.
   actedOn?: { fixed: Set<string>; autoClosed: Set<string> };
+  /**
+   * What reviewers actually said when they dismissed something, one entry per dismissal that
+   * carried a reply, from the same stores as `dismissed`. Kept apart from the fingerprint
+   * set because it answers a different question: the set says how often the tool is wrong,
+   * these say in what way.
+   */
+  dismissalReasons?: string[];
+  /** Dismissals in those stores where the reviewer said nothing at all. */
+  reasonlessDismissals?: number;
+}
+
+/** One thing reviewers keep saying when they reject a finding, and how often. */
+export interface DismissalReason {
+  reason: string;
+  count: number;
 }
 
 export interface Bucket {
@@ -122,6 +137,15 @@ export interface CalibrationReport {
   // Dismissals whose finding is in no run we can still read — usually retention pruned the
   // run. Reported so the totals above are never mistaken for the whole history.
   orphanDismissals: number;
+  /**
+   * The reviewers' own words, most repeated first. A dismissal rate says how often prloop is
+   * wrong; only this says in what way — "we dismiss a lot of performance findings" and "we
+   * dismiss them because the quoted line is always in a test fixture" are different problems
+   * with different fixes, and the second is the one that changes a prompt or a rule.
+   */
+  reasons: DismissalReason[];
+  /** Dismissals whose reviewer left no reply. Usually most of them; worth knowing. */
+  reasonless: number;
   byConfidence: Bucket[];
   byCategory: Bucket[];
   byFinder: Bucket[];
@@ -154,6 +178,27 @@ function toBuckets(m: Map<string, ReturnType<typeof tally>>, order?: string[]): 
   if (order) return rows.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
   // Biggest population first: a 100% dismissal rate over one finding is not the top line.
   return rows.sort((a, b) => b.findings - a.findings || a.key.localeCompare(b.key));
+}
+
+/**
+ * Groups reviewers' replies by what they say.
+ *
+ * Case and trailing punctuation are folded together, and nothing else is: these are
+ * sentences people typed, and any cleverer normalisation would merge two different reasons
+ * and report a consensus nobody expressed. The first spelling seen is the one displayed, so
+ * the report shows a reviewer's actual words rather than a lowercased reconstruction.
+ */
+export function groupReasons(reasons: readonly string[]): DismissalReason[] {
+  const counts = new Map<string, { reason: string; count: number }>();
+  for (const r of reasons) {
+    const text = r.trim();
+    if (!text) continue;
+    const key = text.toLowerCase().replace(/[.!?\s]+$/, "");
+    const prior = counts.get(key);
+    if (prior) prior.count++;
+    else counts.set(key, { reason: text, count: 1 });
+  }
+  return [...counts.values()].sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
 }
 
 /**
@@ -273,6 +318,8 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     dismissed: dismissedCount,
     publishedDismissed,
     orphanDismissals,
+    reasons: groupReasons(input.dismissalReasons ?? []),
+    reasonless: input.reasonlessDismissals ?? 0,
     byConfidence: toBuckets(conf, CONFIDENCE_FLOORS.map(([, k]) => k)),
     byCategory: toBuckets(cat),
     byFinder: toBuckets(finder),
@@ -398,6 +445,8 @@ export function scanRuns(root: string): ScanResult {
   const outcomes: CalibrationOutcome[] = [];
   const unusable: string[] = [];
   const dismissed = new Set<string>();
+  const dismissalReasons: string[] = [];
+  let reasonlessDismissals = 0;
   const actedOn = { fixed: new Set<string>(), autoClosed: new Set<string>() };
   const repos: string[] = [];
 
@@ -421,7 +470,11 @@ export function scanRuns(root: string): ScanResult {
     // and a second parser here would drift from the one that writes it.
     const [org = "", project = "", repoId = ""] = rel.slice(-3);
     const ref = { baseUrl: "", org, project, repoId, prId: 0 };
-    for (const d of loadDismissals(ref, root)) dismissed.add(d.fingerprint);
+    for (const d of loadDismissals(ref, root)) {
+      dismissed.add(d.fingerprint);
+      if (d.reason) dismissalReasons.push(d.reason);
+      else reasonlessDismissals++;
+    }
     // Its own store, read through its own loader for the same reason: both tolerate corrupt
     // lines and dedupe first-wins, and a second parser here would drift from the writer.
     for (const o of loadOutcomes(ref, root)) {
@@ -429,7 +482,7 @@ export function scanRuns(root: string): ScanResult {
     }
   }
 
-  return { findings, verdicts, outcomes, dismissed, actedOn, runs, unusable, repos };
+  return { findings, verdicts, outcomes, dismissed, dismissalReasons, reasonlessDismissals, actedOn, runs, unusable, repos };
 }
 
 // ─── Output ─────────────────────────────────────────────────────────────────
@@ -501,6 +554,18 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
     bucketTable("Dismissal rate by finder model", report.byFinder),
     "",
   );
+  const totalReasons = report.reasons.reduce((n, r) => n + r.count, 0);
+  if (totalReasons > 0 || report.reasonless > 0) {
+    out.push(
+      totalReasons === 0
+        ? `Why reviewers said no\n  (none of the ${report.reasonless} dismissals came with a reply)`
+        : `Why reviewers said no (${totalReasons} of ${totalReasons + report.reasonless} dismissals came with a reply)\n${table(
+            ["reason", "count"],
+            report.reasons.slice(0, 10).map((r) => [r.reason.slice(0, 96), String(r.count)]),
+          )}`,
+      "",
+    );
+  }
   out.push(
     report.skeptics.length === 0
       ? "Skeptic verdicts\n  (no verification recorded)"

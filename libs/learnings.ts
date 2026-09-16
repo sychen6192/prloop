@@ -18,6 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { DISMISSAL_HINT_THRESHOLD, RUNS_DIR } from "../config";
 import { logVerbose } from "./log";
+import { redactSecrets } from "./redact";
 import type { PrRef } from "./types";
 
 export interface StoredDismissal {
@@ -27,6 +28,8 @@ export interface StoredDismissal {
   // Parsed from the comment's category marker; absent on comments posted by older versions.
   category?: string;
   resolvedAs: string;
+  /** What the reviewer said when they closed it, if anything (publish/lifecycle.ts). */
+  reason?: string;
   prId: number;
   recordedAt: string;
 }
@@ -71,7 +74,7 @@ export function loadDismissals(ref: PrRef, root: string = RUNS_DIR): StoredDismi
  */
 export function recordDismissals(
   ref: PrRef,
-  records: Array<{ fingerprint: string; file: string; claim: string; category?: string; resolvedAs: string }>,
+  records: Array<{ fingerprint: string; file: string; claim: string; category?: string; resolvedAs: string; reason?: string }>,
   root: string = RUNS_DIR,
 ): number {
   if (records.length === 0) return 0;
@@ -85,7 +88,12 @@ export function recordDismissals(
   const lines = fresh
     .map((r) => JSON.stringify({ ...r, prId: ref.prId, recordedAt: now } satisfies StoredDismissal))
     .join("\n");
-  fs.appendFileSync(p, `${lines}\n`);
+  // Redacted like every other artifact this process writes. This store was the one egress
+  // that bypassed it — it appends its own bytes instead of going through libs/artifacts.ts —
+  // and it now carries a reviewer's free text, which is exactly where somebody explains a
+  // dismissal by pasting the credential the finding was about. The replacement is a plain
+  // string in an already-escaped JSON value, so a redacted line still parses.
+  fs.appendFileSync(p, `${redactSecrets(lines)}\n`);
   return fresh.length;
 }
 

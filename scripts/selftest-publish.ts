@@ -976,6 +976,70 @@ try {
     eq("...and does not hold the resume point", rejected.watermark, { record: 3, held: false });
   }
 
+  section("a dismissal keeps the reviewer's reason, which is the only thing that says WHY");
+  {
+    // The dismissal store is the basis of the whole suppression feature, and the only thing
+    // it kept about a dismissal was that one happened. "We dismiss a lot of performance
+    // findings" and "we dismiss them because the quoted line is always in a test fixture" are
+    // different problems with different fixes, and the second was thrown away every time.
+    const { loadDismissals: load } = await import("../libs/learnings");
+    const BOT = "33333333-4444-5555-6666-777777777777";
+    const dismissed = (id: number, fp: string, replies: Array<{ id: number; content: string; author?: string }>): FakeThread => ({
+      id,
+      status: "wontFix",
+      comments: [
+        { id: id + 50, content: `${BOT_MARKER}<!-- prloop:fp=${fp} --><!-- prloop:cat=performance -->\n**High** · Performance\n\nN+1 query.`, author: { id: BOT } },
+        ...replies.map((r) => ({ id: r.id, content: r.content, author: { id: r.author ?? "human" } })),
+      ],
+      threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 5 }, rightFileEnd: { line: 5 } },
+    });
+
+    setState({
+      selfIdentityId: BOT,
+      threads: [
+        dismissed(8001, "ee110001", [{ id: 8101, content: "It's a test fixture, the loop runs twice." }]),
+        // A reviewer who said nothing is the common case and must not invent a reason.
+        dismissed(8002, "ee110002", []),
+        // prloop's own follow-up in the thread is not a reviewer's reason.
+        dismissed(8003, "ee110003", [
+          { id: 8103, content: `${BOT_MARKER}\nstill open`, author: BOT },
+          { id: 8104, content: "duplicate of the one above", author: "human" },
+        ]),
+        // A reply is free text: multi-line, and long enough to matter in a JSONL store.
+        dismissed(8004, "ee110004", [{ id: 8105, content: `no\n\n## Verdict\n\n${"x".repeat(600)}` }]),
+      ],
+    });
+    resetIdentityCache();
+    const { value: r } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const byFp = new Map(r.dismissals.map((d) => [d.fingerprint, d.reason]));
+    eq("the reviewer's own words are kept", byFp.get("ee110001"), "It's a test fixture, the loop runs twice.");
+    eq("...and a reviewer who said nothing gets no invented reason", byFp.get("ee110002"), undefined);
+    eq("...and prloop's own reply in the thread is not a reviewer's reason", byFp.get("ee110003"), "duplicate of the one above");
+    const long = byFp.get("ee110004") ?? "";
+    check("...and a reply is flattened and bounded before it is stored", !long.includes("\n") && long.startsWith("no ## Verdict") && long.length < 340, String(long.length));
+
+    const stored = new Map(load(ref, runsDir).map((d) => [d.fingerprint, d.reason]));
+    eq("the reason reaches dismissals.jsonl", stored.get("ee110001"), "It's a test fixture, the loop runs twice.");
+
+    // The store appends its own bytes instead of going through libs/artifacts.ts, so it was
+    // the one artifact egress that never met redactSecrets — and it now carries free text a
+    // reviewer typed, which is exactly where somebody explains a dismissal by pasting the
+    // credential the finding was about.
+    setState({
+      selfIdentityId: BOT,
+      threads: [dismissed(8010, "ee110010", [{ id: 8110, content: "fine, we authenticate with sk-live-abcdefghijklmnop here" }])],
+    });
+    resetIdentityCache();
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const raw = fs.readFileSync(path.join(runsDir, "contoso", "Shop", "shop-api", "dismissals.jsonl"), "utf8");
+    check("a credential in a reviewer's reply never reaches the store", !raw.includes("sk-live-abcdefghijklmnop"), raw.slice(-200));
+    check("...and what is stored still parses", raw.trim().split("\n").every((l) => JSON.parse(l).fingerprint), "");
+    eq("...with the redaction in place of it", load(ref, runsDir).find((d) => d.fingerprint === "ee110010")?.reason?.includes("[REDACTED]"), true);
+
+    setState({ threads: [] });
+    resetIdentityCache();
+  }
+
   section("the summary says what became of the comments it left last time");
   {
     // `resolved` was computed on every run and reached nothing a human reads. A PR carrying

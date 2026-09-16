@@ -10,8 +10,9 @@
 // the tool is meant to be runnable from a pipeline agent, a laptop, or a cron box without
 // them sharing a filesystem.
 import { readMarkers } from "./markers";
+import { neutralizeLine } from "../prompts/untrusted";
 import { isSelfIdentity, selfIdentityId } from "../ado/identity";
-import { listThreads, setThreadStatus, type Thread } from "../ado/threads";
+import { listThreads, setThreadStatus, type Thread, type ThreadComment } from "../ado/threads";
 import type { FileIndex } from "../libs/fileindex";
 import { log, logVerbose } from "../libs/log";
 import type { PrRef } from "../libs/types";
@@ -343,6 +344,32 @@ export interface DismissalRecord {
   // From the comment's category marker; absent on comments posted by older versions.
   category?: string;
   resolvedAs: string;
+  /** What the reviewer said when they closed it. Absent when they said nothing. */
+  reason?: string;
+}
+
+/**
+ * The reviewer's own words for why they rejected a finding.
+ *
+ * The first reply in the thread that prloop did not write. A dismissal is the most valuable
+ * signal the tool gets — it is the basis of the whole suppression feature — and until now the
+ * only thing kept about one was that it happened. "We dismiss a lot of performance findings"
+ * and "we dismiss a lot of performance findings BECAUSE THE QUOTED LINE IS ALWAYS IN A TEST
+ * FIXTURE" are different problems with different fixes, and the second was thrown away every
+ * time.
+ *
+ * Bounded and flattened on the way in (prompts/untrusted.ts). It is author-controlled text
+ * that ends up in dismissals.jsonl and in a terminal report, and it must never reach a prompt:
+ * a reviewer's reply is not a review instruction, and nothing downstream of the store reads
+ * anything but the fingerprint and the category.
+ */
+function dismissalReason(comments: ThreadComment[] | undefined): string | undefined {
+  for (const c of comments ?? []) {
+    if (c.isDeleted || readMarkers(c.content).ours) continue;
+    const text = neutralizeLine(c.content ?? "");
+    if (text) return text;
+  }
+  return undefined;
 }
 
 /**
@@ -370,12 +397,14 @@ export function collectDismissals(threads: Thread[], selfId?: string): Dismissal
     if (!c) continue;
     const m = readMarkers(c.content);
     if (!m.fingerprint) continue; // the summary comment carries no fingerprint
+    const reason = dismissalReason(t.comments);
     out.push({
       fingerprint: m.fingerprint,
       file: t.threadContext?.filePath ?? "",
       claim: (c.content ?? "").split("\n").find((l) => l && !l.startsWith("<") && !l.startsWith("**")) ?? "",
       category: m.category,
       resolvedAs: t.status ?? "",
+      ...(reason === undefined ? {} : { reason }),
     });
   }
   return out;

@@ -331,7 +331,11 @@ npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
   overlap; a substantially reworded finding on a *different* PR can still reappear —
   fingerprints hash the quote). A thread merely marked *Closed* is treated as handled, not
   dismissed. After three dismissals in one category the summary suggests excluding it, and
-  stops there: prloop never writes its own config.
+  stops there: prloop never writes its own config. The reviewer's first reply in the thread is
+  kept as the *reason*, and `scripts/calibrate.ts` groups by it — a dismissal rate says how
+  often prloop is wrong, and only the reason says in what way. It is a reviewer's free text,
+  so it is flattened, capped and redacted on the way into the store, and it reaches no prompt:
+  nothing under `prompts/` can read that store at all, and the selftest pins it.
 - **Clean PR → one quiet line.** Style and formatting never get a comment; that's the linter's job.
 
 Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the settings the run
