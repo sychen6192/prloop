@@ -12,10 +12,10 @@ import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
 import { recordOutcomes } from "../libs/outcomes";
 import { log } from "../libs/log";
-import { collectDismissals, collectOutcomes, findStaleThreads, resolveStaleThreads, watermarkFor } from "./lifecycle";
+import { collectDismissals, collectOutcomes, findStaleThreads, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
 import { iterationMarker, readMarkers } from "./markers";
 import type { AnchoredFinding, PrRef } from "../libs/types";
-import type { DismissalRecord, OutcomeRecord, StaleThread, WatermarkDecision } from "./lifecycle";
+import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
 
 export interface PublishResult {
@@ -27,6 +27,9 @@ export interface PublishResult {
   failed: Array<{ finding: AnchoredFinding; error: string; status?: number }>;
   // Our own threads auto-closed because the code they pointed at changed.
   resolved: number;
+  // Where every comment prloop has left on this PR now stands. Absent on a dry run and when
+  // the thread list could not be read — neither of which is the same as "all zero".
+  threads?: ThreadTally;
   // Findings a human closed as wontFix/byDesign — raw material for future exclusion rules.
   dismissals: DismissalRecord[];
   // Findings the author acted on: fixed by a human, or auto-closed because the code went
@@ -292,6 +295,9 @@ export async function publish(
   // a PR accumulates stale comments the author already addressed.
   const closed = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex));
   result.resolved = closed.length;
+  // From the same pre-close snapshot as the outcomes below, so a thread this run has just
+  // closed is still `active` in it and cannot also be booked as a reviewer's fix.
+  result.threads = tallyThreads(threads, closed.length);
   result.dismissals = collectDismissals(threads, selfId);
 
   // The positive half of the record, and the only evidence prloop has ever collected that a
@@ -405,6 +411,8 @@ export async function publish(
       alreadyPosted: result.alreadyPosted,
       failed: result.failed,
       watermark,
+      ...(result.threads === undefined ? {} : { threads: result.threads }),
+      ...(prior === undefined ? {} : { sinceIteration: prior }),
     })}\n` + (watermark.record === undefined ? "" : iterationMarker(watermark.record));
 
   try {

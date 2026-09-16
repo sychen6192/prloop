@@ -321,6 +321,10 @@ npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
 - **No duplicates on re-run** — each comment embeds a finding fingerprint.
 - **Stale threads auto-close** when their target code is gone. The criteria are narrow on
   purpose: wrongly closing a live issue is worse than leaving a stale comment.
+- **The summary says what became of the last run's comments** — how many this run closed
+  because the code under them changed (dated from the `--since auto` resume point, which is
+  what made them stale), how many a reviewer marked fixed, how many were dismissed, and how
+  many are still waiting. Nothing settled yet, or a first run, prints no line at all.
 - **Dismissals stick.** A finding closed as *wontFix*/*byDesign* is recorded per repo
   (`runs/<org>/<project>/<repo>/dismissals.jsonl`) and never posted again on any PR where
   the model produces the same quote (rewordings on the same PR are also caught by position

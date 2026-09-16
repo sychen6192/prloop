@@ -246,6 +246,56 @@ export async function resolveStaleThreads(ref: PrRef, stale: StaleThread[]): Pro
   return closed;
 }
 
+/** Where prloop's own inline comments on this PR stand right now. */
+export interface ThreadTally {
+  /** Still awaiting an answer, after this run's own closes are taken out. */
+  open: number;
+  /** A reviewer marked them fixed. */
+  fixed: number;
+  /** A reviewer said no: wontFix or byDesign. */
+  dismissed: number;
+  /** Closed by THIS run, because the code under them is gone. */
+  closedThisRun: number;
+}
+
+/**
+ * The lifecycle of prloop's comments, counted for the summary.
+ *
+ * `resolved` was computed on every run and went nowhere: a reader of the sticky summary
+ * could see what this run found and nothing about what had become of everything it said
+ * before. A PR carrying twelve open prloop comments and one carrying twelve the author has
+ * worked through read identically.
+ *
+ * Markers alone, no authorship check, for the same reason findStaleThreads uses none: these
+ * are counts in a summary, so a forged thread buys an inflated number, while requiring
+ * identity would make a pipeline run report zero for every comment a laptop run posted —
+ * and prloop's credential legitimately differs between the two.
+ *
+ * `threads` must be the snapshot taken BEFORE this run closed anything, so a thread it is
+ * about to auto-close is still `active` here and is not also counted as a reviewer's fix.
+ * That is why the closes are subtracted rather than read off the list.
+ */
+export function tallyThreads(threads: Thread[], closedThisRun: number): ThreadTally {
+  let open = 0;
+  let fixed = 0;
+  let dismissed = 0;
+  for (const t of threads) {
+    const first = t.comments?.find((c) => !c.isDeleted);
+    if (!first) continue;
+    const m = readMarkers(first.content);
+    // A fingerprint is what makes it a finding: the sticky summary is ours and marked, and
+    // counting it as an open comment would put a permanent +1 on every PR.
+    if (!m.ours || !m.fingerprint) continue;
+    if (t.status === "fixed") fixed++;
+    else if (t.status === "wontFix" || t.status === "byDesign") dismissed++;
+    else if (t.status === "active" || t.status === "pending") open++;
+    // "Closed" is deliberately in none of them. In the ADO UI it is the catch-all that
+    // routinely means "I have read this", which is neither a fix nor a dismissal, and
+    // collectDismissals already refuses to read it as one.
+  }
+  return { open: Math.max(0, open - closedThisRun), fixed, dismissed, closedThisRun };
+}
+
 export interface OutcomeRecord {
   fingerprint: string;
   file: string;

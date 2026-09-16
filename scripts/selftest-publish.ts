@@ -976,6 +976,90 @@ try {
     eq("...and does not hold the resume point", rejected.watermark, { record: 3, held: false });
   }
 
+  section("the summary says what became of the comments it left last time");
+  {
+    // `resolved` was computed on every run and reached nothing a human reads. A PR carrying
+    // twelve open prloop comments and one carrying twelve the author had worked through
+    // rendered identically.
+    const { tallyThreads } = await import("../publish/lifecycle");
+    const BOT = "22222222-3333-4444-5555-666666666666";
+    const ours = (id: number, status: string, fp: string, line: number): FakeThread => ({
+      id,
+      status,
+      comments: [{ id: id + 100, content: `${BOT_MARKER}<!-- prloop:fp=${fp} --><!-- prloop:cat=correctness -->\nclaim`, author: { id: BOT } }],
+      threadContext: { filePath: "/src/app.ts", rightFileStart: { line }, rightFileEnd: { line } },
+    });
+
+    // The counting rules, before any wire.
+    const snapshot: FakeThread[] = [
+      ours(7001, "active", "aaaa1111", 5),
+      ours(7002, "active", "aaaa2222", 6),
+      ours(7003, "fixed", "aaaa3333", 7),
+      ours(7004, "wontFix", "aaaa4444", 8),
+      ours(7005, "byDesign", "aaaa5555", 9),
+      // "Closed" is the ADO UI's catch-all and routinely means "I have read this"; it is
+      // neither a fix nor a dismissal, and collectDismissals already refuses to read it as
+      // one.
+      ours(7006, "closed", "aaaa6666", 10),
+      // The sticky summary is ours and marked, and counting it as an open comment would put
+      // a permanent +1 on every PR.
+      { id: 7007, status: "closed", comments: [{ id: 7107, content: `${BOT_MARKER}${SUMMARY_MARKER}\nx\n<!-- prloop:iteration=2 -->`, author: { id: BOT } }] },
+      // Somebody else's thread is never counted.
+      { id: 7008, status: "active", comments: [{ id: 7108, content: "looks good to me", author: { id: "human" } }] },
+    ];
+    eq("open, fixed and dismissed are counted off the PR's own threads", tallyThreads(snapshot as never, 0), {
+      open: 2,
+      fixed: 1,
+      dismissed: 2,
+      closedThisRun: 0,
+    });
+    // The snapshot is taken BEFORE this run closes anything, so a thread it is about to
+    // auto-close is still `active` in it — subtracting is what stops it being counted twice.
+    eq("...and this run's own closes come out of the open count", tallyThreads(snapshot as never, 1), {
+      open: 1,
+      fixed: 1,
+      dismissed: 2,
+      closedThisRun: 1,
+    });
+
+    // On the wire, through publish(), with a real auto-close: the thread points past the end
+    // of a 40-line file.
+    setState({
+      selfIdentityId: BOT,
+      threads: [...snapshot, ours(7009, "active", "aaaa7777", 900)],
+    });
+    resetIdentityCache();
+    const { value: result, lines: _l } = await capture(() =>
+      publish(ref, { requirement: [], code: [] }, summaryInput(), known()),
+    );
+    void _l;
+    eq("a thread whose code is gone is closed", result.resolved, 1);
+    eq("...and the tally reaches the caller", result.threads, { open: 2, fixed: 1, dismissed: 2, closedThisRun: 1 });
+    const body = String(commentPatches().find((r) => String(r.body?.["content"] ?? "").includes(SUMMARY_MARKER))?.body?.["content"] ?? "");
+    check("the summary reports the auto-close", body.includes("**1** closed by this run"), body.slice(0, 700));
+    check("...and dates it from the resume point, which is what made them stale", body.includes("since iteration 2"), body.slice(0, 700));
+    check("...the reviewer's own verdicts", body.includes("**1** marked fixed by a reviewer") && body.includes("**2** dismissed"), body.slice(0, 700));
+    check("...and what is still waiting", body.includes("**2** still open"), body.slice(0, 700));
+
+    // A first run has nothing to report, and a row of zeroes is worse than silence.
+    setState({ selfIdentityId: BOT, threads: [] });
+    resetIdentityCache();
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const firstRun = contentOf(threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER)) ?? {});
+    check("a first run says nothing about earlier comments", !firstRun.includes("Earlier comments"), firstRun.slice(0, 300));
+
+    // Nor does a PR where nothing has been settled: every comment still open is the normal
+    // state of a PR under review, and it is already visible on the PR itself.
+    setState({ selfIdentityId: BOT, threads: [ours(7101, "active", "bbbb1111", 5)] });
+    resetIdentityCache();
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const untouched = contentOf(threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER)) ?? {});
+    check("...nor does a PR where nothing has been settled", !untouched.includes("Earlier comments"), untouched.slice(0, 300));
+
+    setState({ threads: [] });
+    resetIdentityCache();
+  }
+
   section("the run lease: two runs on one pull request post every finding twice");
   {
     // The README's own cron loop is the case: a tick that runs long and the next tick both

@@ -134,6 +134,16 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   kilobytes, all of it rendered into a PR comment as the one-sentence headline. Fingerprints
   hash the tool, the rule, the file and the line's own text, never the claim, so nothing
   already posted is re-posted.
+- **The summary reports what became of the comments the last run left.** `resolved` was
+  computed on every run and reached nothing a human reads, so a pull request carrying twelve
+  open prloop comments and one carrying twelve the author had worked through rendered
+  identically. One line now: how many threads this run closed because the code under them has
+  changed — dated from the `--since auto` resume point, since that is the push that made them
+  stale, and it is the half only prloop can report — plus how many a reviewer marked fixed,
+  how many were dismissed and how many are still open. Counted off the pre-close snapshot so
+  a thread this run is about to close is not also booked as a reviewer's fix, off markers
+  alone so a pipeline run still counts a laptop run's comments, and not printed at all on a
+  first run or a PR where nothing has been settled.
 
 ### Changed
 
