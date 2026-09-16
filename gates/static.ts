@@ -34,6 +34,7 @@ import type { Profile, ToolFinding, ToolSpec } from "../profiles/types";
 import type { AnchoredFinding, FileDiff, ModelRunner } from "../libs/types";
 import { TRIAGE_SCHEMA } from "../models/schemas";
 import { TRIAGE_SYSTEM, buildTriagePrompt, type TriageItem } from "../prompts/triage";
+import { sanitizeToolMessage } from "../prompts/untrusted";
 
 export interface StaticResult {
   // Authoritative findings, ready to post without a model in the loop.
@@ -760,7 +761,13 @@ export async function triageAndConvert(
       file: fd.path,
       quote: lineText,
       side: "right",
-      claim: `${f.message}`,
+      // The tool's own words, bounded (prompts/untrusted.ts). tsc reporting a mismatch
+      // between two large union types emits kilobytes, and all of it used to be rendered
+      // into a PR comment as the one-sentence claim; the message is also source text quoted
+      // back, so a line break followed by ``` in it forged a section of a comment prloop
+      // signed. The fingerprint below hashes the tool, the rule, the file and the line's own
+      // text — never this — so nothing already posted is said a second time.
+      claim: sanitizeToolMessage(f.message),
       evidence: `Reported by ${f.tool}${f.ruleId ? ` (rule ${f.ruleId})` : ""}${f.helpUri ? `\n${f.helpUri}` : ""}`,
       // A deterministic tool is its own corroboration: it doesn't guess, so it doesn't
       // need a second model to agree before we believe the location exists.

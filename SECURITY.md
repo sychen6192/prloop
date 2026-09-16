@@ -56,6 +56,22 @@ no source, no quote — and neither is ever read into a model prompt.
   start of a comment body, so model-written text that quotes one is not mistaken for the
   protocol. Where `connectionData` is unavailable (some on-prem Server versions) prloop falls
   back to trusting the markers alone and says so, once, in the run log.
+- **Text prloop did not write is fenced before it reaches a model.** The PR description, the
+  reviewed repository's own convention documents, the linked work items (title, description
+  and every acceptance criterion) and the static-analysis reports each go into their prompt
+  inside a named tag, preceded by one sentence saying they are reference material and that
+  instructions addressed to a reviewer inside them are to be ignored (`prompts/untrusted.ts`).
+  A closing tag carried by the text is neutralised, so it cannot end its own fence early, and
+  prloop's own reading instructions stay outside the fence rather than being disclaimed along
+  with the ticket. Single-line fields — the PR title, branch names, the author's display name,
+  a work item's type — are collapsed to one line and capped, because a newline in one of them
+  forges a section of the prompt. None of this is a guarantee against a determined injection;
+  it makes the boundary explicit, which is what a model can act on.
+- **A static-analysis message is source text quoted back.** It becomes the claim of a comment
+  prloop signs and the body of a triage prompt, so it is collapsed to one paragraph, stripped
+  of HTML comments and leading markdown structure, and capped. Finding fingerprints hash the
+  tool, the rule, the file and the line's own text — never the message — so this changes what
+  is displayed and never what is suppressed.
 - **prloop never writes its own configuration** and never votes on a PR. It posts comments and,
   optionally, a status.
 

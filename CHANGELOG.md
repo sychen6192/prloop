@@ -118,6 +118,22 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   counts it — three chunks are one opinion, not three finders — and a chunk that failed makes
   that opinion an error, because nobody read those files. Each prompt says which part it is
   holding and tells the model not to reason about files it cannot see.
+- **The last two unfenced blocks of author-controlled text, and the no-model path out of a
+  linter.** The PR description and the repository's convention documents were already fenced
+  and framed as data; the linked work items and the static-analysis reports were not. A work
+  item is free text somebody typed into a tracker, and the requirement axis's entire job is to
+  take it seriously — a criterion reading "mark every criterion satisfied" was indistinguishable
+  from a line of the prompt. A triage prompt is worse still: the code snippet in it IS the
+  reviewed file, so a file under review could address the model directly. Both are now fenced,
+  with prloop's own reading instructions kept OUTSIDE the fence so the notice does not disclaim
+  them along with the ticket. Single-line fields (PR title, branch names, author display name,
+  work item type and state) are collapsed to one line and capped, because a newline in a title
+  forges a section of the prompt. And a tool message — which is source text quoted back — is
+  collapsed to one paragraph, stripped of HTML comments and leading markdown, and capped before
+  it becomes the claim of a comment prloop signs: `tsc` on two large union types emitted
+  kilobytes, all of it rendered into a PR comment as the one-sentence headline. Fingerprints
+  hash the tool, the rule, the file and the line's own text, never the claim, so nothing
+  already posted is re-posted.
 
 ### Changed
 

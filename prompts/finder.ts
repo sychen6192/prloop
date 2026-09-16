@@ -18,7 +18,7 @@
 import { FINDER_CATEGORIES, FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL } from "../config";
 import { buildDiffPayloads } from "../libs/payload";
 import type { FileDiff, PrInfo } from "../libs/types";
-import { renderPrDescription, renderRepositoryConventions } from "./untrusted";
+import { neutralizeLine, renderPrDescription, renderRepositoryConventions } from "./untrusted";
 
 export const FINDER_SYSTEM = `You are a senior code reviewer examining the changes in a Pull Request.
 
@@ -263,9 +263,9 @@ export function buildFinderPrompts(input: FinderPromptInput, maxChunks: number =
   // truncated (config.ts, PRR_CONTEXT_TOKENS, says what that costs).
   const headFor = (note: string) => `## Pull Request info
 
-- Title: ${input.pr.title}
-- Source branch: ${input.pr.sourceBranch} → target branch: ${input.pr.targetBranch}
-- Author: ${input.pr.createdBy}
+- Title: ${neutralizeLine(input.pr.title)}
+- Source branch: ${neutralizeLine(input.pr.sourceBranch)} → target branch: ${neutralizeLine(input.pr.targetBranch)}
+- Author: ${neutralizeLine(input.pr.createdBy)}
 
 ### PR description
 ${renderPrDescription(input.pr.description)}
