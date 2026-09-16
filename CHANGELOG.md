@@ -170,6 +170,22 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   `context.json` records per-file hunk and changed-line counts rather than the lines, and out
   through `RunDir.save` so it meets `redactSecrets` like every other artifact. `scripts/demo.ts`
   writes one from synthetic data.
+- **`--batch <file>`: review a list of pull requests and keep the exit codes.** The daily job
+  the README documents is `while read -r url; do prloop "$url" || true; done < prs.txt`, and
+  the `|| true` is forced — without it the first PR with a blocking finding stops the loop, so
+  the only way to review the rest is to discard the one signal the tool produces. `--batch`
+  reviews them all and exits with the worst outcome: `1` (prloop could not run) over `2`
+  (blocking findings) over `3` (incomplete) over `0`, keeping the single-run precedence for
+  the middle two. It prints a table of what each PR actually did, read back out of that run's
+  own `result.json` — the exit code alone cannot tell "clean" from "the pull request had
+  already merged", and cannot name the stage behind a `3`. The file is validated before the
+  first review starts, so a typo on line 40 of a 60-line list no longer surfaces two hours in.
+  One child process per pull request, because per-run state is module-global in four places
+  (token totals, the log clock and sink, the artifact call sink, and `PRR_DRY_RUN` in
+  `process.env`), and strictly sequential, because `PRR_LLM_CONCURRENCY` is the only throttle
+  prloop has on an endpoint and it is per process. Three fatal exits in a row abandon the rest
+  of the list: that is a credential, an endpoint or a proxy rather than those pull requests,
+  and the remaining ones would each pay a full retry budget to discover the same thing.
 
 ### Changed
 

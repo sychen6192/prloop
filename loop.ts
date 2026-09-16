@@ -24,6 +24,7 @@ import { unmetCriteria } from "./gates/requirement";
 import { claimRunLease, releaseRunLease, runId } from "./publish/lease";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
 import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir } from "./libs/artifacts";
+import { batchExitCode, forwardedArgs, readBatchList, renderBatchReport, runBatch } from "./libs/batch";
 import { parseArgs } from "./libs/cli";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
@@ -39,6 +40,8 @@ const USAGE = `Usage: prloop <PR URL> [options]
 Options:
   --since <iteration>   review only changes after that iteration (incremental)
   --since auto          resume from the last reviewed iteration
+  --batch <file>        review every PR URL in the file, one per line (# comments allowed),
+                        one after another; exits with the worst outcome in the list
   --dry-run             compute everything, post nothing
   --config              print every setting, its value and its source, then exit
   -h, --help            show this help
@@ -103,6 +106,26 @@ async function main() {
   if (cli.help) help();
   if (args.length === 0) usage();
   if (cli.error) die(cli.error);
+
+  // Before anything that needs a PR: a batch reviews a list of them, one child process each,
+  // and this process only tallies the results (libs/batch.ts says why a child rather than a
+  // loop in here). The whole file is validated first, so a typo on line 40 of a 60-line list
+  // surfaces now rather than two hours in.
+  if (cli.batch) {
+    const urls = readBatchList(cli.batch);
+    banner(`prloop: ${urls.length} pull requests from ${cli.batch}`);
+    const started = Date.now();
+    const outcomes = await runBatch(urls, forwardedArgs(args));
+    const codes = outcomes.map((o) => o.exitCode).filter((c): c is number => c !== undefined);
+    banner(`Done: ${outcomes.length} pull requests in ${Math.round((Date.now() - started) / 60000)}m`);
+    console.log(renderBatchReport(outcomes));
+    const exit = batchExitCode(codes);
+    // The one thing the documented shell loop cannot do. `|| true` throws every exit code
+    // away because without it the first blocking finding stops the loop; this reviews all of
+    // them AND still reports the worst.
+    log(`Exiting ${exit}: the worst outcome in the list`);
+    process.exit(exit);
+  }
 
   let compareTo = typeof cli.since === "number" ? cli.since : 0;
   const sinceAuto = cli.since === "auto";

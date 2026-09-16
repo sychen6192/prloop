@@ -259,11 +259,30 @@ PRR_WORKTREE_REPO=/repos/myrepo
 PRR_WORKTREE_SETUP_CMD='npm ci'         # a worktree has no node_modules and no venv
 ```
 
-Then the whole daily job is a loop, with no checkout to manage and nothing to edit per PR:
+Then the whole daily job is one command, with no checkout to manage and nothing to edit per PR:
 
 ```bash
-while read -r url; do prloop "$url" --since auto || true; done < prs.txt
+prloop --batch prs.txt --since auto
 ```
+
+`--batch` reviews every URL in the file, one after another, and **exits with the worst outcome
+in the list** — which is the one thing the loop it replaces cannot do:
+
+```bash
+while read -r url; do prloop "$url" --since auto || true; done < prs.txt   # the old way
+```
+
+That `|| true` is not laziness: without it the first PR with a blocking finding stops the
+loop, so the only way to review the rest was to throw every exit code away. `--batch` prints a
+table at the end — one line per PR with its exit code and what actually happened, read back
+out of each run's own `result.json`, because the code alone cannot tell "clean" from "the PR
+had already merged" — and then exits `1` > `2` > `3` > `0`, worst wins. The whole file is
+validated first, so a typo on line 40 surfaces immediately rather than two hours in. Each PR
+is a separate process (per-run state is module-global in four places) and they run one at a
+time: the only throttle prloop has on a model endpoint is `PRR_LLM_CONCURRENCY`, which is per
+process. If three pull requests in a row fail before producing a review, the rest are
+abandoned — that is a credential, an endpoint or a proxy, not those pull requests, and the
+remaining PRs would each pay a full retry budget to find that out.
 
 **Two runs on one PR post everything twice.** A tick that runs long and the next one — or
 your laptop beside the pipeline — both read the PR's existing comments before either has

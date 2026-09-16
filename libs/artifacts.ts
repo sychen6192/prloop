@@ -291,6 +291,44 @@ export function createRunDir(ref: PrRef, iterationId: number): RunDir {
  * of auth failures erasing the review anyone would want to look at. The only question this
  * answers is "why did the last run die", and only the latest answer is the current one.
  */
+/**
+ * The result.json a child run left behind, found by walking the PR's own directory.
+ *
+ * `--batch` spawns one child per pull request (libs/batch.ts) and needs to say what each one
+ * did. The exit code alone cannot: 0 covers both "clean" and "the PR had already merged", and
+ * 3 names no stage. The child knows, and wrote it down — but into one of three directories
+ * whose names the parent cannot predict (iter-<n>-<timestamp>, skipped, fatal).
+ *
+ * `notBefore` is what makes the answer this run's rather than last night's: result.json
+ * carries the run's own start time in its identity block, which is exactly the field that
+ * makes the file identifiable on its own. A run whose identity is missing or older is
+ * ignored, and the caller reports the exit code alone rather than somebody else's summary.
+ */
+export function latestResult(ref: PrRef, notBefore: number): Record<string, unknown> | undefined {
+  const dir = prDir(ref);
+  let best: { at: number; value: Record<string, unknown> } | undefined;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    try {
+      const raw = fs.readFileSync(path.join(dir, ent.name, "result.json"), "utf8");
+      const value = JSON.parse(raw) as Record<string, unknown>;
+      const started = (value["identity"] as { startedAt?: string } | undefined)?.startedAt;
+      const at = started ? Date.parse(started) : NaN;
+      if (!Number.isFinite(at) || at < notBefore) continue;
+      if (!best || at > best.at) best = { at, value };
+    } catch {
+      // A directory with no result.json, or one being written right now. Neither is news.
+    }
+  }
+  return best?.value;
+}
+
 export function createFatalRunDir(ref: PrRef): RunDir {
   return openRunDir(path.join(prDir(ref), "fatal"), true);
 }
