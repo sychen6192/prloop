@@ -21,8 +21,9 @@ import {
 import { parsePrUrl } from "./ado/client";
 import { postStatus } from "./ado/statuses";
 import { unmetCriteria } from "./gates/requirement";
+import { claimRunLease, releaseRunLease, runId } from "./publish/lease";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
-import { buildResultSummary, createFatalRunDir, currentRunDir, openRunDir } from "./libs/artifacts";
+import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir } from "./libs/artifacts";
 import { parseArgs } from "./libs/cli";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
@@ -75,6 +76,9 @@ function runIdentity(iteration?: number, compareTo?: number) {
     ...(iteration === undefined ? {} : { iteration }),
     ...(compareTo === undefined ? {} : { compareTo }),
     dryRun: isDryRun(),
+    // How a lease nobody released is traced back to the run that left it: the id in the
+    // marker on the PR is this one, and it is on disk for every run the fleet made.
+    runId: runId(),
     startedAt,
     models: {
       finders: FINDER_MODELS,
@@ -142,6 +146,34 @@ async function main() {
     }
     log(`Excluded categories: ${excluded.join(", ")}`);
   }
+  // Before `--since auto`, and long before the model budget: standing down has to be the
+  // cheap path, or the lease costs more than the overlap it prevents. A dry run skips it
+  // entirely — it writes nothing, so it cannot collide with anything, and taking a lease it
+  // would then have to release is the opposite of "compute everything, post nothing".
+  if (!isDryRun()) {
+    const lease = await claimRunLease(ref);
+    if (!lease.acquired) {
+      const reason = lease.reason ?? "another run holds this pull request";
+      log(`No review: ${reason}. Nothing was posted and no model call was made.`);
+      // The same shape a merged PR produces, for the same reason: this tick correctly did
+      // nothing, and a cron over a list of PRs must not redden because one of them was
+      // already being reviewed.
+      createSkipDir(ref).saveJson(
+        "result.json",
+        buildResultSummary({
+          exitCode: 0,
+          skippedReason: reason,
+          identity: runIdentity(undefined, compareTo),
+          incomplete: [],
+          counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+          tokens: tokenTotals(),
+          durationSec: Math.round((Date.now() - Date.parse(startedAt)) / 1000),
+        }),
+      );
+      process.exit(0);
+    }
+  }
+
   if (sinceAuto) {
     const last = await resolveLastReviewedIteration(ref);
     if (last === undefined) log("--since auto: no prior review found, doing a full review");
@@ -153,6 +185,11 @@ async function main() {
   if (compareTo > 0) log(`Incremental mode: reviewing only changes after iteration ${compareTo}`);
 
   const result = await runReview({ ref, runner: await createRunner(), compareTo });
+
+  // Here rather than in a `finally`, because every exit below is a process.exit() and those
+  // do not run one. A normal review has already released it — publish() rewrites the summary
+  // and the new body carries no marker — so on that path this costs one GET and no write.
+  await releaseRunLease(ref);
 
   banner("Done");
   log(`Elapsed ${result.durationSec}s, artifacts: ${result.runDir}`);
@@ -235,6 +272,10 @@ main().catch(async (e) => {
   // behind the first one's green check. Best effort and never allowed to replace the real
   // error: if ADO is what just failed, this will fail too, and the fatal message is the one
   // worth keeping.
+  // Released before anything else: the next tick of a cron should be able to retry
+  // immediately, not wait out an hour of a lease held by a process that is already dead.
+  if (fatalRef) await releaseRunLease(fatalRef).catch(() => undefined);
+
   if (POST_STATUS && fatalRef && !isDryRun()) {
     try {
       await postStatus(fatalRef, "error", `Review crashed: ${String(e instanceof Error ? e.message : e)}`);

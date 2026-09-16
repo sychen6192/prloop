@@ -127,6 +127,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_POST_STATUS", kind: "bool", section: S_PUBLISH, description: "1 = also post a PR status" },
   { name: "PRR_STATUS_GENRE", kind: "string", section: S_PUBLISH, description: "genre of that status" },
   { name: "PRR_STATUS_NAME", kind: "string", section: S_PUBLISH, description: "name of that status" },
+  { name: "PRR_RUN_LEASE_MS", kind: "number", section: S_PUBLISH, description: "how long one run holds a PR; 0 = no lease" },
 
   { name: "PRR_CA_CERTS", kind: "csv", section: S_NET, description: "CA bundle(s) to trust on a TLS-intercepting network" },
   { name: "PRR_HTTPS_PROXY", kind: "string", section: S_NET, description: "overrides HTTPS_PROXY from the shell" },
@@ -929,6 +930,18 @@ void isDryRun();
 export const POST_STATUS = flagEnv("PRR_POST_STATUS");
 export const STATUS_GENRE = strEnv("PRR_STATUS_GENRE", "prloop");
 export const STATUS_NAME = strEnv("PRR_STATUS_NAME", "ai-review");
+
+// How long one run may hold a pull request before another may take it over (publish/lease.ts).
+// 0 turns the lease off entirely, which the plan's own rule demands of a feature that can
+// refuse to review: an operator who would rather have a duplicate comment than a skipped
+// tick has to be able to say so.
+//
+// The default is deliberately generous. One model call alone may take PRR_LLM_TIMEOUT_MS
+// (15 minutes by default) and a review makes many, so a window that merely feels long would
+// have the next tick taking over a review still in flight — the exact overlap this exists to
+// prevent, now with the model budget spent twice. An hour is four of those timeouts, and a
+// crashed run costs one tick of an hourly cron rather than a day of them.
+export const RUN_LEASE_MS = numEnv("PRR_RUN_LEASE_MS", 3_600_000, 0);
 
 export const QUIET = flagEnv("PRR_QUIET");
 // 1 = print the configuration table and exit, without running a review (same as --config).

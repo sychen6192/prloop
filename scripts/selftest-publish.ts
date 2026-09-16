@@ -157,7 +157,7 @@ try {
   });
 
   const setState = (partial: Partial<FakeAdoState>) => {
-    Object.assign(ado.state, { threads: [], rejectThreadPost: undefined, rejectStatusPost: undefined, rejectThreadList: undefined, selfIdentityId: undefined, ...partial });
+    Object.assign(ado.state, { threads: [], rejectThreadPost: undefined, rejectStatusPost: undefined, rejectThreadList: undefined, selfIdentityId: undefined, afterCommentPatch: undefined, ...partial });
     ado.reset();
   };
 
@@ -974,6 +974,134 @@ try {
     );
     eq("a 4xx on a comment is kept with its status", rejected.failed[0]?.status, 400);
     eq("...and does not hold the resume point", rejected.watermark, { record: 3, held: false });
+  }
+
+  section("the run lease: two runs on one pull request post every finding twice");
+  {
+    // The README's own cron loop is the case: a tick that runs long and the next tick both
+    // read the thread list before either has written anything, so both see the same `seen`
+    // set and both post everything in it. A lock file cannot help — libs/learnings.ts states
+    // that a laptop and a cron box do not share RUNS_DIR, and that is exactly the pair that
+    // collides — so the lease is state on the PR, like the resume point beside it.
+    const { claimRunLease, releaseRunLease, leaseIsLive, resetLeaseState, runId } = await import("../publish/lease");
+    const { runMarker, setRunMarker } = await import("../publish/markers");
+    const { RUN_LEASE_MS } = await import("../config");
+
+    const BOT = "11111111-2222-3333-4444-555555555555";
+    const NOW = 1_800_000_000_000;
+    const summaryBody = `${BOT_MARKER}${SUMMARY_MARKER}\n## prloop review\n\nNothing blocking.\n<!-- prloop:iteration=2 -->`;
+    const withSummary = (body = summaryBody): FakeThread => ({
+      id: 4200,
+      status: "closed",
+      comments: [{ id: 95, content: body, author: { id: BOT } }],
+    });
+    const summaryNow = () => String(ado.state.threads.find((t) => t.id === 4200)?.comments?.[0]?.content ?? "");
+    const fresh = (partial: Partial<FakeAdoState>) => {
+      setState({ selfIdentityId: BOT, ...partial });
+      resetIdentityCache();
+      resetLeaseState();
+    };
+
+    // The clock rule, before any wire. A marker from the future is far likelier to be a live
+    // run on a box whose clock is a minute ahead than a forgotten one, and reading it as
+    // "long expired" hands the PR to two runs at once — the one thing the lease is for.
+    eq("a lease written a moment ago is live", leaseIsLive(NOW - 1000, NOW, RUN_LEASE_MS), true);
+    eq("...one older than the window is not", leaseIsLive(NOW - RUN_LEASE_MS - 1, NOW, RUN_LEASE_MS), false);
+    eq("...and one from a clock that reads ahead is still live", leaseIsLive(NOW + 1000, NOW, RUN_LEASE_MS), true);
+    eq("...but not unboundedly so", leaseIsLive(NOW + RUN_LEASE_MS + 1, NOW, RUN_LEASE_MS), false);
+
+    // Nothing to claim into. Creating the summary here to hold a lease would mean two first
+    // runs leaving two summary threads, which is the wedge the lease exists to prevent.
+    fresh({ threads: [] });
+    const none = await capture(() => claimRunLease(ref, NOW));
+    eq("a PR with no prloop summary is reviewed, not claimed", none.value.acquired, true);
+    eq("...and nothing is written to it", commentPatches().length + threadPosts().length, 0);
+
+    fresh({ threads: [withSummary()] });
+    const first = await capture(() => claimRunLease(ref, NOW));
+    eq("a free PR is acquired", first.value.acquired, true);
+    eq("...by editing the summary once", commentPatches().length, 1);
+    const claimed = summaryNow();
+    check("...which now carries this run's marker", claimed.includes(runMarker(NOW, runId())), claimed.slice(-120));
+    // The summary is a comment a human is reading. A claim that re-rendered it would churn
+    // the visible text twice per run, and would have to reproduce a body written by a
+    // version of prloop that is not this one.
+    eq("...and is otherwise byte-identical", setRunMarker(claimed, ""), summaryBody);
+
+    // The case that actually happens: the other run started minutes ago and is still going.
+    fresh({ threads: [withSummary(setRunMarker(summaryBody, runMarker(NOW - 60_000, "deadbeef")))] });
+    const busy = await capture(() => claimRunLease(ref, NOW));
+    eq("a PR another run is holding is not acquired", busy.value.acquired, false);
+    check("...and the reason names the run and its age", (busy.value.reason ?? "").includes("deadbeef") && (busy.value.reason ?? "").includes("60s"), busy.value.reason);
+    eq("...and nothing at all is written to the PR", commentPatches().length, 0);
+
+    // Expired: taken over, but never silently. A review that legitimately runs longer than
+    // the window gets taken over mid-flight, and this line is the only warning there is.
+    fresh({ threads: [withSummary(setRunMarker(summaryBody, runMarker(NOW - RUN_LEASE_MS - 1, "deadbeef")))] });
+    const stale = await capture(() => claimRunLease(ref, NOW));
+    eq("an expired lease is taken over", stale.value.acquired, true);
+    check("...loudly, and naming the knob that fixes it", stale.lines.some((l) => l.includes("never finished") && l.includes("PRR_RUN_LEASE_MS")), stale.lines.join(" | "));
+    check("...leaving only this run's marker behind", summaryNow().includes(runMarker(NOW, runId())) && !summaryNow().includes("deadbeef"), summaryNow().slice(-140));
+
+    // A lease is a claim about prloop's own state, and the consequence of believing a forged
+    // one is that prloop never reviews the PR again. Same rule, same reason, as the resume
+    // point: a comment anyone can type is not prloop's state.
+    fresh({
+      threads: [{
+        id: 4200,
+        status: "closed",
+        comments: [{ id: 95, content: setRunMarker(summaryBody, runMarker(NOW, "deadbeef")), author: { id: "99999999-8888-7777-6666-555555555555" } }],
+      }],
+    });
+    const forged = await capture(() => claimRunLease(ref, NOW));
+    eq("a lease in a comment prloop did not write is not prloop's lease", forged.value.acquired, true);
+
+    // The read-back. Two runs claiming in the same instant both write; ADO serialises them,
+    // so the body ends up carrying exactly one id and only its owner proceeds. It narrows
+    // the race to a sub-round-trip window; it does not close it, and nothing here claims it.
+    fresh({
+      threads: [withSummary()],
+      afterCommentPatch: (c) => {
+        ado.state.afterCommentPatch = undefined;
+        c.content = setRunMarker(c.content ?? "", runMarker(NOW, "deadbeef"));
+      },
+    });
+    const lost = await capture(() => claimRunLease(ref, NOW));
+    eq("a run that lost the write race stands down", lost.value.acquired, false);
+    check("...saying the other run claimed it at the same moment", (lost.value.reason ?? "").includes("same moment"), lost.value.reason);
+
+    // Releasing. The normal path never needs it — publish() rewrites the summary from
+    // scratch and the new body carries no marker — so what this covers is every other way a
+    // run ends: a merged PR, a crash, a stage that threw.
+    fresh({ threads: [withSummary()] });
+    await capture(() => claimRunLease(ref, NOW));
+    await capture(() => releaseRunLease(ref));
+    eq("releasing gives the PR back", readMarkers(summaryNow()).run, undefined);
+    eq("...without touching the rest of the summary", summaryNow(), summaryBody);
+
+    // Never steal: by the time this run finishes, an expired lease may already have been
+    // taken over, and stripping that marker would hand the PR to a third run.
+    fresh({ threads: [withSummary()] });
+    await capture(() => claimRunLease(ref, NOW));
+    const rival = setRunMarker(summaryBody, runMarker(NOW, "deadbeef"));
+    ado.state.threads[0]!.comments![0]!.content = rival;
+    await capture(() => releaseRunLease(ref));
+    eq("a lease another run has taken over is left alone", summaryNow(), rival);
+
+    // And the release that costs nothing: a run that never held the lease makes no request
+    // at all, which is what lets loop.ts call it unconditionally on every exit path.
+    fresh({ threads: [withSummary()] });
+    await capture(() => releaseRunLease(ref));
+    eq("a run that never claimed makes no request to release", ado.requests.length, 0);
+
+    // The normal release, in the one place it actually happens.
+    fresh({ threads: [withSummary()] });
+    await capture(() => claimRunLease(ref, NOW));
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    eq("publishing the review is what gives the lease back", readMarkers(summaryNow()).run, undefined);
+    check("...in the same request that posts the summary", summaryNow().includes("<!-- prloop:iteration=3 -->"), summaryNow().slice(-140));
+
+    fresh({ threads: [] });
   }
 } finally {
   await ado.close();

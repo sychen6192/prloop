@@ -170,6 +170,8 @@ export interface ResultSummaryInput {
     iteration?: number;
     compareTo?: number;
     dryRun: boolean;
+    /** The id this run used on the PR's lease marker (publish/lease.ts). */
+    runId?: string;
     startedAt: string;
     models: { finders: readonly string[]; skeptics: readonly string[]; req?: string; triage?: string };
   };

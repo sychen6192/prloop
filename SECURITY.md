@@ -47,8 +47,10 @@ no source, no quote — and neither is ever read into a model prompt.
   recoverable also check `author.id` against the identity prloop authenticates as
   (`_apis/connectionData`, `ado/identity.ts`): the resume point, where a forged
   `<!-- prloop:iteration=9999 -->` would make a run review an empty diff and report a clean PR,
-  and the dismissal store, where a forged `wontFix` thread would suppress a finding on every
-  future PR in the repository. The dedupe readers deliberately stay on markers alone — forging
+  the dismissal store, where a forged `wontFix` thread would suppress a finding on every
+  future PR in the repository, and the run lease, where a forged
+  `<!-- prloop:run=... -->` refreshed often enough would make prloop stand down from that PR
+  for good. The dedupe readers deliberately stay on markers alone — forging
   those costs one missing comment, while requiring identity there would double-post whenever
   prloop's credential differs between a laptop and a pipeline. Markers are read only from the
   start of a comment body, so model-written text that quotes one is not mistaken for the

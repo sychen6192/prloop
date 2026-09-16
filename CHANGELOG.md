@@ -89,6 +89,21 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   pipeline, no model call, no new knob; old `runs/` trees still produce a report, with rows
   that predate the new fields counting toward the per-model verdict table and attributed to
   no finder.
+- **A per-PR run lease, so two runs stop posting the same review twice.** `PRR_RUN_LEASE_MS`
+  (one hour; `0` = off). The README's own cron loop is the case it exists for: a tick that
+  runs long and the next one overlap on a pull request, and both read the existing comments
+  before either has written any — so both see the same already-said findings and both post
+  all of them, and on a PR with no summary yet both create one, which pins `--since auto` to
+  whichever copy ADO returns first, forever. A lock file cannot address it, because a laptop
+  and a cron box do not share `RUNS_DIR` and that is exactly the pair that collides. So the
+  lease is state on the PR, like the resume point beside it: a timestamped marker in prloop's
+  own summary, honoured while fresh, given back by the summary the run publishes. A held PR
+  costs a stand-down and exit `0` — no model call, no write. An expired one is taken over
+  with a warning naming the knob. Only a lease in a comment prloop itself wrote is honoured,
+  since a forged one is a review that silently never happens. It is not a mutex and is not
+  described as one: ADO has no compare-and-swap on a comment body, so the claim reads its own
+  write back to narrow the race rather than to win it, and a PR prloop has never published to
+  takes no lease at all.
 
 ### Changed
 

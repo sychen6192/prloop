@@ -74,6 +74,12 @@ export interface FakeAdoState {
    * trusting the markers alone.
    */
   selfIdentityId?: string;
+  /**
+   * Runs after a comment PATCH has been applied. The only way to stage a SECOND writer
+   * landing between prloop's own write and the read-back that confirms it — which is the
+   * race the run lease narrows, and the one case where a claim must stand down.
+   */
+  afterCommentPatch?: (comment: FakeComment) => void;
 }
 
 export interface AdoRequest {
@@ -181,6 +187,7 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       const comment = thread?.comments?.find((c) => c.id === Number(commentPatch[2]));
       if (!comment) return sendJson(res, 404, { message: "no such comment" });
       comment.content = (body?.["content"] as string | undefined) ?? comment.content;
+      state.afterCommentPatch?.(comment);
       return sendJson(res, 200, comment);
     }
     const threadPatch = /\/pullRequests\/\d+\/threads\/(\d+)$/.exec(path);

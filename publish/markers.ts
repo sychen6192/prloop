@@ -29,6 +29,12 @@ export const SUMMARY_MARKER = "<!-- prloop:summary -->";
 const FP_RE = /<!-- prloop:fp=([^\s>]+) -->/g;
 const CAT_RE = /<!-- prloop:cat=([^\s>]+) -->/;
 const ITERATION_RE = /<!-- prloop:iteration=(\d+) -->/;
+// One source, two compilations: the strip below has to match the read above byte for byte,
+// and two hand-written copies of a marker pattern is the exact drift this module was
+// extracted to end.
+const RUN_PATTERN = String.raw`<!-- prloop:run=(\d+)\.([0-9a-f]{8}) -->`;
+const RUN_RE = new RegExp(RUN_PATTERN);
+const RUN_RE_ALL = new RegExp(RUN_PATTERN, "g");
 
 // gates/aggregate.ts hashes a fingerprint to 12 hex characters. Validated by shape rather
 // than imported, so the publish side does not depend on the gates; selftest-publish.ts
@@ -56,6 +62,31 @@ export function iterationMarker(id: number): string {
   return `<!-- prloop:iteration=${id} -->`;
 }
 
+/**
+ * "A run is working on this pull request right now", written into the summary for the length
+ * of a run and taken back out by the summary the run publishes (publish/lease.ts).
+ *
+ * The start time is the holder's, and the READER applies its own PRR_RUN_LEASE_MS to it, so
+ * turning the lease off is a local decision rather than something a previous run's bytes
+ * decided for you. The id is what tells another machine's live run apart from the corpse of
+ * one of your own that crashed — the two are otherwise identical on the wire.
+ */
+export function runMarker(startedAtMs: number, id: string): string {
+  return `<!-- prloop:run=${startedAtMs}.${id} -->`;
+}
+
+/**
+ * Replaces (or, with an empty marker, removes) the run marker in a comment body, leaving
+ * every other byte alone.
+ *
+ * Alone matters: claiming the lease rewrites the sticky summary of a PR a human is reading,
+ * and a claim that re-rendered the body would churn the visible comment twice per run —
+ * and would have to reproduce a summary written by a version of prloop that is not this one.
+ */
+export function setRunMarker(body: string, marker: string): string {
+  return body.replace(RUN_RE_ALL, "") + marker;
+}
+
 /** Everything the protocol carries, read out of one comment body. */
 export interface CommentMarkers {
   /** Written by prloop. Threads without this are somebody else's and are never touched. */
@@ -70,6 +101,8 @@ export interface CommentMarkers {
   category?: FindingCategory;
   /** The iteration recorded by the run that wrote this comment. */
   iteration?: number;
+  /** A run that had this PR in hand when it wrote this comment (publish/lease.ts). */
+  run?: { startedAt: number; id: string };
 }
 
 const NONE: CommentMarkers = { ours: false, summary: false, fingerprints: [] };
@@ -107,6 +140,11 @@ export function readMarkers(body: string | undefined): CommentMarkers {
   // but the pair of conditions its only reader applies: the comment must be OURS and the
   // SUMMARY, both decided from the leading run above (publish/lifecycle.ts).
   const iter = ITERATION_RE.exec(body)?.[1];
+  // Same whole-body read, and for the same reason: the lease marker is appended after the
+  // rendered summary, so that a claim never has to re-render a body it did not write. Its
+  // reader applies the identical pair of guards (ours, and the summary), plus the identity
+  // check — a forged lease is a review that silently never happens.
+  const run = RUN_RE.exec(body);
   return {
     ours: true,
     summary: head.includes(SUMMARY_MARKER),
@@ -114,5 +152,6 @@ export function readMarkers(body: string | undefined): CommentMarkers {
     fingerprints,
     ...(cat !== undefined && CATEGORIES.has(cat) ? { category: cat as FindingCategory } : {}),
     ...(iter === undefined ? {} : { iteration: Number(iter) }),
+    ...(run?.[1] === undefined || run[2] === undefined ? {} : { run: { startedAt: Number(run[1]), id: run[2] } }),
   };
 }

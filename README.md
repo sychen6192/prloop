@@ -254,6 +254,23 @@ Then the whole daily job is a loop, with no checkout to manage and nothing to ed
 while read -r url; do prloop "$url" --since auto || true; done < prs.txt
 ```
 
+**Two runs on one PR post everything twice.** A tick that runs long and the next one — or
+your laptop beside the pipeline — both read the PR's existing comments before either has
+written any, so both see the same set of already-said findings and both say all of them
+again. So a run takes a **lease** on the pull request first: a timestamped marker inside
+prloop's own summary comment, honoured by any other run for `PRR_RUN_LEASE_MS` (one hour by
+default). A run that finds the PR held reviews nothing, spends nothing, and exits `0`; the
+review is already happening. The lease is given back by the summary the run posts, so the
+normal path costs no extra write, and an expired one is taken over with a warning naming the
+knob — if reviews here legitimately run longer than the window, raise it. `0` turns it off.
+
+This is not a mutex, and it is not sold as one: Azure DevOps has no compare-and-swap on a
+comment body, so two runs starting in the same round trip can still both proceed (the claim
+reads its own write back, which makes that window small). It also does nothing on a PR prloop
+has never published to, because claiming would mean creating the summary comment before the
+review that fills it — and two first runs racing would then leave two summary threads, which
+is the `--since auto` wedge the lease exists to prevent. A dry run takes no lease at all.
+
 A merged pull request can stay in `prs.txt`. prloop still fetches it and its diff, then stops
 before the first model call: Azure DevOps refuses every write to a completed PR, so a review
 of one used to be paid for in full and then fail comment by comment, exiting `3` on every tick
@@ -413,6 +430,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_POST_STATUS` | — | `1` = also post a PR status (needs a branch policy to gate merges). Three states, matching the exit code: `failed` (2) · `error` (3, the review did not fully run) · `succeeded` (0) |
 | `PRR_STATUS_GENRE` | `prloop` | genre of that status |
 | `PRR_STATUS_NAME` | `ai-review` | name of that status |
+| `PRR_RUN_LEASE_MS` | `3600000` | how long one run holds a PR before another may take it over; `0` = no lease |
 | `PRR_HTTPS_PROXY` | — | overrides `HTTPS_PROXY` from the shell (Node's fetch reads neither by itself) |
 | `PRR_HTTP_PROXY` | — | overrides `HTTP_PROXY` from the shell |
 | `PRR_NO_PROXY` | — | hosts that bypass the proxy; `host:port` entries match on port |
