@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { RUNS_DIR } from "../config";
 import { loadDismissals } from "../libs/learnings";
+import { loadOutcomes } from "../libs/outcomes";
 
 // ─── The pure half (exported for the selftest) ──────────────────────────────
 
@@ -37,11 +38,55 @@ export interface CalibrationVerdict {
   error: boolean;
 }
 
+/**
+ * One finding as the SKEPTIC saw it, from a run's skeptic.json.
+ *
+ * Separate from CalibrationFinding because the two files hold different populations, and
+ * that difference is the whole reason this type exists: applyVerdicts drops a killed
+ * finding before finalize runs, so findings.json never contains one. A refuted finding is
+ * recorded here and nowhere else.
+ *
+ * Every field but `killed` is optional: runs written before the row carried a finding's
+ * identity are still worth their verdict counts, and dropping a generation of artifacts to
+ * gain a column would be the wrong trade for a diagnostic.
+ */
+export interface CalibrationOutcome {
+  fingerprint?: string;
+  category?: string;
+  confidence?: number;
+  sources?: string[];
+  /** The skeptic majority refuted it, so it never reached finalize. */
+  killed: boolean;
+}
+
 export interface CalibrationInput {
   findings: CalibrationFinding[];
   verdicts: CalibrationVerdict[];
+  // Per-finding skeptic results. Optional so an older caller still type-checks; absent means
+  // "no verification recorded", not "nothing was killed".
+  outcomes?: CalibrationOutcome[];
   // Fingerprints a human closed as wontFix/byDesign, from the repo's dismissals.jsonl.
   dismissed: Set<string>;
+  // Fingerprints the author acted on, from the repo's outcomes.jsonl, split by how prloop
+  // knows. `fixed` is a human's statement; `autoClosed` is prloop's own inference from the
+  // flagged line having gone away, which is narrow but not a person saying anything — so the
+  // headline rate counts only the first, and the second is reported beside it.
+  actedOn?: { fixed: Set<string>; autoClosed: Set<string> };
+  /**
+   * What reviewers actually said when they dismissed something, one entry per dismissal that
+   * carried a reply, from the same stores as `dismissed`. Kept apart from the fingerprint
+   * set because it answers a different question: the set says how often the tool is wrong,
+   * these say in what way.
+   */
+  dismissalReasons?: string[];
+  /** Dismissals in those stores where the reviewer said nothing at all. */
+  reasonlessDismissals?: number;
+}
+
+/** One thing reviewers keep saying when they reject a finding, and how often. */
+export interface DismissalReason {
+  reason: string;
+  count: number;
 }
 
 export interface Bucket {
@@ -49,6 +94,13 @@ export interface Bucket {
   findings: number;
   published: number;
   dismissed: number;
+  // Findings in this bucket a human marked fixed after prloop commented on them.
+  actedOn: number;
+  // Findings in this bucket the skeptic majority refuted. Read against `findings` in the
+  // same row: that is the share of this finder's (or this category's) output the verifier
+  // threw away, which is the number that says whether a finder is pulling its weight and
+  // the one nothing in the tool could answer before.
+  killed: number;
   // dismissed / published, NOT dismissed / findings: only a published finding is ever put
   // in front of a human, so the wider denominator would report a bucket as accurate purely
   // because the corroboration gate kept it out of the PR.
@@ -74,9 +126,26 @@ export interface CalibrationReport {
   // (iii): findings that were published inline and a human then dismissed. The headline
   // false-positive number.
   publishedDismissed: number;
+  // Findings the skeptic majority refuted. The tool's own false-positive count, as opposed
+  // to publishedDismissed, which is the share that got past it.
+  killed: number;
+  // Published findings a human then marked fixed: PROPOSAL §12's implementation rate, and
+  // the only positive evidence the tool collects. Counted apart from autoClosed, which is
+  // prloop's own inference that the flagged line went away rather than a person's decision.
+  actedOn: number;
+  autoClosed: number;
   // Dismissals whose finding is in no run we can still read — usually retention pruned the
   // run. Reported so the totals above are never mistaken for the whole history.
   orphanDismissals: number;
+  /**
+   * The reviewers' own words, most repeated first. A dismissal rate says how often prloop is
+   * wrong; only this says in what way — "we dismiss a lot of performance findings" and "we
+   * dismiss them because the quoted line is always in a test fixture" are different problems
+   * with different fixes, and the second is the one that changes a prompt or a rule.
+   */
+  reasons: DismissalReason[];
+  /** Dismissals whose reviewer left no reply. Usually most of them; worth knowing. */
+  reasonless: number;
   byConfidence: Bucket[];
   byCategory: Bucket[];
   byFinder: Bucket[];
@@ -96,8 +165,8 @@ const CONFIDENCE_FLOORS: Array<[number, string]> = [
 const confidenceBucket = (c: number) =>
   CONFIDENCE_FLOORS.find(([floor]) => c >= floor)?.[1] ?? CONFIDENCE_FLOORS[CONFIDENCE_FLOORS.length - 1]![1];
 
-function tally(): { findings: number; published: number; dismissed: number } {
-  return { findings: 0, published: 0, dismissed: 0 };
+function tally(): { findings: number; published: number; dismissed: number; actedOn: number; killed: number } {
+  return { findings: 0, published: 0, dismissed: 0, actedOn: 0, killed: 0 };
 }
 
 function toBuckets(m: Map<string, ReturnType<typeof tally>>, order?: string[]): Bucket[] {
@@ -109,6 +178,27 @@ function toBuckets(m: Map<string, ReturnType<typeof tally>>, order?: string[]): 
   if (order) return rows.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
   // Biggest population first: a 100% dismissal rate over one finding is not the top line.
   return rows.sort((a, b) => b.findings - a.findings || a.key.localeCompare(b.key));
+}
+
+/**
+ * Groups reviewers' replies by what they say.
+ *
+ * Case and trailing punctuation are folded together, and nothing else is: these are
+ * sentences people typed, and any cleverer normalisation would merge two different reasons
+ * and report a consensus nobody expressed. The first spelling seen is the one displayed, so
+ * the report shows a reviewer's actual words rather than a lowercased reconstruction.
+ */
+export function groupReasons(reasons: readonly string[]): DismissalReason[] {
+  const counts = new Map<string, { reason: string; count: number }>();
+  for (const r of reasons) {
+    const text = r.trim();
+    if (!text) continue;
+    const key = text.toLowerCase().replace(/[.!?\s]+$/, "");
+    const prior = counts.get(key);
+    if (prior) prior.count++;
+    else counts.set(key, { reason: text, count: 1 });
+  }
+  return [...counts.values()].sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
 }
 
 /**
@@ -132,14 +222,49 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     else byFingerprint.set(f.fingerprint, { ...f });
   }
 
+  // A refuted finding is in no findings.json anywhere, so it has to be carried in from the
+  // skeptic's own record or it is counted nowhere — which is exactly the hole this is for:
+  // every rate below was computed over the survivors alone, so a finder whose output the
+  // skeptic threw away looked identical to one that produced nothing to throw away.
+  //
+  // Killed in ANY run sticks, like published: models do not reproduce a quote byte for byte
+  // across runs, so a fingerprint that survived a later re-review is a different finding
+  // text, not the verifier changing its mind.
+  const killedFps = new Set<string>();
+  for (const o of input.outcomes ?? []) {
+    if (!o.fingerprint || !o.killed) continue;
+    killedFps.add(o.fingerprint);
+    if (byFingerprint.has(o.fingerprint)) continue;
+    byFingerprint.set(o.fingerprint, {
+      fingerprint: o.fingerprint,
+      category: o.category ?? "",
+      confidence: o.confidence ?? 0,
+      sources: o.sources ?? [],
+      // It never reached a comment, by construction: that is what being killed means.
+      published: false,
+    });
+  }
+  let killedCount = 0;
+  let fixedCount = 0;
+  let autoClosedCount = 0;
+
   const conf = new Map<string, ReturnType<typeof tally>>();
   const cat = new Map<string, ReturnType<typeof tally>>();
   const finder = new Map<string, ReturnType<typeof tally>>();
-  const add = (m: Map<string, ReturnType<typeof tally>>, key: string, f: CalibrationFinding, dismissed: boolean) => {
+  const add = (
+    m: Map<string, ReturnType<typeof tally>>,
+    key: string,
+    f: CalibrationFinding,
+    dismissed: boolean,
+    killed: boolean,
+    actedOn: boolean,
+  ) => {
     const t = m.get(key) ?? tally();
     t.findings++;
     if (f.published) t.published++;
     if (dismissed) t.dismissed++;
+    if (killed) t.killed++;
+    if (actedOn) t.actedOn++;
     m.set(key, t);
   };
 
@@ -151,10 +276,15 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     if (f.published) published++;
     if (dismissed) dismissedCount++;
     if (dismissed && f.published) publishedDismissed++;
-    add(conf, confidenceBucket(f.confidence), f, dismissed);
-    add(cat, f.category || "(none)", f, dismissed);
+    const killed = killedFps.has(f.fingerprint);
+    if (killed) killedCount++;
+    const fixed = input.actedOn?.fixed.has(f.fingerprint) ?? false;
+    if (fixed) fixedCount++;
+    if (input.actedOn?.autoClosed.has(f.fingerprint)) autoClosedCount++;
+    add(conf, confidenceBucket(f.confidence), f, dismissed, killed, fixed);
+    add(cat, f.category || "(none)", f, dismissed, killed, fixed);
     // A finding found by two models is credit — and blame — for both.
-    for (const s of f.sources.length > 0 ? f.sources : ["(unknown)"]) add(finder, s, f, dismissed);
+    for (const s of f.sources.length > 0 ? f.sources : ["(unknown)"]) add(finder, s, f, dismissed, killed, fixed);
   }
 
   const skeptics = new Map<string, SkepticStats>();
@@ -182,9 +312,14 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   return {
     findings: byFingerprint.size,
     published,
+    killed: killedCount,
+    actedOn: fixedCount,
+    autoClosed: autoClosedCount,
     dismissed: dismissedCount,
     publishedDismissed,
     orphanDismissals,
+    reasons: groupReasons(input.dismissalReasons ?? []),
+    reasonless: input.reasonlessDismissals ?? 0,
     byConfidence: toBuckets(conf, CONFIDENCE_FLOORS.map(([, k]) => k)),
     byCategory: toBuckets(cat),
     byFinder: toBuckets(finder),
@@ -260,12 +395,32 @@ function readFindings(file: string, into: CalibrationFinding[]): boolean {
   return true;
 }
 
-function readVerdicts(file: string, into: CalibrationVerdict[]): boolean {
+/**
+ * One pass over a run's skeptic.json, filling both views of it: `verdicts` is one row per
+ * ANSWER (what each verifier said), `outcomes` one row per FINDING (what the majority did
+ * with it). Kept as one reader because they come from the same rows and a second parser
+ * would drift from this one.
+ */
+function readVerdicts(file: string, into: CalibrationVerdict[], outcomes: CalibrationOutcome[]): boolean {
   const v = readJson(file);
   if (!Array.isArray(v)) return false;
   for (const item of v) {
     if (typeof item !== "object" || item === null) continue;
-    const verdicts = (item as Record<string, unknown>)["verdicts"];
+    const row = item as Record<string, unknown>;
+    // Every field but `killed` is absent on runs written before the row carried the
+    // finding's identity. Such a row still contributes its verdicts; it simply cannot be
+    // attributed to a finder or a category, which is the honest answer for it.
+    const fp = str(row["fingerprint"]);
+    outcomes.push({
+      killed: row["killed"] === true,
+      ...(fp ? { fingerprint: fp } : {}),
+      ...(typeof row["category"] === "string" ? { category: row["category"] } : {}),
+      ...(typeof row["confidence"] === "number" ? { confidence: row["confidence"] } : {}),
+      ...(Array.isArray(row["sources"])
+        ? { sources: row["sources"].filter((x): x is string => typeof x === "string") }
+        : {}),
+    });
+    const verdicts = row["verdicts"];
     if (!Array.isArray(verdicts)) continue;
     for (const raw of verdicts) {
       if (typeof raw !== "object" || raw === null) continue;
@@ -287,8 +442,12 @@ function readVerdicts(file: string, into: CalibrationVerdict[]): boolean {
 export function scanRuns(root: string): ScanResult {
   const findings: CalibrationFinding[] = [];
   const verdicts: CalibrationVerdict[] = [];
+  const outcomes: CalibrationOutcome[] = [];
   const unusable: string[] = [];
   const dismissed = new Set<string>();
+  const dismissalReasons: string[] = [];
+  let reasonlessDismissals = 0;
+  const actedOn = { fixed: new Set<string>(), autoClosed: new Set<string>() };
   const repos: string[] = [];
 
   // runs/<org>/<project>/<repo>/pr-N/iter-M/findings.json is 6 deep; the walk is bounded so
@@ -300,7 +459,7 @@ export function scanRuns(root: string): ScanResult {
     else unusable.push(f);
   }
   for (const f of findFiles(root, "skeptic.json", 6, [])) {
-    if (!readVerdicts(f, verdicts)) unusable.push(f);
+    if (!readVerdicts(f, verdicts, outcomes)) unusable.push(f);
   }
 
   // The learnings store sits at the repo root, above the PR directories.
@@ -310,12 +469,20 @@ export function scanRuns(root: string): ScanResult {
     // Read through the store's own loader: it already tolerates corrupt lines and dedupes,
     // and a second parser here would drift from the one that writes it.
     const [org = "", project = "", repoId = ""] = rel.slice(-3);
-    for (const d of loadDismissals({ baseUrl: "", org, project, repoId, prId: 0 }, root)) {
+    const ref = { baseUrl: "", org, project, repoId, prId: 0 };
+    for (const d of loadDismissals(ref, root)) {
       dismissed.add(d.fingerprint);
+      if (d.reason) dismissalReasons.push(d.reason);
+      else reasonlessDismissals++;
+    }
+    // Its own store, read through its own loader for the same reason: both tolerate corrupt
+    // lines and dedupe first-wins, and a second parser here would drift from the writer.
+    for (const o of loadOutcomes(ref, root)) {
+      (o.outcome === "auto-closed" ? actedOn.autoClosed : actedOn.fixed).add(o.fingerprint);
     }
   }
 
-  return { findings, verdicts, dismissed, runs, unusable, repos };
+  return { findings, verdicts, outcomes, dismissed, dismissalReasons, reasonlessDismissals, actedOn, runs, unusable, repos };
 }
 
 // ─── Output ─────────────────────────────────────────────────────────────────
@@ -333,8 +500,16 @@ function table(header: string[], rows: string[][]): string {
 function bucketTable(title: string, buckets: Bucket[]): string {
   if (buckets.length === 0) return `${title}\n  (nothing to report)`;
   return `${title}\n${table(
-    ["", "findings", "published", "dismissed", "rate"],
-    buckets.map((b) => [b.key, String(b.findings), String(b.published), String(b.dismissed), pct(b.rate)]),
+    ["", "findings", "killed", "published", "fixed", "dismissed", "rate"],
+    buckets.map((b) => [
+      b.key,
+      String(b.findings),
+      String(b.killed),
+      String(b.published),
+      String(b.actedOn),
+      String(b.dismissed),
+      pct(b.rate),
+    ]),
   )}`;
 }
 
@@ -347,6 +522,16 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
     `${plural(report.findings, "distinct finding")}, ${report.published} of them commented inline`,
     `${plural(report.publishedDismissed, "commented finding")} later dismissed by a human` +
       (report.published > 0 ? ` (${pct(report.publishedDismissed / report.published)} of what was published)` : ""),
+    // The tool's own catch, next to the one it missed. Both are false-positive counts; the
+    // difference is who paid for it, the verifier or the reviewer.
+    `${plural(report.killed, "finding")} refuted by the skeptic before anyone saw ${report.killed === 1 ? "it" : "them"}` +
+      (report.findings > 0 ? ` (${pct(report.killed / report.findings)} of everything found)` : ""),
+    // PROPOSAL §12's north star, and the first positive number the tool has ever had. The
+    // auto-closed count is kept beside it rather than inside it: prloop closing a thread
+    // because the flagged line went away is its own inference, not a person's decision.
+    `${plural(report.actedOn, "commented finding")} a human then marked fixed` +
+      (report.published > 0 ? ` — implementation rate ${pct(report.actedOn / report.published)}` : "") +
+      (report.autoClosed > 0 ? `, plus ${report.autoClosed} prloop auto-closed when the code went away` : ""),
   ];
   if (report.orphanDismissals > 0) {
     out.push(
@@ -357,6 +542,10 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
   out.push(
     "",
     "Only published findings can be dismissed, so every rate below is dismissed/published.",
+    "`killed` is the skeptic's share of the same population — read it against `findings` in",
+    "the same row, and remember a killed finding was never published and so can never be",
+    "dismissed. A finder whose killed count approaches its findings count is paying for",
+    "verification it is not earning.",
     "",
     bucketTable("Dismissal rate by finder confidence", report.byConfidence),
     "",
@@ -365,6 +554,18 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
     bucketTable("Dismissal rate by finder model", report.byFinder),
     "",
   );
+  const totalReasons = report.reasons.reduce((n, r) => n + r.count, 0);
+  if (totalReasons > 0 || report.reasonless > 0) {
+    out.push(
+      totalReasons === 0
+        ? `Why reviewers said no\n  (none of the ${report.reasonless} dismissals came with a reply)`
+        : `Why reviewers said no (${totalReasons} of ${totalReasons + report.reasonless} dismissals came with a reply)\n${table(
+            ["reason", "count"],
+            report.reasons.slice(0, 10).map((r) => [r.reason.slice(0, 96), String(r.count)]),
+          )}`,
+      "",
+    );
+  }
   out.push(
     report.skeptics.length === 0
       ? "Skeptic verdicts\n  (no verification recorded)"

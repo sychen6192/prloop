@@ -140,7 +140,12 @@ name looks like a credential (`*_PAT`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_A
 `*_ACCESS_KEY`, `*_PRIVATE_KEY`, `SYSTEM_ACCESSTOKEN`, prloop's own PAT and LLM key) is
 dropped, and everything else (`PATH`, `JAVA_HOME`, `M2_HOME`, `npm_config_*`, proxies, CA
 paths) passes through, because build tools legitimately need it. The `opencode` runner's
-child process gets the same treatment.
+child process gets the same treatment, and so does `PRR_WORKTREE_SETUP_CMD` — which is why
+that command runs in a **non-login** shell: a login shell re-reads `~/.profile`, and a
+profile that exports a key would hand back everything the scrub just dropped. It therefore
+inherits prloop's own `PATH` and nothing else, exactly as the linters do, so a toolchain that
+exists only inside `~/.profile` (nvm, pyenv, sdkman) needs its `PATH` exported in the
+environment prloop itself starts from.
 
 ---
 
@@ -221,6 +226,27 @@ found it never ran) · `1` fatal.
 `--since auto` reads the last reviewed iteration back out of prloop's own summary comment —
 state lives on the PR, so a pipeline agent, your laptop and a cron box need no shared disk.
 
+**A run that did not review the push does not move that resume point.** If the finder stage
+crashed, every finder failed, the skeptic stage crashed, the requirement axis errored, or a
+comment came back with a 5xx, the summary keeps the previous iteration marker and the next
+run reviews the same push again; the summary says so in its run notes. Deliberately narrow:
+a crashed linter, one model out of three timing out, one finding whose verifier died, a 4xx
+ADO will refuse identically next time, and files dropped for diff size all still advance it —
+they are reported by exit `3`, not by re-reviewing. A run that has already lost files to
+`PRR_MAX_DIFF_CHARS` also advances whatever else failed, because holding would widen the next
+run's range and review less, not more.
+
+**A diff that does not fit can be read in more than one request.** By default it is not: the
+files past the budget are dropped from every finder's context and reported as a coverage gap,
+so a large PR exits `3` telling you the part most likely to hold the defect was never read.
+Set `PRR_FINDER_MAX_CHUNKS` above `1` and the packing continues into a second and third
+request instead of stopping. Every finder reads every chunk, so "two finders agreed" still
+means two models, and the corroboration gate is untouched; the split is decided by budget
+alone and never by the per-finder seed, so a finding is compared against the same file in the
+same part. Chunks are separate requests, not a conversation — each prompt says which part it
+holds and tells the model not to reason about files it cannot see. The cost is linear and the
+run says so before spending it.
+
 ### Unattended, over a list of PRs
 
 Static analysis needs the code on disk. Point `PRR_WORKTREE_REPO` at a clone and prloop cuts
@@ -233,11 +259,56 @@ PRR_WORKTREE_REPO=/repos/myrepo
 PRR_WORKTREE_SETUP_CMD='npm ci'         # a worktree has no node_modules and no venv
 ```
 
-Then the whole daily job is a loop, with no checkout to manage and nothing to edit per PR:
+Then the whole daily job is one command, with no checkout to manage and nothing to edit per PR:
 
 ```bash
-while read -r url; do prloop "$url" --since auto || true; done < prs.txt
+prloop --batch prs.txt --since auto
 ```
+
+`--batch` reviews every URL in the file, one after another, and **exits with the worst outcome
+in the list** — which is the one thing the loop it replaces cannot do:
+
+```bash
+while read -r url; do prloop "$url" --since auto || true; done < prs.txt   # the old way
+```
+
+That `|| true` is not laziness: without it the first PR with a blocking finding stops the
+loop, so the only way to review the rest was to throw every exit code away. `--batch` prints a
+table at the end — one line per PR with its exit code and what actually happened, read back
+out of each run's own `result.json`, because the code alone cannot tell "clean" from "the PR
+had already merged" — and then exits `1` > `2` > `3` > `0`, worst wins. The whole file is
+validated first, so a typo on line 40 surfaces immediately rather than two hours in. Each PR
+is a separate process (per-run state is module-global in four places) and they run one at a
+time: the only throttle prloop has on a model endpoint is `PRR_LLM_CONCURRENCY`, which is per
+process. If three pull requests in a row fail before producing a review, the rest are
+abandoned — that is a credential, an endpoint or a proxy, not those pull requests, and the
+remaining PRs would each pay a full retry budget to find that out.
+
+**Two runs on one PR post everything twice.** A tick that runs long and the next one — or
+your laptop beside the pipeline — both read the PR's existing comments before either has
+written any, so both see the same set of already-said findings and both say all of them
+again. So a run takes a **lease** on the pull request first: a timestamped marker inside
+prloop's own summary comment, honoured by any other run for `PRR_RUN_LEASE_MS` (one hour by
+default). A run that finds the PR held reviews nothing, spends nothing, and exits `0`; the
+review is already happening. The lease is given back by the summary the run posts, so the
+normal path costs no extra write, and an expired one is taken over with a warning naming the
+knob — if reviews here legitimately run longer than the window, raise it. `0` turns it off.
+
+This is not a mutex, and it is not sold as one: Azure DevOps has no compare-and-swap on a
+comment body, so two runs starting in the same round trip can still both proceed (the claim
+reads its own write back, which makes that window small). It also does nothing on a PR prloop
+has never published to, because claiming would mean creating the summary comment before the
+review that fills it — and two first runs racing would then leave two summary threads, which
+is the `--since auto` wedge the lease exists to prevent. A dry run takes no lease at all.
+
+A merged pull request can stay in `prs.txt`. prloop still fetches it and its diff, then stops
+before the first model call: Azure DevOps refuses every write to a completed PR, so a review
+of one used to be paid for in full and then fail comment by comment, exiting `3` on every tick
+forever. It exits `0` now and says why. It still reads the PR's comments first — the window
+right after a merge is when people work through a bot's comments in bulk, and those
+dismissals and fixes are the richest the learning stores ever get. `--dry-run` reviews a
+completed PR anyway, which is what makes a golden set of historical PRs (see
+`scripts/evaluate.ts`) possible.
 
 Prefer this to `PRR_WORKDIR` for anything unattended. `git checkout <branch>` lands on
 whatever the branch points at **now**, which stops being the iteration under review the
@@ -269,13 +340,21 @@ npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
 - **No duplicates on re-run** — each comment embeds a finding fingerprint.
 - **Stale threads auto-close** when their target code is gone. The criteria are narrow on
   purpose: wrongly closing a live issue is worse than leaving a stale comment.
+- **The summary says what became of the last run's comments** — how many this run closed
+  because the code under them changed (dated from the `--since auto` resume point, which is
+  what made them stale), how many a reviewer marked fixed, how many were dismissed, and how
+  many are still waiting. Nothing settled yet, or a first run, prints no line at all.
 - **Dismissals stick.** A finding closed as *wontFix*/*byDesign* is recorded per repo
   (`runs/<org>/<project>/<repo>/dismissals.jsonl`) and never posted again on any PR where
   the model produces the same quote (rewordings on the same PR are also caught by position
   overlap; a substantially reworded finding on a *different* PR can still reappear —
   fingerprints hash the quote). A thread merely marked *Closed* is treated as handled, not
   dismissed. After three dismissals in one category the summary suggests excluding it, and
-  stops there: prloop never writes its own config.
+  stops there: prloop never writes its own config. The reviewer's first reply in the thread is
+  kept as the *reason*, and `scripts/calibrate.ts` groups by it — a dismissal rate says how
+  often prloop is wrong, and only the reason says in what way. It is a reviewer's free text,
+  so it is flattened, capped and redacted on the way into the store, and it reaches no prompt:
+  nothing under `prompts/` can read that store at all, and the selftest pins it.
 - **Clean PR → one quiet line.** Style and formatting never get a comment; that's the linter's job.
 
 Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the settings the run
@@ -292,6 +371,24 @@ number, duration, tokens, error), and `result.json` (the outcome: exit code, wha
 incomplete, the counts down the funnel, tokens, duration, version). Start there when a
 result looks wrong.
 
+`review.html` is the run on one screen: the diff, with every anchored finding sitting on the
+line it is about, every finding below the bar shown greyed with the reason it was not
+commented, and every finding that could not be anchored in its own list with the failure that
+stopped it. One self-contained file — inline CSS, no script, nothing fetched — so it opens
+from a build agent's disk as readily as from a laptop. It is what makes `--dry-run` a
+preflight you can actually read, and what makes auditing a golden set (`scripts/evaluate.ts`)
+tolerable by hand. `npx tsx scripts/demo.ts` writes one from synthetic data if you want to see
+it without a PR.
+
+`result.json` is written on **every** exit path, not just a clean one: a run that crashed
+records what killed it under `fatal`, and one that reviewed nothing (a merged PR) records
+`skippedReason`. All three carry an `identity` block — which pull request, which iteration,
+what it compared against, dry-run or not, and the model fleet — so a digest over a list of
+PRs can read the files without parsing directory names. A crash before intake has no run
+directory yet, so it writes into `<pr>/fatal/` instead, along with a `run.log` replaying the
+lines printed before then. Like `<pr>/skipped/`, that directory has a fixed name and is never
+pruned: a week of auth failures must not evict the PR's last real review.
+
 ## Settings
 
 Full list with explanations in [.env.example](./.env.example). The ones that change behaviour:
@@ -304,6 +401,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_MAX_SKEPTIC_FINDINGS` | `30` | fan-out ceiling; worst findings verified first, overflow logged |
 | `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |
+| `PRR_BOT_IDENTITY_IDS` | — | identity GUIDs, besides the current credential's, whose marker comments are prloop's own. Only needed when prloop's credential changed (laptop PAT → pipeline service account); without it the first run under the new identity re-reviews the PR from scratch and stops harvesting dismissals on the older threads |
 | `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size. `0` = no cap |
 | `PRR_LLM_RETRIES` | `1` | **EXTRA** attempts on transient model failures — `1` = up to two calls, `0` = never retry (never on 4xx) |
 | `PRR_LLM_MAX_TOKENS` | `8192` | **raise to 16384+ for thinking models** — reasoning is billed to this budget |
@@ -327,7 +425,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_WORKTREE_SETUP_TIMEOUT_MS` | `600000` | deadline for that command |
 | `PRR_TRIAGE_MODEL` | — | unset = high-FP tool findings are dropped |
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |
-| `PRR_DRY_RUN` | — | `1` = compute, publish nothing |
+| `PRR_DRY_RUN` | — | `1` = compute, publish nothing. Also the only way to review a **completed** PR: a live run over one skips before the first model call, because ADO refuses every write to it |
 | `PRR_ADO_MAX_RETRIES` | `3` | **TOTAL** attempts per ADO request, first try included — `1` = never retry. Opposite sense to `PRR_LLM_RETRIES`; both names are published, so neither was renamed |
 | `PRR_RUNS_KEEP` | `20` | iteration directories kept per PR under `runs/`, oldest deleted first; `0` = keep everything. Never touches `dismissals.jsonl` |
 | `PRR_RUNS_MAX_AGE_DAYS` | `0` | also delete iteration directories older than this; `0` = no age limit |
@@ -361,6 +459,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_AGENT_TIMEOUT_MS` | `900000` | wall clock for one opencode session |
 | `PRR_RULES_DIR` | `rules/` | your team's rules as `.md` files with an `applyTo` glob |
 | `PRR_MAX_DIFF_CHARS` | `240000` | ceiling on the diff sent to a finder, in characters of the diff alone; overflow makes the run incomplete |
+| `PRR_FINDER_MAX_CHUNKS` | `1` | requests one finder may spend on a diff that does not fit; `1` = the overflow is never read. Every finder reads every chunk, so corroboration is unchanged — and the cost is linear |
 | `PRR_CONTEXT_TOKENS` | `0` (off) | the model's context window in tokens. Set it and the diff is budgeted as `window − PRR_LLM_MAX_TOKENS − (system prompt + rules + conventions + PR description + inlined schema)`, so the backend never truncates a prompt mid-hunk and corrupts the quotes anchoring depends on. Token counts are an estimate (±20%) |
 | `PRR_CONTEXT_TOKENS_BY_MODEL` | — | JSON `model → tokens`: a fleet of different families is also a fleet of different context sizes, and one number either wastes the largest or truncates the smallest |
 | `PRR_HUNK_CONTEXT_BEFORE` | `6` | context lines before each hunk (asymmetric: what precedes a change means more) |
@@ -376,9 +475,10 @@ answer to "why did editing `.env` change nothing".
 | `PRR_SKIP_REQUIREMENT` | — | `1` = skip the requirement axis |
 | `PRR_DISMISSAL_HINT_THRESHOLD` | `3` | dismissals in one category before the summary suggests excluding it |
 | `PRR_MAX_INLINE_REQ_COMMENTS` | `3` | requirement-axis budget, separate so code findings cannot crowd it out |
-| `PRR_POST_STATUS` | — | `1` = also post a PR status (needs a branch policy to gate merges) |
+| `PRR_POST_STATUS` | — | `1` = also post a PR status (needs a branch policy to gate merges). Three states, matching the exit code: `failed` (2) · `error` (3, the review did not fully run) · `succeeded` (0) |
 | `PRR_STATUS_GENRE` | `prloop` | genre of that status |
 | `PRR_STATUS_NAME` | `ai-review` | name of that status |
+| `PRR_RUN_LEASE_MS` | `3600000` | how long one run holds a PR before another may take it over; `0` = no lease |
 | `PRR_HTTPS_PROXY` | — | overrides `HTTPS_PROXY` from the shell (Node's fetch reads neither by itself) |
 | `PRR_HTTP_PROXY` | — | overrides `HTTP_PROXY` from the shell |
 | `PRR_NO_PROXY` | — | hosts that bypass the proxy; `host:port` entries match on port |
@@ -462,6 +562,53 @@ published findings a human later dismissed — the tool's own false-positive rat
 read-only and offline, counts each finding once no matter how often the PR was re-reviewed,
 and skips (counting) any artifact it cannot read, so an old or half-written `runs/` tree
 still yields a report. Pass a directory to point it somewhere other than `PRR_RUNS_DIR`.
+
+Each of those three tables also carries a **`fixed`** column and the headline an
+**implementation rate**: of the findings that reached a comment, how many a human then marked
+fixed. That is PROPOSAL §12's north star, and until now the only per-finding outcome prloop
+kept was negative — so precision could only be estimated as one minus the dismissal rate,
+which scores every comment nobody answered as a success. Threads prloop auto-closed because
+the flagged line went away are counted beside the rate, never inside it: that is prloop's own
+inference, not a person's decision, and folding it in would let the tool grade itself. The
+record lives in `runs/<org>/<project>/<repo>/outcomes.jsonl`, deliberately not in
+`dismissals.jsonl` — everything in that file is suppressed on every future PR in the repo, and
+a finding somebody fixed is the last thing to stop reporting.
+
+Each of those three tables also carries a **`killed`** column: how many of that bucket's
+findings the skeptic majority refuted. A refuted finding reaches no comment and appears in no
+`findings.json`, so it is read out of `skeptic.json` and joined back in — without it a finder
+whose output the verifier throws away looks exactly like one that found nothing to throw
+away. Read `killed` against `findings` in the same row: that ratio, per finder and per
+category, is what says whether a finder is earning the verification it costs. Runs written
+before `skeptic.json` recorded a finding's identity still count toward the per-model verdict
+table; they simply cannot be attributed to a finder or a category.
+
+`scripts/evaluate.ts` answers the other half of PROPOSAL §12: not "did a human reject what we
+published" but "did we publish what is actually there". Write a `golden.json` beside a PR's
+iteration directories listing the defects you know it contains, and it scores the newest run
+against them:
+
+```json
+{
+  "defects": [{ "file": "src/pay.ts", "lines": [25, 25], "note": "gateway call inside the transaction" }],
+  "mustNotFlag": [{ "file": "src/util.ts", "lines": [1, 80], "note": "reviewed clean" }]
+}
+```
+
+The output is not one recall number, because a miss is not one event. Each defect is filed
+under the furthest stage it reached — `inline`, `cap`, `severity`, `no-corroboration`,
+`dismissed`, `refuted`, `anchor-failed`, `not-found` — and each of those names a different
+file to open. A defect nothing mentioned is a finder-prompt or model problem; one whose quote
+would not anchor is `anchoring/locate.ts`; one the skeptic killed is verification; one held
+back for want of a second finder is the corroboration gate. "Recall 60%" hides which.
+
+`mustNotFlag` is what makes precision measurable at all: a comment matching no listed defect
+may be a false positive or a real bug the golden set does not know about, and nothing in the
+artifacts can tell those apart. Only a comment inside a region a reviewer has declared clean
+is a measured mistake; the rest are reported as unattributed and counted against nothing.
+
+The per-finder table is the multi-model question in numbers. Run the same golden set with
+`PRR_FINDER_MODELS=a` and then `a,b` into different `PRR_RUNS_DIR`s and compare.
 
 `scripts/selftest.ts` is the regression net for anchoring — **run it after touching
 `libs/diff.ts` or `anchoring/locate.ts`**. Its assertions map directly onto the causes of

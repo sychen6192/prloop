@@ -25,6 +25,40 @@ export interface PreparedWorktree {
   cleanup: () => Promise<void>;
 }
 
+/**
+ * How PRR_WORKTREE_SETUP_CMD is handed to a shell.
+ *
+ * Through a shell at all, because what belongs in that knob is the project's own install
+ * line ("npm ci", "uv sync", "mvn -q -DskipTests install") and those are shell strings, not
+ * argv — and through the platform's own shell, because `sh` is not on a Windows box and the
+ * whole point of the knob is that it runs unattended.
+ *
+ * NOT a login shell. `sh -lc` re-sources /etc/profile and ~/.profile before running the
+ * command, and a profile is exactly where an operator exports OPENAI_API_KEY, GITHUB_TOKEN
+ * or AZURE_DEVOPS_EXT_PAT. run() hands every child scrubbedEnv() (libs/shell.ts), so the
+ * login shell was putting back every name the scrub had just dropped — and then handing
+ * them to the reviewed branch's own build script, which is a program the PR author wrote.
+ * The linters never had this hole: gates/static.ts spawns their binary directly, no shell.
+ * cmd.exe /d /s /c reads no profile, so Windows was never affected and does not change.
+ *
+ * The cost is real and is the reason `-l` was there: the command now inherits prloop's own
+ * PATH and nothing else, exactly as the linters do. A toolchain that exists only inside
+ * ~/.profile (nvm, pyenv, sdkman) is invisible to it. In practice prloop is itself started
+ * through node, so the PATH that launched it already carries node and npm — the case that
+ * breaks is a cron or systemd unit with a minimal PATH and an absolute node, where a
+ * non-node toolchain lived only in the profile. Those operators export PATH in the
+ * environment prloop starts from, which they already have to do for the linters.
+ *
+ * Pure, so the selftest can pin the flags for both platforms without a shell. Asserting on
+ * the returned argv rather than grepping this file for "-lc" is deliberate: the argv catches
+ * a reinstated `-l` however it is spelled.
+ */
+export function planSetupShell(cmd: string, platform: NodeJS.Platform): { file: string; args: string[] } {
+  return platform === "win32"
+    ? { file: "cmd.exe", args: ["/d", "/s", "/c", cmd] }
+    : { file: "sh", args: ["-c", cmd] };
+}
+
 /** Why no worktree could be prepared, worded for the static gate's skippedReason. */
 export interface WorktreeFailure {
   error: string;
@@ -108,18 +142,9 @@ export async function prepareWorktree(
   };
 
   if (WORKTREE_SETUP_CMD) {
-    // Through a shell, because what belongs here is the project's own install line
-    // ("npm ci", "uv sync", "mvn -q -DskipTests install") and those are shell strings, not
-    // argv — and through the platform's own shell, because `sh` is not on a Windows box and
-    // the whole point of this knob is that it runs unattended. It gets the
-    // credential-scrubbed environment for the same reason the linters do (libs/shell.ts):
-    // it is the reviewed branch's build script, written by the PR author.
     log(`worktree: running PRR_WORKTREE_SETUP_CMD`);
-    const [shell, shellArgs] =
-      process.platform === "win32"
-        ? ["cmd.exe", ["/d", "/s", "/c", WORKTREE_SETUP_CMD]]
-        : ["sh", ["-lc", WORKTREE_SETUP_CMD]];
-    const setup = await run(shell as string, shellArgs as string[], WORKTREE_SETUP_TIMEOUT_MS, dir);
+    const { file, args } = planSetupShell(WORKTREE_SETUP_CMD, process.platform);
+    const setup = await run(file, args, WORKTREE_SETUP_TIMEOUT_MS, dir);
     if (setup.code !== 0) {
       // Not fatal, and not silent. The fact-tier tools name an uninstalled tree themselves
       // (environmentRules) and discard their own findings; the other tools are unaffected.

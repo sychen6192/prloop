@@ -7,6 +7,7 @@ import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
 import type { AggregateResult } from "../gates/aggregate";
 import type { CategoryHint } from "../libs/learnings";
+import type { ThreadTally, WatermarkDecision } from "./lifecycle";
 import type { ReviewContext } from "../ado/intake";
 import type { StaticResult } from "../gates/static";
 
@@ -113,6 +114,13 @@ export interface SummaryInput {
   posted?: AnchoredFinding[];
   alreadyPosted?: AnchoredFinding[];
   failed?: Array<{ finding: AnchoredFinding; error: string }>;
+  // What publish() decided about the `--since auto` resume point. Absent means no decision
+  // was taken (dry run, local-review, demo), which is not the same as "it advanced".
+  watermark?: WatermarkDecision;
+  // Where prloop's earlier comments on this PR now stand, and the iteration the last run
+  // recorded. Both absent when nothing was published (dry run, local-review, demo).
+  threads?: ThreadTally;
+  sinceIteration?: number;
   durationSec: number;
   runDir: string;
 }
@@ -209,6 +217,36 @@ function postingOutcome(input: SummaryInput): (f: AnchoredFinding) => string {
         : "";
 }
 
+/**
+ * What has become of everything prloop said on this PR before today.
+ *
+ * `resolved` was computed on every run and reached nothing a human reads, so a PR carrying
+ * twelve open prloop comments and one carrying twelve the author had worked through rendered
+ * identically. The auto-closes are the half only prloop can report — nobody else knows a
+ * thread was closed because the code under it went away — and they are dated, since the
+ * resume point says exactly which push made them stale.
+ *
+ * Empty when there is nothing to say: a first run, or a PR where every comment is still open
+ * and this run closed none, gets no line rather than a row of zeroes.
+ */
+function renderThreadStatus(input: SummaryInput): string[] {
+  const t = input.threads;
+  if (!t) return [];
+  const settled = t.fixed + t.dismissed + t.closedThisRun;
+  if (settled === 0) return [];
+  const parts: string[] = [];
+  if (t.closedThisRun > 0) {
+    parts.push(
+      `**${t.closedThisRun}** closed by this run — the code under them has changed` +
+        (input.sinceIteration === undefined ? "" : ` since iteration ${input.sinceIteration}`),
+    );
+  }
+  if (t.fixed > 0) parts.push(`**${t.fixed}** marked fixed by a reviewer`);
+  if (t.dismissed > 0) parts.push(`**${t.dismissed}** dismissed`);
+  if (t.open > 0) parts.push(`**${t.open}** still open`);
+  return [`🧵 Earlier comments: ${parts.join(" · ")}`, ""];
+}
+
 /** The headline over the findings table: what was found, and what reached the code. */
 function postingClaim(input: SummaryInput, inline: AnchoredFinding[]): string {
   const found = `Found **${inline.length}** issues worth attention`;
@@ -241,6 +279,8 @@ export function renderSummary(input: SummaryInput): string {
     `Scope: ${scope} | ${ctx.files.length} files changed | ${input.durationSec}s`,
     "",
   );
+
+  lines.push(...renderThreadStatus(input));
 
   lines.push(...renderRequirementSection(input.req));
 
@@ -343,6 +383,20 @@ export function renderSummary(input: SummaryInput): string {
     notes.push(
       `${agg.stats.excluded} findings dropped, category excluded by config (PRR_EXCLUDE_CATEGORIES=${excludedCategories().join(",")})`,
     );
+  }
+  // Worded from the decision, not from the list of reasons, because the two cases read
+  // oppositely: with a resume point already on the PR the next run re-reviews this push,
+  // and without one it reviews the whole PR. The reasons themselves are already a bullet
+  // each above — repeating them here would say the same thing twice.
+  const wm = input.watermark;
+  if (wm?.held) {
+    notes.push(
+      wm.record === undefined
+        ? `This push was not fully reviewed (${wm.reason}), and no resume point was recorded, so the next \`--since auto\` run reviews the whole PR`
+        : `This push was not fully reviewed (${wm.reason}), so the \`--since auto\` resume point stays at iteration ${wm.record} and the next run re-reviews from there`,
+    );
+  } else if (wm?.reason) {
+    notes.push(wm.reason);
   }
   for (const h of input.dismissalHints ?? []) {
     notes.push(

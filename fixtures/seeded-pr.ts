@@ -178,6 +178,13 @@ export interface ExpectedAnchor {
   contextAfter?: string;
   /** The line this must anchor to, or the failure it must produce. */
   expect: number | "quote-ambiguous" | "quote-not-found" | "outside-changed-lines";
+  /**
+   * This entry is a defect the review OUGHT to report, not just a quote that ought to
+   * anchor. The two groups are not the same list and cannot be told apart by shape: two of
+   * the anchoring boundary cases below name a line as well, because what they pin is WHICH
+   * of two identical lines a quote resolves to — correctly refusing to report anything.
+   */
+  defect?: true;
 }
 
 export const EXPECTED_ANCHORS: ExpectedAnchor[] = [
@@ -186,48 +193,56 @@ export const EXPECTED_ANCHORS: ExpectedAnchor[] = [
     name: "mutable default argument",
     file: "/src/payment/refund_service.py",
     quote: "    def process_refund(self, order_id, amount, audit_tags=[]):",
+    defect: true,
     expect: 15,
   },
   {
     name: "payment call inside the transaction",
     file: "/src/payment/refund_service.py",
     quote: "        self.gateway.refund(order.payment_id, amount)",
+    defect: true,
     expect: 25,
   },
   {
     name: "swallowed exception",
     file: "/src/payment/refund_service.py",
     quote: "        except Exception:",
+    defect: true,
     expect: 34,
   },
   {
     name: "static SimpleDateFormat",
     file: "/src/main/java/shop/InventoryService.java",
     quote: `    private static final SimpleDateFormat STAMP = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");`,
+    defect: true,
     expect: 12,
   },
   {
     name: "ConcurrentHashMap non-atomic compound operation",
     file: "/src/main/java/shop/InventoryService.java",
     quote: "        stock.put(sku, stock.get(sku) - qty);",
+    defect: true,
     expect: 22,
   },
   {
     name: "Collectors.toMap without a merge function",
     file: "/src/main/java/shop/InventoryService.java",
     quote: "        return items.stream().collect(Collectors.toMap(Item::sku, Item::name));",
+    defect: true,
     expect: 26,
   },
   {
     name: "Server Action with no authorization check",
     file: "/app/checkout/actions.ts",
     quote: "export async function applyRefund(orderId: string, amount: number) {",
+    defect: true,
     expect: 5,
   },
   {
     name: "leftover console.log",
     file: "/app/checkout/page.tsx",
     quote: "  console.log('cart', cart)",
+    defect: true,
     expect: 6,
   },
 
@@ -266,3 +281,24 @@ export const EXPECTED_ANCHORS: ExpectedAnchor[] = [
     expect: 18,
   },
 ];
+
+/**
+ * The same seeded defects as ground truth for scripts/evaluate.ts, rather than as anchoring
+ * vectors.
+ *
+ * EXPECTED_ANCHORS above answers "does this quote land on line 25". This answers the
+ * different and larger question the golden-set evaluator asks: "does the review report the
+ * defect on line 25 at all, and if not, which stage lost it". Derived from the same entries
+ * on purpose — the line numbers were verified against the real files with `grep -n`, and a
+ * second hand-written list would drift from them.
+ *
+ * Only the entries flagged `defect`. The anchoring boundary cases below them cannot be told
+ * apart by shape — two of them name a line too, because what they pin is which of two
+ * identical lines a quote resolves to, and the right answer for those is to report nothing.
+ */
+export const SEEDED_DEFECTS: Array<{ file: string; lines: [number, number]; note: string }> =
+  EXPECTED_ANCHORS.filter((a): a is ExpectedAnchor & { expect: number } => a.defect === true && typeof a.expect === "number").map((a) => ({
+    file: a.file,
+    lines: [a.expect, a.expect],
+    note: a.name,
+  }));
