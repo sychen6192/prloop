@@ -73,6 +73,9 @@ try {
   process.env["PRR_RUNS_DIR"] = runsDir;
   process.env["PRR_LEARN_FROM_DISMISSALS"] = "1";
   process.env["PRR_QUIET"] = "1";
+  // One attempt: the failure paths below are the point, and three retries with backoff would
+  // add seconds to a net CLAUDE.md says runs before every commit.
+  process.env["PRR_ADO_MAX_RETRIES"] = "1";
 
   const { parsePrUrl } = await import("../ado/client");
   const { publish } = await import("../publish/publish");
@@ -154,7 +157,7 @@ try {
   });
 
   const setState = (partial: Partial<FakeAdoState>) => {
-    Object.assign(ado.state, { threads: [], rejectThreadPost: undefined, rejectStatusPost: undefined, selfIdentityId: undefined, ...partial });
+    Object.assign(ado.state, { threads: [], rejectThreadPost: undefined, rejectStatusPost: undefined, rejectThreadList: undefined, selfIdentityId: undefined, ...partial });
     ado.reset();
   };
 
@@ -502,6 +505,73 @@ try {
 
     setState({ threads: [] });
     resetIdentityCache();
+  }
+
+  section("a PR that cannot be read: degrade and say so, never crash after paying for the review");
+  {
+    // Every dedupe prloop has reads the thread list — fingerprints already said, lines
+    // already commented on, which comment is the sticky summary and what resume point it
+    // carries. Posting without it would double every comment and open a second summary,
+    // which pins `--since auto` to whichever copy ADO returns first, forever.
+    // Medium on purpose: a high-risk finding would fail the gate on its own merits and hide
+    // whether incompleteness reddened it. The blocking case is asserted below.
+    const f = finding({ fingerprint: "eeee7777", severity: "medium" });
+    setState({ rejectThreadList: 500 });
+    const { value: r, lines } = await capture(() =>
+      publish(ref, { requirement: [], code: [f] }, summaryInput({ agg: { ...summaryInput().agg, inline: [f] } }), known()),
+    );
+    eq("publish resolves rather than throwing", typeof r, "object");
+    eq("nothing is posted", threadPosts().length, 0);
+    eq("...and nothing patched", commentPatches().length, 0);
+    eq("every finding is reported as unpostable", r.failed.map((x) => x.finding.fingerprint), ["eeee7777"]);
+    eq("...and none as posted", r.posted.length, 0);
+    eq("there is no summary thread to point at", r.summaryThreadId, undefined);
+    // One precise reason: "N comments failed to post" and "summary comment failed to post"
+    // would both be true here and neither would say why.
+    check("the reason names the read, not the writes", r.gaps.some((g) => g.includes("could not read the PR's comment threads")), JSON.stringify(r.gaps));
+    eq("...and it is the only one", r.gaps.length, 1);
+    // No thread list means no prior resume point, so no decision could be taken. Absent, not
+    // "held: false", which would read as "advanced it".
+    eq("no watermark decision is taken", r.watermark, undefined);
+    // The one write that needs no thread list is the one that must not stay green.
+    eq("the branch-policy gate still goes red", statusOf(statusPosts()[0]), "error");
+    eq("...which is what the exit code says too", exitCodeFor({ agg: { ...summaryInput().agg, inline: [] }, incomplete: r.gaps } as Parameters<typeof exitCodeFor>[0]), 3);
+    check("...and the log says posting was skipped on purpose", lines.some((l) => l.includes("Posting nothing")), lines.join(" | "));
+
+    // A finding prloop found but could not post still blocks: it exists, it is simply not
+    // visible on the PR, and the description has to admit both facts.
+    const risky = finding({ fingerprint: "eeee8888", severity: "critical" });
+    setState({ rejectThreadList: 500 });
+    await capture(() =>
+      publish(ref, { requirement: [], code: [risky] }, summaryInput({ agg: { ...summaryInput().agg, inline: [risky] } }), known()),
+    );
+    eq("an unpostable high-risk finding fails the gate rather than erroring it", statusOf(statusPosts()[0]), "failed");
+    check(
+      "...and the description still admits the review was incomplete",
+      String(statusPosts()[0]?.body?.["description"] ?? "").includes("also incomplete"),
+      String(statusPosts()[0]?.body?.["description"] ?? ""),
+    );
+
+    // The other edge, in the opposite direction. `--since auto` used to read a failed thread
+    // fetch as "no prior review found" and silently re-review the whole PR at full model
+    // cost — and at logVerbose level, which PRR_QUIET (what a cron sets) silences entirely.
+    const { resolveLastReviewedIteration } = await import("../publish/lifecycle");
+    setState({ rejectThreadList: 503 });
+    let threw = "";
+    try {
+      await resolveLastReviewedIteration(ref);
+    } catch (e) {
+      threw = e instanceof Error ? e.message : String(e);
+    }
+    check("an unreadable PR fails the run rather than silently reviewing everything", threw !== "", "it resolved");
+    check("...naming --since auto, so the message says which decision was lost", threw.includes("--since auto"), threw);
+
+    // And the meaning `undefined` has to keep: read fine, nothing recorded yet.
+    setState({ threads: [] });
+    resetIdentityCache();
+    eq("a PR that reads fine but carries no resume point still returns undefined", await resolveLastReviewedIteration(ref), undefined);
+
+    setState({ threads: [] });
   }
 
   section("outcomes: the only positive evidence the tool collects about its own comments");

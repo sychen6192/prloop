@@ -212,12 +212,62 @@ export async function publish(
     return result;
   }
 
+  const { ctx } = summaryInput;
+
+  // Hoisted, because it has to run on both paths below: the branch-policy check needs no
+  // thread list, and a run that could not read the PR is exactly the one whose gate must not
+  // stay green.
+  const reportStatus = async (): Promise<void> => {
+    if (!POST_STATUS) return;
+    const outcome = reviewOutcome({
+      unmet: summaryInput.req ? unmetCriteria(summaryInput.req).length : 0,
+      highRisk: axes.code.filter((f) => f.severity === "critical" || f.severity === "high").length,
+      incomplete: [...known.incomplete, ...result.gaps],
+      filesReviewed: ctx.files.length,
+    });
+    result.status = outcome.state;
+    try {
+      await postStatus(ref, outcome.state, outcome.description, { iterationId: ctx.iteration.id });
+      log(`Reported PR status: ${outcome.state} (${outcome.description})`);
+    } catch (e) {
+      log(`[FAIL] PR status report failed: ${e instanceof Error ? e.message : String(e)}`);
+      // Named, not just logged. The gate on the PR now shows whatever an earlier run left
+      // there — on a re-run of the same iteration, quite possibly a green one — and the
+      // exit code is the only thing left that can say the check was never updated.
+      result.gaps.push("PR status failed to post");
+    }
+  };
+
   // Asked once, alongside the thread list it qualifies: which comments on this PR prloop
   // actually wrote. Everything below still trusts the markers alone; only the two readers
   // whose forging is unrecoverable consult this (publish/lifecycle.ts).
-  const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+  //
+  // Guarded, and the degrade is to write NOTHING. Every dedupe prloop has runs off this list
+  // — the fingerprints already said, the lines already commented on, which comment is the
+  // sticky summary, what resume point it carries — so posting without it would double every
+  // comment and open a second summary thread, which breaks `--since auto` permanently
+  // (it resumes from the first marker it finds). Unguarded, a transient 5xx here threw out
+  // of runReview after every model call had been paid for, and loop.ts died with exit 1
+  // before publish.json or result.json were written: the run directory then held findings
+  // and nothing saying the run had ended, indistinguishable a week later from one that was
+  // killed. Now the findings are reported as unpostable, the run exits 3, and the artifacts
+  // land.
+  let threads: Thread[];
+  let selfId: string | undefined;
+  try {
+    [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`[FAIL] Could not read the PR's existing comments: ${msg}`);
+    log("Posting nothing: without them every comment would be a duplicate and the summary a second one");
+    for (const f of findings) result.failed.push({ finding: f, error: `not attempted: ${msg}` });
+    // One precise reason rather than the generic pair below it: "N comments failed to post"
+    // and "summary comment failed to post" would both be true and neither would say why.
+    result.gaps.push(`could not read the PR's comment threads: ${msg}`);
+    await reportStatus();
+    return result;
+  }
   const seen = postedFingerprints(threads);
-  const { ctx } = summaryInput;
 
   // Close our own threads whose code has since changed, before adding new ones — otherwise
   // a PR accumulates stale comments the author already addressed.
@@ -365,25 +415,7 @@ export async function publish(
     result.gaps.push("summary comment failed to post");
   }
 
-  if (POST_STATUS) {
-    const outcome = reviewOutcome({
-      unmet: summaryInput.req ? unmetCriteria(summaryInput.req).length : 0,
-      highRisk: axes.code.filter((f) => f.severity === "critical" || f.severity === "high").length,
-      incomplete: [...known.incomplete, ...result.gaps],
-      filesReviewed: ctx.files.length,
-    });
-    result.status = outcome.state;
-    try {
-      await postStatus(ref, outcome.state, outcome.description, { iterationId: ctx.iteration.id });
-      log(`Reported PR status: ${outcome.state} (${outcome.description})`);
-    } catch (e) {
-      log(`[FAIL] PR status report failed: ${e instanceof Error ? e.message : String(e)}`);
-      // Named, not just logged. The gate on the PR now shows whatever an earlier run left
-      // there — on a re-run of the same iteration, quite possibly a green one — and the
-      // exit code is the only thing left that can say the check was never updated.
-      result.gaps.push("PR status failed to post");
-    }
-  }
+  await reportStatus();
 
   return result;
 }

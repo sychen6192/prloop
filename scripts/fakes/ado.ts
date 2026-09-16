@@ -64,6 +64,11 @@ export interface FakeAdoState {
    */
   rejectStatusPost?: number;
   /**
+   * Rejects GET .../threads with this HTTP status. Every dedupe prloop has reads that list,
+   * so a run that cannot get it must post nothing rather than duplicate everything.
+   */
+  rejectThreadList?: number;
+  /**
    * The identity GET /_apis/connectionData answers with — who prloop's credential posts as.
    * Undefined serves a 404, which is the on-prem Server case where prloop must fall back to
    * trusting the markers alone.
@@ -150,6 +155,9 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
     }
     // --- threads ---------------------------------------------------------------------
     if (method === "GET" && /\/pullRequests\/\d+\/threads$/.test(path)) {
+      if (state.rejectThreadList !== undefined) {
+        return sendJson(res, state.rejectThreadList, { message: "TF400898: an internal error occurred" });
+      }
       return sendJson(res, 200, { count: state.threads.length, value: state.threads });
     }
     if (method === "POST" && /\/pullRequests\/\d+\/threads$/.test(path)) {

@@ -49,13 +49,31 @@ export function lastReviewedIteration(threads: Thread[], selfId?: string): numbe
   return undefined;
 }
 
+/**
+ * The resume point `--since auto` starts from, read off the PR.
+ *
+ * Throws when the PR cannot be read, and that is the fix rather than an oversight. It used
+ * to swallow the failure at logVerbose level — which `PRR_QUIET=1`, the setting an unattended
+ * cron wants, silences completely — and return undefined, which loop.ts reads as "no prior
+ * review found, doing a full review". So a transient 5xx on one tick silently turned an
+ * incremental review into a full one at full model cost, with nothing in the log saying why.
+ *
+ * `undefined` has to keep meaning one thing: the PR was read and carries no resume point.
+ * A cron that cannot read the PR cannot post to it either — publish() needs the same call —
+ * so failing here costs a tick and saves the entire model budget of a run that was going to
+ * fail at the end anyway.
+ */
 export async function resolveLastReviewedIteration(ref: PrRef): Promise<number | undefined> {
   try {
     const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
     return lastReviewedIteration(threads, selfId);
   } catch (e) {
-    logVerbose(`Could not read last reviewed iteration: ${e instanceof Error ? e.message : String(e)}`);
-    return undefined;
+    const msg = e instanceof Error ? e.message : String(e);
+    logVerbose(`Could not read last reviewed iteration: ${msg}`);
+    throw new Error(
+      `--since auto could not read the pull request's comments, so the resume point is unknown: ${msg}`,
+      { cause: e },
+    );
   }
 }
 

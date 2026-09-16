@@ -49,22 +49,6 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   against fake OpenAI-compatible and Azure DevOps servers (`scripts/fakes/`, `node:http` and
   plain objects) so the side-effecting paths are covered, not just their pure helpers.
   `scripts/demo.ts` and `scripts/local-review.ts` run without ADO credentials or a model endpoint.
-
-### Changed
-
-- Guided decoding is used where the backend enforces it; where it does not, the JSON schema is
-  inlined into the prompt instead (`PRR_LLM_STRUCTURED=0`).
-- Output schemas carry no value constraints — backends disagree on the JSON Schema dialect and
-  a `minimum` keyword was an HTTP 400 on every call.
-- Base rules stopped suppressing findings: the code axis keeps every defect category in scope,
-  and the recall-first stance moved the filtering downstream to the gates.
-- Exit codes tell the truth: `3` for an incomplete review (a crashed stage, or files the finder
-  never saw with `PRR_STRICT_COVERAGE` on) rather than a green `0`.
-- The pipeline, not the model, owns the criteria list, so the requirement axis's denominator
-  stops moving between runs.
-
-### Added
-
 - **An implementation rate: how many commented findings the author actually fixed.** PROPOSAL
   §12 names it as the online north star and nothing measured it. The only per-finding outcome
   prloop persisted was negative — `collectDismissals` kept `wontFix`/`byDesign`, a thread a
@@ -106,8 +90,38 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   that predate the new fields counting toward the per-model verdict table and attributed to
   no finder.
 
+### Changed
+
+- Guided decoding is used where the backend enforces it; where it does not, the JSON schema is
+  inlined into the prompt instead (`PRR_LLM_STRUCTURED=0`).
+- Output schemas carry no value constraints — backends disagree on the JSON Schema dialect and
+  a `minimum` keyword was an HTTP 400 on every call.
+- Base rules stopped suppressing findings: the code axis keeps every defect category in scope,
+  and the recall-first stance moved the filtering downstream to the gates.
+- Exit codes tell the truth: `3` for an incomplete review (a crashed stage, or files the finder
+  never saw with `PRR_STRICT_COVERAGE` on) rather than a green `0`.
+- The pipeline, not the model, owns the criteria list, so the requirement axis's denominator
+  stops moving between runs.
+
 ### Fixed
 
+- **A pull request prloop cannot read is handled at both edges, in opposite directions.**
+  `--since auto` used to swallow a failed thread fetch at `logVerbose` level — which
+  `PRR_QUIET=1`, the setting an unattended cron wants, silences completely — and return the
+  same `undefined` that means "no prior review found". So one transient 5xx quietly turned an
+  incremental review into a full one at full model cost, with nothing saying why. It now fails
+  the run: `undefined` has to keep meaning "the PR was read and carries no resume point", and
+  a cron that cannot read the PR cannot post to it either, so stopping here costs a tick and
+  saves the whole model budget of a run that was going to fail at the end anyway. In the other
+  direction, `publish()` called the same endpoint unguarded **after** every model call had been
+  paid for; a throw there escaped `runReview`, died with exit `1`, and left a run directory
+  holding findings and nothing saying the run had ended — indistinguishable a week later from
+  one that was killed. It now degrades: every finding is reported as unpostable, one precise
+  reason is recorded, the branch-policy status still goes red, the run exits `3`, and
+  `publish.json` and `result.json` land. It deliberately posts **nothing** in that state —
+  every dedupe prloop has reads that thread list, so posting without it would duplicate every
+  comment and open a second summary, which pins `--since auto` to whichever copy ADO returns
+  first, permanently.
 - **prloop's hidden markers are no longer trusted on the markers alone.** `readMarkers` decided
   "this comment is ours" from a substring anywhere in the body and never consulted the author,
   which `ado/threads.ts` had parsed all along. So any PR participant could type prloop's own
