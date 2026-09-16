@@ -105,6 +105,21 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **A merged pull request no longer costs a full review to accomplish nothing.** `pr.status`
+  came back from intake and nothing read it, so the documented cron loop kept paying for the
+  finders, the skeptic and triage on PRs that had completed weeks ago, then watched every
+  `createThread` fail with "the pull request is completed" — exiting `3` on every tick, which
+  also poisoned the signal that is supposed to mean a stage failed. It now stops before the
+  first model call and exits `0`. `completed` only: it is the one rejection this codebase has
+  ever recorded, whereas nothing here has seen an abandoned PR refuse a write and abandonment
+  is reversible, so adding it would be a guess. The tick is not a bare return — it still reads
+  the PR's comments and records the dismissals and fixes it finds, because the window right
+  after a merge is when people work through a bot's comments in bulk and that harvest is the
+  basis of the whole suppression feature. It records itself in a fixed `skipped/` directory
+  rather than a timestamped `iter-` one, so a daily cron cannot evict the last real review
+  inside `PRR_RUNS_KEEP` ticks and orphan every dismissal on that PR. `--dry-run` still
+  reviews a completed PR, which is the escape hatch rather than a new knob: that is exactly
+  how a golden set of historical PRs is built.
 - **A pull request prloop cannot read is handled at both edges, in opposite directions.**
   `--since auto` used to swallow a failed thread fetch at `logVerbose` level — which
   `PRR_QUIET=1`, the setting an unattended cron wants, silences completely — and return the

@@ -128,6 +128,23 @@ async function main() {
   banner("Done");
   log(`Elapsed ${result.durationSec}s, artifacts: ${result.runDir}`);
 
+  // Nothing below applies to a tick that reviewed nothing, and printing "0 inline comments"
+  // over a merged PR reads as a clean review rather than an absent one.
+  if (result.skippedReason) {
+    log(`No review: ${result.skippedReason}. Re-run with --dry-run to review it anyway.`);
+    openRunDir(result.runDir).saveJson(
+      "result.json",
+      buildResultSummary({
+        exitCode: 0,
+        incomplete: [],
+        counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+        tokens: tokenTotals(),
+        durationSec: result.durationSec,
+      }),
+    );
+    process.exit(0);
+  }
+
   const unmet = result.req ? unmetCriteria(result.req) : [];
   if (result.req?.skipped) log(`Requirement axis: ${result.req.skipped}`);
   else if (result.req?.error) log(`Requirement axis: failed (${result.req.error})`);

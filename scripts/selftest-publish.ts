@@ -507,6 +507,97 @@ try {
     resetIdentityCache();
   }
 
+  section("a merged PR: harvest what humans did, spend nothing on a review nobody can see");
+  {
+    // The README's cron loop kept paying for the finders, the skeptic and triage on PRs that
+    // had merged weeks ago, then watched every createThread fail with "the pull request is
+    // completed" and exit 3 — every tick, for as long as the URL stayed in prs.txt.
+    const { runReview } = await import("../orchestrator");
+    const { terminalPrStatus } = await import("../ado/iterations");
+    const { loadOutcomes } = await import("../libs/outcomes");
+    const { loadDismissals } = await import("../libs/learnings");
+
+    eq("a completed PR is terminal", terminalPrStatus("completed"), "the pull request is completed");
+    eq("...case-insensitively, because ADO's casing is not ours to assume", terminalPrStatus("Completed"), "the pull request is completed");
+    eq("an active one is not", terminalPrStatus("active"), undefined);
+    // Never observed refusing a write, reversible from the same page, and the skip offers no
+    // way back except --dry-run. Adding it on the assumption it behaves like `completed`
+    // would be a guess wearing a fact's clothes.
+    eq("...and neither is abandoned, which nothing here has ever seen refuse a write", terminalPrStatus("abandoned"), undefined);
+
+    const BOT = "cccccccc-dddd-eeee-ffff-000000000000";
+    const mergedCtx = { ...ctx, pr: { ...ctx.pr, status: "completed" } } as ReviewContext;
+    // Driven through the intake seam rather than by setting env vars before a dynamic
+    // import: config's consts are read once at module load, and this file imported ../config
+    // pages ago.
+    const intake = async () => mergedCtx;
+    // Counted rather than thrown: a throw would be caught by the finder stage and degrade
+    // into a stage failure, which proves nothing about whether the call was made.
+    let modelCalls = 0;
+    const runner = {
+      chat: async () => {
+        modelCalls++;
+        throw new Error("no endpoint in a selftest");
+      },
+    } as unknown as Parameters<typeof runReview>[0]["runner"];
+
+    setState({
+      selfIdentityId: BOT,
+      threads: [
+        // The post-merge window is exactly when people work through a bot's comments in bulk.
+        {
+          id: 6100,
+          status: "wontFix",
+          comments: [{ id: 91, content: `${BOT_MARKER}<!-- prloop:fp=aaaa9999 --><!-- prloop:cat=performance -->\nx`, author: { id: BOT } }],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 5 }, rightFileEnd: { line: 5 } },
+        },
+        {
+          id: 6101,
+          status: "fixed",
+          comments: [{ id: 92, content: `${BOT_MARKER}<!-- prloop:fp=bbbb9999 --><!-- prloop:cat=correctness -->\ny`, author: { id: BOT } }],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 9 }, rightFileEnd: { line: 9 } },
+        },
+      ],
+    });
+    resetIdentityCache();
+    const { value: skipped, lines: skipLines } = await capture(() =>
+      runReview({ ref, runner, compareTo: 0, intake }),
+    );
+
+    eq("not one model call is made", modelCalls, 0);
+    eq("the run reports why it did nothing", skipped.skippedReason, "the pull request is completed");
+    eq("...as a clean exit, not the exit 3 the failing posts used to produce", exitCodeFor(skipped), 0);
+    eq("nothing is written to the PR", threadPosts().length + commentPatches().length + statusPosts().length, 0);
+    check("...and the log says so", skipLines.some((l) => l.includes("no review will be posted")), skipLines.join(" | "));
+
+    // The reads-only harvest, which is the whole reason it does not return bare: this window
+    // is the richest the two stores ever get, and unlike the writes it is not something ADO
+    // was refusing anyway.
+    eq("a dismissal clicked after the merge is still recorded", loadDismissals(ref, runsDir).some((d) => d.fingerprint === "aaaa9999"), true);
+    eq("...and so is a fix", loadOutcomes(ref, runsDir).some((o) => o.fingerprint === "bbbb9999"), true);
+
+    // One fixed directory per PR, not an iter- one: a daily cron over a merged PR would
+    // otherwise evict the last REAL review inside PRR_RUNS_KEEP ticks and orphan every
+    // dismissal on it.
+    check("the tick records itself outside the pruned run directories", skipped.runDir.endsWith(path.join("pr-4821", "skipped")), skipped.runDir);
+    check("...naming the reason on disk", fs.readFileSync(path.join(skipped.runDir, "skipped.json"), "utf8").includes("completed"), "");
+
+    // --dry-run is the escape hatch rather than a knob: reviewing historical PRs is exactly
+    // what a golden set is built from.
+    process.env["PRR_DRY_RUN"] = "1";
+    try {
+      let reached = false;
+      const probe = { chat: async () => { reached = true; throw new Error("stop here"); } } as unknown as Parameters<typeof runReview>[0]["runner"];
+      await capture(() => runReview({ ref, runner: probe, compareTo: 0, intake })).catch(() => undefined);
+      check("a dry run still reviews a merged PR", reached, "the skip fired even under --dry-run");
+    } finally {
+      delete process.env["PRR_DRY_RUN"];
+    }
+
+    setState({ threads: [] });
+    resetIdentityCache();
+  }
+
   section("a PR that cannot be read: degrade and say so, never crash after paying for the review");
   {
     // Every dedupe prloop has reads the thread list — fingerprints already said, lines

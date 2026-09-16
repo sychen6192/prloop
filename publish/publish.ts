@@ -175,6 +175,25 @@ function postedFingerprints(threads: Thread[]): Set<string> {
   return out;
 }
 
+/**
+ * Reads what humans did to prloop's comments and records it. No writes of any kind.
+ *
+ * Split out of publish() for the one case where reading is all prloop may do: a pull request
+ * that has merged refuses every thread write, so there is no review to post — but the window
+ * right after a merge is when people work through a bot's comments in bulk, and that is the
+ * richest the dismissal and outcome stores ever get. Returning early without this would trade
+ * the whole harvest for the model budget it was meant to save.
+ */
+export async function harvestClosedThreads(ref: PrRef): Promise<{ dismissals: number; outcomes: number }> {
+  const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+  const dismissals = collectDismissals(threads, selfId);
+  const outcomes = collectOutcomes(threads, selfId);
+  return {
+    dismissals: LEARN_FROM_DISMISSALS ? recordDismissals(ref, dismissals) : 0,
+    outcomes: recordOutcomes(ref, outcomes),
+  };
+}
+
 export async function publish(
   ref: PrRef,
   axes: { requirement: AnchoredFinding[]; code: AnchoredFinding[] },

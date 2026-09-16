@@ -13,6 +13,27 @@ interface RawPr {
   status?: string;
 }
 
+/**
+ * A pull request ADO will refuse every write to, so there is nothing a review can leave on
+ * it and no reason to buy one.
+ *
+ * `completed` only, and the narrowness is the evidence talking. It is the one rejection this
+ * codebase has ever recorded — `ado/client.ts` quotes "the pull request is completed" as a
+ * message seen in the field — whereas nothing in the tree has ever observed an abandoned PR
+ * refusing a thread, abandonment is reversible from the same page, and the skip offers no way
+ * back except `--dry-run`. Adding `abandoned` here on the assumption that it behaves the same
+ * would be a guess wearing a fact's clothes; add it in its own commit once a rejected POST on
+ * one has been seen, and paste the message into this docstring the way client.ts does.
+ *
+ * Lives beside getPrInfo rather than in the orchestrator because scripts/doctor.ts needs it
+ * too, and doctor deliberately imports no gate, no publisher and no orchestrator: it is what
+ * you run at 3am when something is broken, and a module-load failure anywhere in the pipeline
+ * must not take the diagnostic down with it.
+ */
+export function terminalPrStatus(status: string): string | undefined {
+  return status.toLowerCase() === "completed" ? "the pull request is completed" : undefined;
+}
+
 export async function getPrInfo(ref: PrRef): Promise<PrInfo> {
   const pr = await adoGet<RawPr>(prBase(ref));
   const short = (r?: string) => (r ?? "").replace(/^refs\/heads\//, "");

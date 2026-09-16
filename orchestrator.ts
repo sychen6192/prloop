@@ -15,6 +15,7 @@ import {
   isDryRun,
 } from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
+import { terminalPrStatus } from "./ado/iterations";
 import { fetchRepoConventions } from "./ado/conventions";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
@@ -23,13 +24,13 @@ import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gate
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
 import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
 import { isWorktreeFailure, prepareWorktree, type PreparedWorktree } from "./git/worktree";
-import { createRunDir } from "./libs/artifacts";
+import { createRunDir, createSkipDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
 import { tokenTotals } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
 import type { AnchoredFinding, ModelRunner, PrRef, RequirementResult } from "./libs/types";
-import { publish, type PublishResult } from "./publish/publish";
+import { harvestClosedThreads, publish, type PublishResult } from "./publish/publish";
 import { reviewOutcome } from "./publish/status";
 
 export interface ReviewRunOptions {
@@ -59,6 +60,13 @@ export interface ReviewRunResult {
    * the same exit code, and a CI check goes green on an unverified PR.
    */
   incomplete: string[];
+  /**
+   * Why this run did no review at all, e.g. "the pull request is completed". Named
+   * skippedReason rather than skipped because three neighbours already own that word and
+   * mean different things by it: ReviewContext.skipped is a list of files intake did not
+   * fetch, RequirementResult.skipped is a stage's reason string, StaticResult has both.
+   */
+  skippedReason?: string;
 }
 
 /**
@@ -111,11 +119,82 @@ export function exitCodeFor(result: Pick<ReviewRunResult, "agg" | "req" | "incom
   }).exitCode;
 }
 
+/**
+ * A tick over a pull request nothing can be written to: harvest what humans did, record why
+ * the tick did nothing, spend no model call.
+ *
+ * It does not return bare, and the reads-only pass is the reason. listThreads is a GET and
+ * works fine on a merged PR, and the window right after a merge is exactly when people go
+ * through a bot's comments in bulk — dismissing the ones they disagreed with, marking the
+ * ones they fixed. Returning early without reading them would quietly delete the richest
+ * source the suppression feature has (PROPOSAL §10 makes that store the basis of the whole
+ * thing), and unlike the thread writes it is not something ADO was refusing anyway.
+ */
+async function skipTerminalPr(
+  ref: PrRef,
+  ctx: ReviewContext,
+  reason: string,
+  started: number,
+): Promise<ReviewRunResult> {
+  log(`${reason} — no review will be posted, so none is computed`);
+  const run = createSkipDir(ref);
+  const harvest = await harvestClosedThreads(ref).catch((e): { dismissals: number; outcomes: number } => {
+    // Best effort by design: a tick that could not read a merged PR has still correctly done
+    // nothing, and turning that into a failure would redden a cron over a list of PRs that
+    // are all finished.
+    log(`[WARN] could not read this PR's comments: ${e instanceof Error ? e.message : String(e)}`);
+    return { dismissals: 0, outcomes: 0 };
+  });
+  const durationSec = Math.round((Date.now() - started) / 1000);
+  run.saveJson("skipped.json", { ref, reason, prStatus: ctx.pr.status, iteration: ctx.iteration.id, ...harvest, durationSec });
+  if (harvest.dismissals > 0 || harvest.outcomes > 0) {
+    log(`Recorded ${harvest.dismissals} dismissals and ${harvest.outcomes} findings the author acted on`);
+  }
+  const agg: AggregateResult = {
+    inline: [],
+    belowBar: [],
+    degraded: [],
+    stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
+  };
+  return {
+    ctx,
+    agg,
+    req: { workItems: [], criteria: [], extras: [], skipped: reason },
+    reqFindings: [],
+    runDir: run.dir,
+    durationSec,
+    // Nothing was left unreviewed that a re-run could fix, so this is a clean exit 0 rather
+    // than the exit 3 the failing thread POSTs used to produce on every tick.
+    incomplete: [],
+    skippedReason: reason,
+  };
+}
+
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {
   const started = Date.now();
 
   banner("Step 1/4: fetch PR changes");
   const ctx = await (opts.intake ?? buildReviewContext)(opts.ref, opts.compareTo);
+
+  // A merged pull request refuses every write, so a review of one buys nothing and costs
+  // everything: the README's cron loop kept paying for the finders, the skeptic and triage on
+  // PRs that had merged weeks ago, then watched every createThread fail with "the pull
+  // request is completed" and exit 3 — on every tick, for as long as the URL stayed in
+  // prs.txt. That also poisoned the exit-3 signal, which is supposed to mean a stage failed.
+  //
+  // --dry-run still reviews it, and that is the escape hatch rather than a knob: reviewing
+  // historical PRs is exactly what PROPOSAL §12's golden set is built from, and a dry run
+  // already means "compute everything, write nothing".
+  //
+  // The honest cost note: intake has already fetched the PR, its iterations and two blobs
+  // per changed file by the time we get here. What this saves is the model budget, which is
+  // the part that is measured in money. Skipping before the REST spend would need a status
+  // probe of its own alongside the intake seam, and is a different change.
+  const terminal = terminalPrStatus(ctx.pr.status);
+  if (terminal && !isDryRun()) {
+    return skipTerminalPr(opts.ref, ctx, terminal, started);
+  }
+
   const run = createRunDir(opts.ref, ctx.iteration.id);
   log(`artifacts: ${run.dir}`);
 

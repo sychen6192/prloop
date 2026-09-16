@@ -254,6 +254,15 @@ Then the whole daily job is a loop, with no checkout to manage and nothing to ed
 while read -r url; do prloop "$url" --since auto || true; done < prs.txt
 ```
 
+A merged pull request can stay in `prs.txt`. prloop still fetches it and its diff, then stops
+before the first model call: Azure DevOps refuses every write to a completed PR, so a review
+of one used to be paid for in full and then fail comment by comment, exiting `3` on every tick
+forever. It exits `0` now and says why. It still reads the PR's comments first — the window
+right after a merge is when people work through a bot's comments in bulk, and those
+dismissals and fixes are the richest the learning stores ever get. `--dry-run` reviews a
+completed PR anyway, which is what makes a golden set of historical PRs (see
+`scripts/evaluate.ts`) possible.
+
 Prefer this to `PRR_WORKDIR` for anything unattended. `git checkout <branch>` lands on
 whatever the branch points at **now**, which stops being the iteration under review the
 moment the author pushes again — and a file whose content no longer matches is *skipped, not
@@ -343,7 +352,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_WORKTREE_SETUP_TIMEOUT_MS` | `600000` | deadline for that command |
 | `PRR_TRIAGE_MODEL` | — | unset = high-FP tool findings are dropped |
 | `PRR_CA_CERTS` | — | CA bundle for TLS-intercepting networks (comma-separated) |
-| `PRR_DRY_RUN` | — | `1` = compute, publish nothing |
+| `PRR_DRY_RUN` | — | `1` = compute, publish nothing. Also the only way to review a **completed** PR: a live run over one skips before the first model call, because ADO refuses every write to it |
 | `PRR_ADO_MAX_RETRIES` | `3` | **TOTAL** attempts per ADO request, first try included — `1` = never retry. Opposite sense to `PRR_LLM_RETRIES`; both names are published, so neither was renamed |
 | `PRR_RUNS_KEEP` | `20` | iteration directories kept per PR under `runs/`, oldest deleted first; `0` = keep everything. Never touches `dismissals.jsonl` |
 | `PRR_RUNS_MAX_AGE_DAYS` | `0` | also delete iteration directories older than this; `0` = no age limit |

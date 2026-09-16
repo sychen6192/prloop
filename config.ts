@@ -123,7 +123,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_MAX_INLINE_COMMENTS", kind: "number", section: S_PUBLISH, description: "code-axis inline comment budget" },
   { name: "PRR_MAX_INLINE_REQ_COMMENTS", kind: "number", section: S_PUBLISH, description: "requirement-axis inline comment budget" },
   { name: "PRR_MIN_INLINE_SEVERITY", kind: "string", section: S_PUBLISH, description: "critical | high | medium | low; below = summary only" },
-  { name: "PRR_DRY_RUN", kind: "bool", section: S_PUBLISH, description: "1 = compute everything, post nothing" },
+  { name: "PRR_DRY_RUN", kind: "bool", section: S_PUBLISH, description: "compute everything, post nothing (and review a merged PR)" },
   { name: "PRR_POST_STATUS", kind: "bool", section: S_PUBLISH, description: "1 = also post a PR status" },
   { name: "PRR_STATUS_GENRE", kind: "string", section: S_PUBLISH, description: "genre of that status" },
   { name: "PRR_STATUS_NAME", kind: "string", section: S_PUBLISH, description: "name of that status" },

@@ -239,16 +239,26 @@ function appender<T>(file: string, render: (item: T) => string): (item: T) => vo
   };
 }
 
+function prDir(ref: PrRef): string {
+  return path.join(RUNS_DIR, safe(ref.org), safe(ref.project), safe(ref.repoId), `pr-${ref.prId}`);
+}
+
 export function createRunDir(ref: PrRef, iterationId: number): RunDir {
-  return openRunDir(
-    path.join(
-      RUNS_DIR,
-      safe(ref.org),
-      safe(ref.project),
-      safe(ref.repoId),
-      `pr-${ref.prId}`,
-      `${ITER_PREFIX}${iterationId}-${timestamp()}`,
-    ),
-    true,
-  );
+  return openRunDir(path.join(prDir(ref), `${ITER_PREFIX}${iterationId}-${timestamp()}`), true);
+}
+
+/**
+ * Where a tick that did no review records why.
+ *
+ * One fixed directory per PR, overwritten each time, and both halves of that matter. It is
+ * not an `iter-` directory, so selectForPruning never counts it — otherwise a daily cron over
+ * a PR that has merged would evict the last REAL review inside PRR_RUNS_KEEP ticks, leaving
+ * calibrate.ts nothing to join that repo's dismissals against and turning every one of them
+ * into an orphan. And it is a fixed name rather than a timestamped one, so a year of daily
+ * ticks leaves one small directory instead of three hundred: the only question it has to
+ * answer is "why did this PR produce nothing today", and only the latest answer is the
+ * current one.
+ */
+export function createSkipDir(ref: PrRef): RunDir {
+  return openRunDir(path.join(prDir(ref), "skipped"), true);
 }
