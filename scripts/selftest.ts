@@ -2707,6 +2707,11 @@ section("worktree: the static gate gets the commit under review, not whatever th
     await g("init", "-q", "-b", "main");
     await g("config", "user.email", "selftest@example.invalid");
     await g("config", "user.name", "selftest");
+    // This repository is the fixture, and .gitattributes does not reach it. Without this,
+    // git's Windows default rewrites the checkout to CRLF and the content assertion below
+    // fails on a line ending rather than on the thing it is testing — which commit the
+    // worktree holds.
+    await g("config", "core.autocrlf", "false");
     fs.writeFileSync(path.join(repo, "a.ts"), "export const v = 1;\n");
     await g("add", "-A");
     await g("commit", "-qm", "one");
@@ -3392,15 +3397,19 @@ section("rules: java.md concurrency and @Transactional in rule → bad → good 
   for (const title of ["Concurrency", "Spring `@Transactional`"]) {
     const s = sectionOf(title);
     const rules = (s.match(/^### /gm) ?? []).length;
-    const bad = (s.match(/```java\n\/\/ bad/g) ?? []).length;
-    const good = (s.match(/```java\n\/\/ good/g) ?? []).length;
+    // \r?\n throughout: .gitattributes pins the checkout to LF, and these assertions are
+    // about whether a rule carries a snippet at all — not about which byte ends the fence
+    // line. Depending on the latter is how a Windows runner came to report "0 bad, 0 good"
+    // about a file nobody had touched.
+    const bad = (s.match(/```java\r?\n\/\/ bad/g) ?? []).length;
+    const good = (s.match(/```java\r?\n\/\/ good/g) ?? []).length;
     const why = (s.match(/^Why: /gm) ?? []).length;
     check(
       `${title}: every rule has a bad snippet, a good snippet and a why`,
       rules >= 6 && bad === rules && good === rules && why === rules,
       `${rules} rules, ${bad} bad, ${good} good, ${why} why`,
     );
-    const lengths = [...s.matchAll(/```java\n([\s\S]*?)```/g)].map((m) => m[1]!.trim().split("\n").length);
+    const lengths = [...s.matchAll(/```java\r?\n([\s\S]*?)```/g)].map((m) => m[1]!.trim().split(/\r?\n/).length);
     check(`${title}: snippets stay short (3-6 lines)`, lengths.length > 0 && lengths.every((n) => n >= 3 && n <= 6), lengths.join(","));
   }
   const stream = sectionOf("Stream");
@@ -3853,7 +3862,16 @@ section("child processes get a secret-scrubbed environment (libs/shell.ts)");
   for (const k of ["PATH", "HOME", "JAVA_HOME", "HTTPS_PROXY", "PRR_CA_CERTS", "npm_config_registry"]) check(`${k} is kept`, env[k] !== undefined);
   check("PATH is not mistaken for a PAT", scrubbedEnv({ PATH: "x", PATTERN: "y" }).PATTERN === "y");
   check("name matching is case-insensitive (Windows environments)", !("Github_Token" in scrubbedEnv({ Github_Token: "x" })));
-  check("the default base is process.env", scrubbedEnv().PATH === process.env.PATH);
+  // Probed through a name this test owns, not PATH: Windows environment variables are
+  // case-insensitive and process.env proxies the lookup, but the plain object scrubbedEnv
+  // builds does not — there the key is spelt "Path", so reading .PATH off it was undefined
+  // on every Windows runner while the function was working correctly.
+  process.env["PRLOOP_SCRUB_PROBE"] = "kept";
+  try {
+    check("the default base is process.env", scrubbedEnv()["PRLOOP_SCRUB_PROBE"] === "kept");
+  } finally {
+    delete process.env["PRLOOP_SCRUB_PROBE"];
+  }
 }
 
 section("fingerprint stability: separators pinned byte-for-byte");
