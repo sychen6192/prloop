@@ -10,8 +10,10 @@ import {
   LLM_BASE_URL,
   MIN_CONSENSUS_SOURCES,
   REQUIRE_CORROBORATION,
+  REQ_MODEL,
   SHOW_CONFIG,
   SKEPTIC_MODELS,
+  TRIAGE_MODEL,
   POST_STATUS,
   excludedCategories,
   isDryRun,
@@ -20,7 +22,7 @@ import { parsePrUrl } from "./ado/client";
 import { postStatus } from "./ado/statuses";
 import { unmetCriteria } from "./gates/requirement";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
-import { buildResultSummary, openRunDir } from "./libs/artifacts";
+import { buildResultSummary, createFatalRunDir, currentRunDir, openRunDir } from "./libs/artifacts";
 import { parseArgs } from "./libs/cli";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
@@ -54,6 +56,33 @@ function help(): never {
 function usage(): never {
   console.error(USAGE);
   process.exit(1);
+}
+
+/** Set once the PR URL parses, so every exit path can say which run this was. */
+let fatalRef: PrRef | undefined;
+const startedAt = new Date().toISOString();
+
+/**
+ * Who this run was, for result.json. Shared by all three exit paths — clean, skipped and
+ * fatal — because the file is only useful across runs if it identifies itself: without this
+ * a morning digest over a list of PRs had to parse directory names, or open context.json and
+ * config.json beside it, to learn which pull request a result belonged to.
+ */
+function runIdentity(iteration?: number, compareTo?: number) {
+  if (!fatalRef) return undefined;
+  return {
+    ref: fatalRef,
+    ...(iteration === undefined ? {} : { iteration }),
+    ...(compareTo === undefined ? {} : { compareTo }),
+    dryRun: isDryRun(),
+    startedAt,
+    models: {
+      finders: FINDER_MODELS,
+      skeptics: SKEPTIC_MODELS,
+      ...(REQ_MODEL ? { req: REQ_MODEL } : {}),
+      ...(TRIAGE_MODEL ? { triage: TRIAGE_MODEL } : {}),
+    },
+  };
 }
 
 async function main() {
@@ -136,6 +165,8 @@ async function main() {
       "result.json",
       buildResultSummary({
         exitCode: 0,
+        skippedReason: result.skippedReason,
+        identity: runIdentity(result.ctx.iteration.id, compareTo),
         incomplete: [],
         counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
         tokens: tokenTotals(),
@@ -181,6 +212,7 @@ async function main() {
     "result.json",
     buildResultSummary({
       exitCode,
+      identity: runIdentity(result.ctx.iteration.id, compareTo),
       incomplete: result.incomplete,
       counts: {
         raw: result.agg.stats.raw,
@@ -196,9 +228,6 @@ async function main() {
   process.exit(exitCode);
 }
 
-/** Set once the PR URL parses, so the fatal path below knows which PR to redden. */
-let fatalRef: PrRef | undefined;
-
 main().catch(async (e) => {
   const msg = e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e);
   // A crash leaves the branch-policy status showing whatever the last run posted. Exit 1 is
@@ -211,6 +240,36 @@ main().catch(async (e) => {
       await postStatus(fatalRef, "error", `Review crashed: ${String(e instanceof Error ? e.message : e)}`);
     } catch (inner) {
       log(`[WARN] could not report the crash as a PR status: ${inner instanceof Error ? inner.message : String(inner)}`);
+    }
+  }
+
+  // On a cron over a list of PRs, the ones that FAILED were the only ones leaving no artifact
+  // at all: result.json was written after runReview returned, so a throw inside it left a run
+  // directory holding findings and nothing saying the run had ended, and a throw before intake
+  // left nothing on disk whatsoever — the auth and proxy lines existed only on a terminal
+  // nobody was watching. Written into this run's own directory when it got one, so the
+  // forensics sit beside the prompts that produced them.
+  if (fatalRef) {
+    try {
+      const dir = currentRunDir();
+      // tee on the fallback: attachLogSink replays the backlog, so the [WARN] lines printed
+      // before intake land in run.log rather than being lost with the terminal.
+      const run = dir ? openRunDir(dir) : createFatalRunDir(fatalRef);
+      run.saveJson(
+        "result.json",
+        buildResultSummary({
+          exitCode: 1,
+          fatal: e instanceof Error ? e.message : String(e),
+          identity: runIdentity(),
+          incomplete: [],
+          counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+          tokens: tokenTotals(),
+          durationSec: Math.round((Date.now() - Date.parse(startedAt)) / 1000),
+        }),
+      );
+      log(`artifacts: ${run.dir}`);
+    } catch (inner) {
+      log(`[WARN] could not record the failure: ${inner instanceof Error ? inner.message : String(inner)}`);
     }
   }
   die(msg);

@@ -316,6 +316,15 @@ number, duration, tokens, error), and `result.json` (the outcome: exit code, wha
 incomplete, the counts down the funnel, tokens, duration, version). Start there when a
 result looks wrong.
 
+`result.json` is written on **every** exit path, not just a clean one: a run that crashed
+records what killed it under `fatal`, and one that reviewed nothing (a merged PR) records
+`skippedReason`. All three carry an `identity` block — which pull request, which iteration,
+what it compared against, dry-run or not, and the model fleet — so a digest over a list of
+PRs can read the files without parsing directory names. A crash before intake has no run
+directory yet, so it writes into `<pr>/fatal/` instead, along with a `run.log` replaying the
+lines printed before then. Like `<pr>/skipped/`, that directory has a fixed name and is never
+pruned: a week of auth failures must not evict the PR's last real review.
+
 ## Settings
 
 Full list with explanations in [.env.example](./.env.example). The ones that change behaviour:

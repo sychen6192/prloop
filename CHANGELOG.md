@@ -105,6 +105,19 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **`result.json` is written on every exit path, and says which run it belongs to.** It was
+  written in exactly one place, after `runReview` returned, so a throw inside any stage went
+  to `main().catch` and left a run directory holding findings and nothing saying the run had
+  ended — indistinguishable a week later from one somebody killed — while a throw before
+  intake (auth, proxy, a 401) left nothing on disk at all, its warning lines existing only on
+  a terminal nobody was watching. On a cron over a list of PRs the failures were the only runs
+  with no artifact. A crash now records `fatal` and the exit code; a run that reviewed nothing
+  records `skippedReason`; and all three paths carry an `identity` block (pull request,
+  iteration, compare base, dry-run, start time, model fleet), so cross-run reporting no longer
+  has to parse directory names or open `context.json` and `config.json` beside it. A crash
+  with no run directory yet writes into a fixed `<pr>/fatal/` and replays the log backlog into
+  it. Neither `fatal/` nor `skipped/` is pruned: a week of auth failures must not evict the
+  PR's last real review.
 - **A merged pull request no longer costs a full review to accomplish nothing.** `pr.status`
   came back from intake and nothing read it, so the documented cron loop kept paying for the
   finders, the skeptic and triage on PRs that had completed weeks ago, then watched every

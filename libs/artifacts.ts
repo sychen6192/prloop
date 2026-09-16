@@ -159,6 +159,24 @@ export interface ResultSummaryInput {
   counts: { raw: number; anchored: number; survived: number; inline: number; degraded: number };
   tokens: { calls: number; promptTokens: number; completionTokens: number };
   durationSec: number;
+  /**
+   * Which pull request, which iteration, which settings. Without it the file could only be
+   * identified by the directory path it happens to sit in, so any cross-run reporting — a
+   * morning digest over a list of PRs, calibrate joining runs to a repo — had to parse
+   * directory names or open context.json and config.json beside it.
+   */
+  identity?: {
+    ref: PrRef;
+    iteration?: number;
+    compareTo?: number;
+    dryRun: boolean;
+    startedAt: string;
+    models: { finders: readonly string[]; skeptics: readonly string[]; req?: string; triage?: string };
+  };
+  /** Why the run died, on a path that reached no verdict at all. */
+  fatal?: string;
+  /** Why the run reviewed nothing, e.g. a pull request that has already merged. */
+  skippedReason?: string;
 }
 
 /**
@@ -170,6 +188,9 @@ export interface ResultSummaryInput {
 export function buildResultSummary(input: ResultSummaryInput): Record<string, unknown> {
   return {
     exitCode: input.exitCode,
+    ...(input.fatal === undefined ? {} : { fatal: input.fatal }),
+    ...(input.skippedReason === undefined ? {} : { skippedReason: input.skippedReason }),
+    ...(input.identity === undefined ? {} : { identity: input.identity }),
     incomplete: [...input.incomplete],
     counts: { ...input.counts },
     tokens: { ...input.tokens },
@@ -243,8 +264,33 @@ function prDir(ref: PrRef): string {
   return path.join(RUNS_DIR, safe(ref.org), safe(ref.project), safe(ref.repoId), `pr-${ref.prId}`);
 }
 
+/**
+ * The directory the run in this process is writing into, once it has one.
+ *
+ * Module-level because only loop.ts's fatal handler needs it and it needs it from outside
+ * the call that failed: a crash inside runReview should leave its result.json NEXT TO the
+ * findings and prompts that run produced, not in a directory of its own.
+ */
+let current: string | undefined;
+export const currentRunDir = (): string | undefined => current;
+
 export function createRunDir(ref: PrRef, iterationId: number): RunDir {
-  return openRunDir(path.join(prDir(ref), `${ITER_PREFIX}${iterationId}-${timestamp()}`), true);
+  const dir = openRunDir(path.join(prDir(ref), `${ITER_PREFIX}${iterationId}-${timestamp()}`), true);
+  current = dir.dir;
+  return dir;
+}
+
+/**
+ * Where a run that died before it had a run directory records what killed it.
+ *
+ * One fixed directory per PR, overwritten, for the same two reasons as `skipped/`: a nightly
+ * job failing on a revoked PAT would otherwise leave a timestamped directory every night, and
+ * if those counted toward PRR_RUNS_KEEP they would evict that PR's last real review — a week
+ * of auth failures erasing the review anyone would want to look at. The only question this
+ * answers is "why did the last run die", and only the latest answer is the current one.
+ */
+export function createFatalRunDir(ref: PrRef): RunDir {
+  return openRunDir(path.join(prDir(ref), "fatal"), true);
 }
 
 /**
@@ -260,5 +306,7 @@ export function createRunDir(ref: PrRef, iterationId: number): RunDir {
  * current one.
  */
 export function createSkipDir(ref: PrRef): RunDir {
-  return openRunDir(path.join(prDir(ref), "skipped"), true);
+  const dir = openRunDir(path.join(prDir(ref), "skipped"), true);
+  current = dir.dir;
+  return dir;
 }

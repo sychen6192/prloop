@@ -4046,6 +4046,37 @@ section("run artifacts: a run has to be diagnosable from its own directory alone
   eq("...what it cost", JSON.stringify(summary["tokens"]), '{"calls":4,"promptTokens":100,"completionTokens":200}');
   eq("...how long it took", summary["durationSec"], 42);
   check("...and which prloop produced it", /^\d+\.\d+/.test(String(summary["version"])), String(summary["version"]));
+  // Absent unless the run actually had one to report, so a clean result cannot be read as a
+  // failure with an empty message or a skip with an empty reason.
+  eq("a clean result claims no fatal", "fatal" in summary, false);
+  eq("...and no skip reason", "skippedReason" in summary, false);
+
+  // Identity: without it a result.json could only be identified by the directory path it
+  // happens to sit in, so any cross-run report had to parse directory names or open two
+  // more artifacts beside it.
+  const ref = { baseUrl: "https://dev.azure.com/contoso", org: "contoso", project: "Shop", repoId: "api", prId: 7 };
+  const identified = buildResultSummary({
+    exitCode: 1,
+    fatal: "AdoError: 401 Unauthorized",
+    identity: {
+      ref,
+      iteration: 4,
+      compareTo: 2,
+      dryRun: false,
+      startedAt: "2026-09-16T00:00:00.000Z",
+      models: { finders: ["qwen3-coder", "devstral"], skeptics: ["gpt-oss"], req: "qwen3-coder" },
+    },
+    incomplete: [],
+    counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+    tokens: { calls: 0, promptTokens: 0, completionTokens: 0 },
+    durationSec: 3,
+  });
+  eq("a fatal result says what killed it", identified["fatal"], "AdoError: 401 Unauthorized");
+  const id = identified["identity"] as Record<string, unknown>;
+  eq("...which pull request it was", (id["ref"] as { prId: number }).prId, 7);
+  eq("...which iteration, and what it was comparing against", [id["iteration"], id["compareTo"]], [4, 2]);
+  eq("...and which fleet produced it", JSON.stringify(id["models"]),
+    '{"finders":["qwen3-coder","devstral"],"skeptics":["gpt-oss"],"req":"qwen3-coder"}');
 }
 
 section("config: .env parsing (the two bugs that made a correct line configure the wrong thing)");
@@ -4343,6 +4374,23 @@ section("runs/ retention");
     ["iter-2-20260801-000000", "iter-1-20260101-000000"],
   );
   eq("0 disables the keep count rather than deleting everything", selectForPruning(dirs, { keep: 0, maxAgeDays: 0, now }), []);
+
+  // The two fixed directories a repeated non-review leaves behind. Neither competes with a
+  // real review for the retention budget, and that is the whole reason they are named rather
+  // than timestamped: a daily cron over a PR that has merged, or one failing on a revoked
+  // PAT, would otherwise evict this PR's last actual review inside PRR_RUNS_KEEP ticks and
+  // leave calibrate nothing to join that repo's dismissals against.
+  const withNonRuns = [...dirs, at("skipped", 200), at("fatal", 200)];
+  eq(
+    "a skipped or fatal directory is never pruned, however old",
+    selectForPruning(withNonRuns, { keep: 1, maxAgeDays: 1, now }).filter((n) => !n.startsWith("iter-")),
+    [],
+  );
+  eq(
+    "...and never counts toward the keep budget either",
+    selectForPruning(withNonRuns, { keep: 2, maxAgeDays: 0, now }),
+    selectForPruning(dirs, { keep: 2, maxAgeDays: 0, now }),
+  );
   eq("0 disables the age limit too", selectForPruning(dirs, { keep: 0, maxAgeDays: 0, now: now + 400 * day }), []);
   eq("keeping more than exist deletes nothing", selectForPruning(dirs, { keep: 99, maxAgeDays: 0, now }), []);
 

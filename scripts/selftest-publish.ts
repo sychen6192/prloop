@@ -515,6 +515,7 @@ try {
     const { runReview } = await import("../orchestrator");
     const { terminalPrStatus } = await import("../ado/iterations");
     const { loadOutcomes } = await import("../libs/outcomes");
+    const { currentRunDir } = await import("../libs/artifacts");
     const { loadDismissals } = await import("../libs/learnings");
 
     eq("a completed PR is terminal", terminalPrStatus("completed"), "the pull request is completed");
@@ -580,6 +581,10 @@ try {
     // otherwise evict the last REAL review inside PRR_RUNS_KEEP ticks and orphan every
     // dismissal on it.
     check("the tick records itself outside the pruned run directories", skipped.runDir.endsWith(path.join("pr-4821", "skipped")), skipped.runDir);
+    // The fatal handler in loop.ts writes into the run's OWN directory when it has one, so
+    // the forensics sit beside the prompts that produced them rather than in a directory of
+    // their own. That only works if the directory announces itself when it is created.
+    eq("...and announces itself, so a later crash lands beside it", currentRunDir(), skipped.runDir);
     check("...naming the reason on disk", fs.readFileSync(path.join(skipped.runDir, "skipped.json"), "utf8").includes("completed"), "");
 
     // --dry-run is the escape hatch rather than a knob: reviewing historical PRs is exactly
@@ -720,6 +725,7 @@ try {
     // run cannot tell them apart from the thread. Having already recorded it, it does not
     // have to.
     const { loadOutcomes } = await import("../libs/outcomes");
+    const { currentRunDir } = await import("../libs/artifacts");
     setState({
       selfIdentityId: BOT,
       threads: [
