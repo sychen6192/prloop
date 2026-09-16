@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { RUNS_DIR } from "../config";
 import { loadDismissals } from "../libs/learnings";
+import { loadOutcomes } from "../libs/outcomes";
 
 // ─── The pure half (exported for the selftest) ──────────────────────────────
 
@@ -66,6 +67,11 @@ export interface CalibrationInput {
   outcomes?: CalibrationOutcome[];
   // Fingerprints a human closed as wontFix/byDesign, from the repo's dismissals.jsonl.
   dismissed: Set<string>;
+  // Fingerprints the author acted on, from the repo's outcomes.jsonl, split by how prloop
+  // knows. `fixed` is a human's statement; `autoClosed` is prloop's own inference from the
+  // flagged line having gone away, which is narrow but not a person saying anything — so the
+  // headline rate counts only the first, and the second is reported beside it.
+  actedOn?: { fixed: Set<string>; autoClosed: Set<string> };
 }
 
 export interface Bucket {
@@ -73,6 +79,8 @@ export interface Bucket {
   findings: number;
   published: number;
   dismissed: number;
+  // Findings in this bucket a human marked fixed after prloop commented on them.
+  actedOn: number;
   // Findings in this bucket the skeptic majority refuted. Read against `findings` in the
   // same row: that is the share of this finder's (or this category's) output the verifier
   // threw away, which is the number that says whether a finder is pulling its weight and
@@ -106,6 +114,11 @@ export interface CalibrationReport {
   // Findings the skeptic majority refuted. The tool's own false-positive count, as opposed
   // to publishedDismissed, which is the share that got past it.
   killed: number;
+  // Published findings a human then marked fixed: PROPOSAL §12's implementation rate, and
+  // the only positive evidence the tool collects. Counted apart from autoClosed, which is
+  // prloop's own inference that the flagged line went away rather than a person's decision.
+  actedOn: number;
+  autoClosed: number;
   // Dismissals whose finding is in no run we can still read — usually retention pruned the
   // run. Reported so the totals above are never mistaken for the whole history.
   orphanDismissals: number;
@@ -128,8 +141,8 @@ const CONFIDENCE_FLOORS: Array<[number, string]> = [
 const confidenceBucket = (c: number) =>
   CONFIDENCE_FLOORS.find(([floor]) => c >= floor)?.[1] ?? CONFIDENCE_FLOORS[CONFIDENCE_FLOORS.length - 1]![1];
 
-function tally(): { findings: number; published: number; dismissed: number; killed: number } {
-  return { findings: 0, published: 0, dismissed: 0, killed: 0 };
+function tally(): { findings: number; published: number; dismissed: number; actedOn: number; killed: number } {
+  return { findings: 0, published: 0, dismissed: 0, actedOn: 0, killed: 0 };
 }
 
 function toBuckets(m: Map<string, ReturnType<typeof tally>>, order?: string[]): Bucket[] {
@@ -187,6 +200,8 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     });
   }
   let killedCount = 0;
+  let fixedCount = 0;
+  let autoClosedCount = 0;
 
   const conf = new Map<string, ReturnType<typeof tally>>();
   const cat = new Map<string, ReturnType<typeof tally>>();
@@ -197,12 +212,14 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     f: CalibrationFinding,
     dismissed: boolean,
     killed: boolean,
+    actedOn: boolean,
   ) => {
     const t = m.get(key) ?? tally();
     t.findings++;
     if (f.published) t.published++;
     if (dismissed) t.dismissed++;
     if (killed) t.killed++;
+    if (actedOn) t.actedOn++;
     m.set(key, t);
   };
 
@@ -216,10 +233,13 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     if (dismissed && f.published) publishedDismissed++;
     const killed = killedFps.has(f.fingerprint);
     if (killed) killedCount++;
-    add(conf, confidenceBucket(f.confidence), f, dismissed, killed);
-    add(cat, f.category || "(none)", f, dismissed, killed);
+    const fixed = input.actedOn?.fixed.has(f.fingerprint) ?? false;
+    if (fixed) fixedCount++;
+    if (input.actedOn?.autoClosed.has(f.fingerprint)) autoClosedCount++;
+    add(conf, confidenceBucket(f.confidence), f, dismissed, killed, fixed);
+    add(cat, f.category || "(none)", f, dismissed, killed, fixed);
     // A finding found by two models is credit — and blame — for both.
-    for (const s of f.sources.length > 0 ? f.sources : ["(unknown)"]) add(finder, s, f, dismissed, killed);
+    for (const s of f.sources.length > 0 ? f.sources : ["(unknown)"]) add(finder, s, f, dismissed, killed, fixed);
   }
 
   const skeptics = new Map<string, SkepticStats>();
@@ -248,6 +268,8 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     findings: byFingerprint.size,
     published,
     killed: killedCount,
+    actedOn: fixedCount,
+    autoClosed: autoClosedCount,
     dismissed: dismissedCount,
     publishedDismissed,
     orphanDismissals,
@@ -376,6 +398,7 @@ export function scanRuns(root: string): ScanResult {
   const outcomes: CalibrationOutcome[] = [];
   const unusable: string[] = [];
   const dismissed = new Set<string>();
+  const actedOn = { fixed: new Set<string>(), autoClosed: new Set<string>() };
   const repos: string[] = [];
 
   // runs/<org>/<project>/<repo>/pr-N/iter-M/findings.json is 6 deep; the walk is bounded so
@@ -397,12 +420,16 @@ export function scanRuns(root: string): ScanResult {
     // Read through the store's own loader: it already tolerates corrupt lines and dedupes,
     // and a second parser here would drift from the one that writes it.
     const [org = "", project = "", repoId = ""] = rel.slice(-3);
-    for (const d of loadDismissals({ baseUrl: "", org, project, repoId, prId: 0 }, root)) {
-      dismissed.add(d.fingerprint);
+    const ref = { baseUrl: "", org, project, repoId, prId: 0 };
+    for (const d of loadDismissals(ref, root)) dismissed.add(d.fingerprint);
+    // Its own store, read through its own loader for the same reason: both tolerate corrupt
+    // lines and dedupe first-wins, and a second parser here would drift from the writer.
+    for (const o of loadOutcomes(ref, root)) {
+      (o.outcome === "auto-closed" ? actedOn.autoClosed : actedOn.fixed).add(o.fingerprint);
     }
   }
 
-  return { findings, verdicts, outcomes, dismissed, runs, unusable, repos };
+  return { findings, verdicts, outcomes, dismissed, actedOn, runs, unusable, repos };
 }
 
 // ─── Output ─────────────────────────────────────────────────────────────────
@@ -420,12 +447,13 @@ function table(header: string[], rows: string[][]): string {
 function bucketTable(title: string, buckets: Bucket[]): string {
   if (buckets.length === 0) return `${title}\n  (nothing to report)`;
   return `${title}\n${table(
-    ["", "findings", "killed", "published", "dismissed", "rate"],
+    ["", "findings", "killed", "published", "fixed", "dismissed", "rate"],
     buckets.map((b) => [
       b.key,
       String(b.findings),
       String(b.killed),
       String(b.published),
+      String(b.actedOn),
       String(b.dismissed),
       pct(b.rate),
     ]),
@@ -445,6 +473,12 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
     // difference is who paid for it, the verifier or the reviewer.
     `${plural(report.killed, "finding")} refuted by the skeptic before anyone saw ${report.killed === 1 ? "it" : "them"}` +
       (report.findings > 0 ? ` (${pct(report.killed / report.findings)} of everything found)` : ""),
+    // PROPOSAL §12's north star, and the first positive number the tool has ever had. The
+    // auto-closed count is kept beside it rather than inside it: prloop closing a thread
+    // because the flagged line went away is its own inference, not a person's decision.
+    `${plural(report.actedOn, "commented finding")} a human then marked fixed` +
+      (report.published > 0 ? ` — implementation rate ${pct(report.actedOn / report.published)}` : "") +
+      (report.autoClosed > 0 ? `, plus ${report.autoClosed} prloop auto-closed when the code went away` : ""),
   ];
   if (report.orphanDismissals > 0) {
     out.push(

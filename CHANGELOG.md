@@ -65,6 +65,22 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **An implementation rate: how many commented findings the author actually fixed.** PROPOSAL
+  §12 names it as the online north star and nothing measured it. The only per-finding outcome
+  prloop persisted was negative — `collectDismissals` kept `wontFix`/`byDesign`, a thread a
+  human set to `fixed` was read by nothing at all, and auto-closed threads were a bare count —
+  so precision could only be estimated as one minus the dismissal rate, which scores every
+  comment nobody answered as a success. Outcomes now go to their own
+  `runs/<org>/<project>/<repo>/outcomes.jsonl`, and the separation from `dismissals.jsonl` is
+  load-bearing rather than tidiness: everything in that file is suppressed on every future PR
+  in the repo, and a finding somebody fixed is the last thing to stop reporting. Threads prloop
+  auto-closed are recorded apart from human fixes and reported beside the rate, never inside
+  it: prloop's auto-close sets the same `fixed` status a person does and leaves no comment
+  behind, so folding it in would let the tool grade itself. Two guards keep the kinds apart —
+  outcomes are read from the thread snapshot taken *before* this run closes anything, and the
+  store is first-write-wins on re-read, so a thread prloop closed on Tuesday cannot be re-filed
+  as a human's decision on Wednesday. `scripts/calibrate.ts` gains a `fixed` column in all
+  three tables. Nothing here reaches a prompt.
 - **`scripts/evaluate.ts`: the golden-set evaluation PROPOSAL §12 has asked for since the first
   draft.** Write a `golden.json` beside a PR's run directories listing the defects you know it
   contains, and it scores the newest run against them — offline, read-only, no new dependency.

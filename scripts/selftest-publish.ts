@@ -14,6 +14,9 @@
 //
 // Its own file, and the server starts before the imports: config reads PRR_ADO_BASE_URL and
 // PRR_ADO_PAT once at import time, and the fake's port only exists at run time.
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { fakeAdo, type FakeAdoState, type FakeThread } from "./fakes/ado";
 import type { AnchoredFinding, FileDiff } from "../libs/types";
 import type { ReviewContext } from "../ado/intake";
@@ -56,14 +59,19 @@ async function capture<T>(fn: () => Promise<T>): Promise<{ value: T; lines: stri
   }
 }
 
+let runsDir = "";
 const ado = await fakeAdo();
 try {
   process.env["PRR_ADO_BASE_URL"] = ado.origin;
   process.env["PRR_ADO_PAT"] = "test-pat";
   process.env["PRR_NO_PROXY"] = "127.0.0.1";
   process.env["PRR_POST_STATUS"] = "1";
-  // The dismissal store writes JSONL under runs/; a selftest must not touch the operator's.
-  process.env["PRR_LEARN_FROM_DISMISSALS"] = "0";
+  // Both JSONL stores write under runs/. Pointed at a temp tree rather than switched off, so
+  // what they write can be asserted: a store that is never exercised is a store whose format
+  // nothing pins.
+  runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-publish-runs-"));
+  process.env["PRR_RUNS_DIR"] = runsDir;
+  process.env["PRR_LEARN_FROM_DISMISSALS"] = "1";
   process.env["PRR_QUIET"] = "1";
 
   const { parsePrUrl } = await import("../ado/client");
@@ -496,6 +504,80 @@ try {
     resetIdentityCache();
   }
 
+  section("outcomes: the only positive evidence the tool collects about its own comments");
+  {
+    const BOT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const marked = (id: number, fp: string, cat: string) => ({
+      id,
+      content: `${BOT_MARKER}<!-- prloop:fp=${fp} --><!-- prloop:cat=${cat} -->\nsomething`,
+      author: { id: BOT },
+    });
+    const ctxOf = (file: string, line: number) => ({
+      filePath: file,
+      rightFileStart: { line },
+      rightFileEnd: { line },
+    });
+
+    setState({
+      selfIdentityId: BOT,
+      threads: [
+        // A human marked it fixed: the one statement that a comment was worth posting.
+        { id: 5100, status: "fixed", comments: [marked(81, "f1f1f1f1f1f1", "correctness")], threadContext: ctxOf("/src/app.ts", 11) },
+        // Dismissed, not fixed. The two stores must not learn from each other: everything in
+        // dismissals.jsonl is suppressed on every future PR, and a fixed finding is the last
+        // thing to stop reporting.
+        { id: 5101, status: "wontFix", comments: [marked(82, "d2d2d2d2d2d2", "performance")], threadContext: ctxOf("/src/app.ts", 20) },
+        // "Closed" is the ADO UI's catch-all and routinely means "I have read this".
+        { id: 5102, status: "closed", comments: [marked(83, "c3c3c3c3c3c3", "security")], threadContext: ctxOf("/src/app.ts", 30) },
+        // Still open, on a line past the end of the file: this run auto-closes it. It is
+        // `active` in the snapshot publish reads, so it cannot be booked as a human's fix.
+        { id: 5103, status: "active", comments: [marked(84, "a4a4a4a4a4a4", "reliability")], threadContext: ctxOf("/src/app.ts", 999) },
+      ],
+    });
+    resetIdentityCache();
+    const { value: r } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+
+    const byFp = new Map(r.outcomes.map((o) => [o.fingerprint, o.outcome]));
+    eq("a human's `fixed` is recorded as the author acting on it", byFp.get("f1f1f1f1f1f1"), "fixed");
+    eq("...and prloop's own auto-close is recorded apart from it", byFp.get("a4a4a4a4a4a4"), "auto-closed");
+    eq("a dismissal is not an outcome", byFp.has("d2d2d2d2d2d2"), false);
+    eq("...and neither is `closed`, which means 'I read this'", byFp.has("c3c3c3c3c3c3"), false);
+    eq("exactly those two, nothing else", r.outcomes.length, 2);
+    eq("the dismissal still goes to its own store", r.dismissals.map((d) => d.fingerprint), ["d2d2d2d2d2d2"]);
+
+    // The separation is the load-bearing part: loadDismissals suppresses every fingerprint
+    // in its file on every future PR of the repo.
+    const repo = path.join(runsDir, "contoso", "Shop", "shop-api");
+    const outcomes = fs.readFileSync(path.join(repo, "outcomes.jsonl"), "utf8");
+    const dismissals = fs.readFileSync(path.join(repo, "dismissals.jsonl"), "utf8");
+    check("outcomes land in outcomes.jsonl", outcomes.includes("f1f1f1f1f1f1"), outcomes);
+    check("...and never in dismissals.jsonl", !dismissals.includes("f1f1f1f1f1f1"), dismissals);
+    check("...which still holds the dismissal", dismissals.includes("d2d2d2d2d2d2"), dismissals);
+
+    // First-wins on re-read is what keeps the two kinds apart over time: prloop's auto-close
+    // sets the same `fixed` status a person does and leaves no comment behind, so the NEXT
+    // run cannot tell them apart from the thread. Having already recorded it, it does not
+    // have to.
+    const { loadOutcomes } = await import("../libs/outcomes");
+    setState({
+      selfIdentityId: BOT,
+      threads: [
+        { id: 5103, status: "fixed", comments: [marked(84, "a4a4a4a4a4a4", "reliability")], threadContext: ctxOf("/src/app.ts", 999) },
+      ],
+    });
+    resetIdentityCache();
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const stored = new Map(loadOutcomes(ref, runsDir).map((o) => [o.fingerprint, o.outcome]));
+    eq(
+      "a thread prloop auto-closed is not re-filed as a human fix on the next run",
+      stored.get("a4a4a4a4a4a4"),
+      "auto-closed",
+    );
+
+    setState({ threads: [] });
+    resetIdentityCache();
+  }
+
   section("PR status: the merge gate must not go green on a review that did not run");
   {
     // The failure: the status was decided from unmet criteria and high-risk findings alone,
@@ -728,6 +810,7 @@ try {
   }
 } finally {
   await ado.close();
+  if (runsDir) fs.rmSync(runsDir, { recursive: true, force: true });
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

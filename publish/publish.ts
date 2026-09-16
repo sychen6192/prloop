@@ -10,11 +10,12 @@ import { postStatus, type StatusState } from "../ado/statuses";
 import { reviewOutcome } from "./status";
 import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
+import { recordOutcomes } from "../libs/outcomes";
 import { log } from "../libs/log";
-import { collectDismissals, findStaleThreads, resolveStaleThreads, watermarkFor } from "./lifecycle";
+import { collectDismissals, collectOutcomes, findStaleThreads, resolveStaleThreads, watermarkFor } from "./lifecycle";
 import { iterationMarker, readMarkers } from "./markers";
 import type { AnchoredFinding, PrRef } from "../libs/types";
-import type { DismissalRecord, WatermarkDecision } from "./lifecycle";
+import type { DismissalRecord, OutcomeRecord, StaleThread, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
 
 export interface PublishResult {
@@ -28,6 +29,9 @@ export interface PublishResult {
   resolved: number;
   // Findings a human closed as wontFix/byDesign — raw material for future exclusion rules.
   dismissals: DismissalRecord[];
+  // Findings the author acted on: fixed by a human, or auto-closed because the code went
+  // away. Measurement only — nothing here ever suppresses a finding.
+  outcomes: OutcomeRecord[];
   /**
    * What this run left on the PR as the `--since auto` resume point. Absent on a dry run,
    * which takes no decision at all — "held: false" there would read as "advanced it", and
@@ -189,7 +193,7 @@ export async function publish(
     incomplete: readonly string[];
   } = { unreviewed: [], incomplete: [] },
 ): Promise<PublishResult> {
-  const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [], gaps: [] };
+  const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [], outcomes: [], gaps: [] };
 
   // Requirement findings go first so that if anything below fails, the message that
   // survived is the one about the PR not doing what was asked.
@@ -217,8 +221,32 @@ export async function publish(
 
   // Close our own threads whose code has since changed, before adding new ones — otherwise
   // a PR accumulates stale comments the author already addressed.
-  result.resolved = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex));
+  const closed = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex));
+  result.resolved = closed.length;
   result.dismissals = collectDismissals(threads, selfId);
+
+  // The positive half of the record, and the only evidence prloop has ever collected that a
+  // comment was worth posting: PROPOSAL §12 names implementation rate as the online north
+  // star, and precision estimated as one minus the dismissal rate counts every comment
+  // nobody answered as a success. Read from the pre-close snapshot, so the threads this run
+  // has just auto-closed are still `active` in it and cannot be booked as a human's fix.
+  // Its own store, never dismissals.jsonl: everything in that file gets suppressed on every
+  // future PR, and a finding somebody fixed is the last thing to stop reporting.
+  result.outcomes = [
+    ...collectOutcomes(threads, selfId),
+    ...closed
+      .filter((c): c is StaleThread & { fingerprint: string } => c.fingerprint !== undefined)
+      .map((c) => ({
+        fingerprint: c.fingerprint,
+        file: c.file,
+        ...(c.category ? { category: c.category } : {}),
+        outcome: "auto-closed" as const,
+      })),
+  ];
+  if (result.outcomes.length > 0) {
+    const newly = recordOutcomes(ref, result.outcomes);
+    if (newly > 0) log(`Recorded ${newly} findings the author acted on (scripts/calibrate.ts reports the rate)`);
+  }
   if (result.dismissals.length > 0 && LEARN_FROM_DISMISSALS) {
     // Persist into the per-repo learnings store: the next run (on this PR or any other)
     // suppresses findings matching these fingerprints instead of re-litigating them.

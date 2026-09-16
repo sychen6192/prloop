@@ -479,6 +479,17 @@ read-only and offline, counts each finding once no matter how often the PR was r
 and skips (counting) any artifact it cannot read, so an old or half-written `runs/` tree
 still yields a report. Pass a directory to point it somewhere other than `PRR_RUNS_DIR`.
 
+Each of those three tables also carries a **`fixed`** column and the headline an
+**implementation rate**: of the findings that reached a comment, how many a human then marked
+fixed. That is PROPOSAL §12's north star, and until now the only per-finding outcome prloop
+kept was negative — so precision could only be estimated as one minus the dismissal rate,
+which scores every comment nobody answered as a success. Threads prloop auto-closed because
+the flagged line went away are counted beside the rate, never inside it: that is prloop's own
+inference, not a person's decision, and folding it in would let the tool grade itself. The
+record lives in `runs/<org>/<project>/<repo>/outcomes.jsonl`, deliberately not in
+`dismissals.jsonl` — everything in that file is suppressed on every future PR in the repo, and
+a finding somebody fixed is the last thing to stop reporting.
+
 Each of those three tables also carries a **`killed`** column: how many of that bucket's
 findings the skeptic majority refuted. A refuted finding reaches no comment and appears in no
 `findings.json`, so it is read out of `skeptic.json` and joined back in — without it a finder

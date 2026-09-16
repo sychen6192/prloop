@@ -1887,6 +1887,29 @@ section("calibration: joining what we published to what humans rejected");
   const kFinder = new Map(killedReport.byFinder.map((b) => [b.key, b]));
   eq("the finder whose output was refuted is named", [kFinder.get("m2")?.findings, kFinder.get("m2")?.killed], [1, 1]);
   eq("...and the one whose output survived is not blamed", kFinder.get("m1")?.killed, 0);
+
+  // PROPOSAL §12's north star. Precision estimated as one minus the dismissal rate counts
+  // every comment nobody answered as a success, which on a review bot is most of them.
+  const acted = calibrate({
+    findings: [
+      f("fixed1", "correctness", 0.9, ["m1"], true),
+      f("fixed2", "security", 0.8, ["m1"], true),
+      f("auto1", "reliability", 0.8, ["m2"], true),
+      f("ignored", "performance", 0.6, ["m2"], true),
+    ],
+    verdicts: [],
+    actedOn: { fixed: new Set(["fixed1", "fixed2"]), autoClosed: new Set(["auto1"]) },
+    dismissed: new Set(),
+  });
+  eq("a human's fix is the implementation rate's numerator", acted.actedOn, 2);
+  // prloop's auto-close sets the same status a person does, so folding it in would let the
+  // tool's own inference inflate its own score.
+  eq("...and prloop's own auto-close is counted beside it, never inside it", acted.autoClosed, 1);
+  const aCat = new Map(acted.byCategory.map((b) => [b.key, b]));
+  eq("the fix lands in the finding's own category", aCat.get("security")?.actedOn, 1);
+  eq("...and a comment nobody answered counts as nothing", aCat.get("performance")?.actedOn, 0);
+  const aFinder = new Map(acted.byFinder.map((b) => [b.key, b]));
+  eq("per finder, how much of its output was acted on", [aFinder.get("m1")?.actedOn, aFinder.get("m2")?.actedOn], [2, 0]);
 }
 
 section("golden-set evaluation: which stage lost the defect, not just that one was lost");

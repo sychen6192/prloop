@@ -17,7 +17,10 @@ diff inside them, each model's raw output, the skeptic verdicts, and `config.jso
 settings the run used and where each value came from. **These files contain the reviewed
 code.** `runs/` is gitignored, never uploaded anywhere by prloop, and pruned by
 `PRR_RUNS_KEEP` / `PRR_RUNS_MAX_AGE_DAYS`; treat the directory with the same care as a
-checkout of the repositories you review.
+checkout of the repositories you review. Two JSONL files sit above the pruned run
+directories and outlive them: `dismissals.jsonl`, the findings a reviewer rejected, and
+`outcomes.jsonl`, the ones they fixed. Both hold a fingerprint, a file path and a category —
+no source, no quote — and neither is ever read into a model prompt.
 
 ## What is defended
 

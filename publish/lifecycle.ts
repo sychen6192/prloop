@@ -147,6 +147,9 @@ export interface StaleThread {
   file: string;
   line: number;
   reason: string;
+  /** From the comment's marker, so closing it can be recorded as an outcome. */
+  fingerprint?: string;
+  category?: string;
 }
 
 /**
@@ -185,25 +188,84 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
     // outside the file, or the line is no longer one this PR touches while the file itself
     // was rewritten, the original code is gone.
     if (line > fd.rightLines.length) {
-      stale.push({ threadId: t.id, file: ctx.filePath, line, reason: "line is past the end of the file" });
+      const m = readMarkers(first.content);
+      stale.push({
+        threadId: t.id,
+        file: ctx.filePath,
+        line,
+        reason: "line is past the end of the file",
+        // Carried so the close can be recorded as an outcome. Absent on threads a version
+        // before the marker protocol wrote; those still close, they are just not counted.
+        ...(m.fingerprint ? { fingerprint: m.fingerprint } : {}),
+        ...(m.category ? { category: m.category } : {}),
+      });
     }
   }
   return stale;
 }
 
-export async function resolveStaleThreads(ref: PrRef, stale: StaleThread[]): Promise<number> {
-  let resolved = 0;
+/**
+ * Closes them, and returns the ones ADO accepted.
+ *
+ * The ones it accepted, not the ones we asked about: a close that failed left the thread
+ * open, and recording it as an outcome would book a comment as acted on because we tried to
+ * say so. The caller writes these into the outcome store, where they are kept apart from
+ * human fixes — prloop's auto-close sets the same `fixed` status a person does and leaves no
+ * comment behind, so the next run cannot tell them apart from the thread alone.
+ */
+export async function resolveStaleThreads(ref: PrRef, stale: StaleThread[]): Promise<StaleThread[]> {
+  const closed: StaleThread[] = [];
   for (const s of stale) {
     try {
       await setThreadStatus(ref, s.threadId, "fixed");
-      resolved++;
+      closed.push(s);
       logVerbose(`  Closed thread ${s.threadId} (${s.file}:${s.line}): ${s.reason}`);
     } catch (e) {
       logVerbose(`  Could not close thread ${s.threadId}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  if (resolved > 0) log(`Auto-closed ${resolved} comments whose code has changed`);
-  return resolved;
+  if (closed.length > 0) log(`Auto-closed ${closed.length} comments whose code has changed`);
+  return closed;
+}
+
+export interface OutcomeRecord {
+  fingerprint: string;
+  file: string;
+  category?: string;
+  outcome: "fixed" | "auto-closed";
+}
+
+/**
+ * Findings a human marked as fixed — the positive half of collectDismissals, and the only
+ * evidence prloop has ever been able to collect that a comment was worth posting.
+ *
+ * `fixed` only. "Closed" is the ADO UI's catch-all and routinely means "I have read this",
+ * and byDesign/wontFix are the dismissal store's business. Same authorship requirement as
+ * the dismissals: a record here is a claim about prloop's own comment, and reading it off a
+ * comment anyone could type would make the tool's success rate something a PR author could
+ * write for it.
+ *
+ * Read from the thread snapshot publish() takes BEFORE it closes anything, so a thread this
+ * run is about to auto-close is still `active` here and cannot be counted as a human's.
+ */
+export function collectOutcomes(threads: Thread[], selfId?: string): OutcomeRecord[] {
+  const out: OutcomeRecord[] = [];
+  for (const t of threads) {
+    if (t.status !== "fixed") continue;
+    const c = t.comments?.find(
+      (x) => !x.isDeleted && readMarkers(x.content).ours && isSelfIdentity(x.author?.id, selfId),
+    );
+    if (!c) continue;
+    const m = readMarkers(c.content);
+    if (!m.fingerprint) continue; // the summary carries none
+    out.push({
+      fingerprint: m.fingerprint,
+      file: t.threadContext?.filePath ?? "",
+      ...(m.category ? { category: m.category } : {}),
+      outcome: "fixed",
+    });
+  }
+  return out;
 }
 
 export interface DismissalRecord {
