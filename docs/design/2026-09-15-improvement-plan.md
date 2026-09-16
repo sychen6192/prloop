@@ -1,7 +1,13 @@
 # Improvement plan
 
 Date: 2026-09-15
-Status: **proposed** — nothing here is implemented.
+Status: **implemented** — every item in waves 0 to 3 shipped; see the CHANGELOG for what each
+one actually turned into. The text below is kept as written, including the scopes that were
+amended during implementation and the two items whose design changed materially once the code
+was in front of us (N's `fatal/` directory is fixed rather than timestamped, because a
+directory repeated failure writes to must not compete for the retention budget; C split
+identity checking by consequence, because `ado/auth.ts` allows three legitimate credential
+identities on one pull request). A plan rewritten to match what was built records nothing.
 
 Method: four independent read-only sweeps of the tree (operational robustness, review quality,
 operator experience, security), then one concrete design per candidate, then two adversarial
@@ -416,3 +422,12 @@ test, D's scaffolding, E's early return. That hit rate is the reason §3 marks C
 §5 marks its own scopes as unverified rather than presenting them at the same confidence.
 
 Before implementing anything in waves 1 to 3, put its design through the same refutation pass.
+
+**What happened instead.** Waves 1 to 3 were implemented without that pass, on the user's
+instruction to do all of them in one go. What stood in for it, per item: the premise was
+re-verified against the code before anything was written, the tests were written to fail on the
+bug being fixed, and every one of them was then confirmed to go red with the fix reinstated
+before the item was committed. That catches a wrong implementation. It does not catch a wrong
+design, which is what the refutation pass was for — so the scopes in §4 to §6 stand as the
+ones nobody attacked, and the two that changed materially (N, C) changed because the code
+argued with them, not because a reviewer did.
