@@ -10,7 +10,7 @@ import { parsePrUrl, prBase } from "../ado/client";
 import { buildHunks, diffLines, renderUnifiedDiff } from "../libs/diff";
 import { arrayField, escapeControlCharsInStrings, parseJsonObject, salvageArrayItems } from "../libs/json";
 import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
-import { buildDiffPayload } from "../libs/payload";
+import { buildDiffPayload, buildDiffPayloads } from "../libs/payload";
 import { htmlToText } from "../libs/html";
 import { globToRegExp, loadRules, renderConventions, renderRules, ruleHeadings, selectRules } from "../libs/rules";
 import { finalize, findingsAgree, fingerprint, mergeToolFindings } from "../gates/aggregate";
@@ -74,7 +74,8 @@ import { buildInvocation, runFailure, traceEvent, type Acc } from "../models/ope
 import { anchorAndDedupe } from "../gates/aggregate";
 import type { FinderOutput } from "../gates/finder";
 import { BASE_SMELLS, checkFinding, citeIsKnown, knownCitesFor, normalizeCite, runFinders, validateFinding } from "../gates/finder";
-import { FINDER_SYSTEM, buildFinderPrompt, finderSystemFor, renderRecap } from "../prompts/finder";
+import { FINDER_SYSTEM, buildFinderPrompt, buildFinderPrompts, finderSystemFor, renderRecap } from "../prompts/finder";
+import { mergeChunkOutputs } from "../gates/finder";
 import { mulberry32, seedFor, shuffle } from "../libs/prng";
 import { coverageGaps } from "../orchestrator";
 import {
@@ -132,7 +133,7 @@ import { isFileMissing } from "../ado/conventions";
 // Phase 3H: anchoring coverage and payload budgeting.
 import { MIN_DIFF_TOKENS, diffTokenBudget, estimateTokens } from "../libs/payload";
 import { isTestPath } from "../libs/lang";
-import { parseContextTokensByModel } from "../config";
+import { MAX_DIFF_CHARS, parseContextTokensByModel } from "../config";
 
 let passed = 0;
 let failed = 0;
@@ -5185,6 +5186,138 @@ section("payload budget: tokens, not just characters");
   check("an array is fatal", throwsWith(() => parseContextTokensByModel("[131072]")));
   check("a non-numeric window is fatal", throwsWith(() => parseContextTokensByModel('{"m":"128k"}')));
   check("a negative window is fatal", throwsWith(() => parseContextTokensByModel('{"m":-1}')));
+}
+
+
+section("over-budget diffs: read the rest instead of reporting it unread");
+{
+  // A diff that does not fit is not a smaller diff. Everything past the budget was dropped
+  // from every finder's context and reported as a coverage gap, so on a large PR the tool
+  // exited 3 and told you the part most likely to hold the defect had not been read.
+  const lines = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `  ${tag}${i}(compute(${i}));`);
+  const all = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
+  const four = ["a", "b", "c", "d"].map((n, i) => mkFile(`/src/${n}.ts`, lines(40 - i * 5, n), all(40 - i * 5)));
+  const oneFits = buildDiffPayload([four[0]!], 1_000_000).text.length;
+
+  // The promise the default knob value makes: one chunk is the old function, byte for byte.
+  const legacy = buildDiffPayload(four, oneFits + 50);
+  const asChunks = buildDiffPayloads(four, oneFits + 50, undefined, undefined, 1);
+  eq("one chunk is exactly what the single-payload builder returns", asChunks.length, 1);
+  eq("...with the same text", asChunks[0]!.text, legacy.text);
+  eq("...the same selection", asChunks[0]!.includedFiles, legacy.includedFiles);
+  eq("...and the same omissions", asChunks[0]!.omittedFiles, legacy.omittedFiles);
+
+  const two = buildDiffPayloads(four, oneFits + 50, undefined, undefined, 2);
+  const many = buildDiffPayloads(four, oneFits + 50, undefined, undefined, 10);
+  eq("a second request picks up where the first stopped", two.length, 2);
+  eq("...reading the file the budget had dropped", two[1]!.includedFiles, [legacy.omittedFiles[0]]);
+  check("enough requests read the whole diff", many.map((c) => c.includedFiles).flat().length === four.length, JSON.stringify(many.map((c) => c.includedFiles)));
+  eq("...and then nothing is omitted", many[0]!.omittedFiles, []);
+
+  // Chunks partition: a file read twice is a finding reported twice, and a file read by
+  // nobody is the gap this whole thing exists to close.
+  const seen = many.flatMap((c) => c.includedFiles);
+  eq("no file lands in two chunks", seen.length, new Set(seen).size);
+  eq("...and every changed file lands in one", [...seen].sort(), four.map((f) => f.path).sort());
+
+  // "Omitted" must keep meaning "nobody read it" and must never come to mean "the next
+  // request has it" — the coverage gate (PRR_STRICT_COVERAGE) is decided off this list.
+  eq("every chunk reports the same omissions", two.map((c) => c.omittedFiles.join()), [two[0]!.omittedFiles.join(), two[0]!.omittedFiles.join()]);
+  eq("...which are the files no chunk carried", two[0]!.omittedFiles, four.slice(2).map((f) => f.path));
+  check("...and the model is told about them", two[1]!.text.includes("omitted for size"), two[1]!.text.slice(-200));
+
+  // The seed contract, extended. It permutes order WITHIN a chunk and must never decide
+  // which chunk a file is in: two finders that agreed have to have agreed about the same
+  // file, and a chunk boundary that moved per finder would make that unknowable.
+  const seeds = [1, 2, 3, 4].map((sd) => buildDiffPayloads(four, oneFits + 50, sd, undefined, 3));
+  check(
+    "the split never depends on the seed",
+    seeds.every((c) => c.map((x) => [...x.includedFiles].sort().join()).join("|") === seeds[0]!.map((x) => [...x.includedFiles].sort().join()).join("|")),
+    JSON.stringify(seeds.map((c) => c.map((x) => x.includedFiles))),
+  );
+
+  // The prompt has to say which part it is holding. Without it the finder reads a partial
+  // diff as the whole PR: the system prompt asks it to examine every hunk before returning
+  // an empty array, and rule 5 tells it to report only issues about this change.
+  const pr = { title: "t", description: "", sourceBranch: "f", targetBranch: "m", createdBy: "A", status: "active" };
+  const promptInput = { pr, files: four, iterationId: 1, compareTo: 0 };
+  const single = buildFinderPrompts(promptInput, 1);
+  eq("one request says nothing about parts", single.chunks[0]!.includes("part 1"), false);
+  eq("...and is what the single-prompt builder returns", single.chunks[0], buildFinderPrompt(promptInput).text);
+
+  // Big enough to actually cross PRR_MAX_DIFF_CHARS, since the prompt builder budgets
+  // against config rather than an argument — the split has to be provoked the way a real PR
+  // provokes it. Built as a literal rather than through mkFile: diffing 40k generated lines
+  // is minutes of work for a net CLAUDE.md says runs before every commit.
+  const huge = (name: string, chars: number): FileDiff => {
+    const n = Math.ceil(chars / 22);
+    const rightLines = Array.from({ length: n }, (_, i) => `  ${name}${i}(compute(${i}));`);
+    return {
+      path: `/src/${name}.ts`,
+      changeType: "edit",
+      hunks: [{ rightStart: 1, rightCount: n, leftStart: 1, leftCount: 0, body: rightLines.map((l) => `+${l}`).join("\n") }],
+      rightLines,
+      leftLines: [],
+      changedRightLines: new Set(Array.from({ length: n }, (_, i) => i + 1)),
+      changedLeftLines: new Set(),
+      binary: false,
+      truncated: false,
+      language: "typescript",
+    };
+  };
+  const overBudget = ["p", "q", "r"].map((n) => huge(n, MAX_DIFF_CHARS));
+  const oneShot = buildFinderPrompts({ pr, files: overBudget, iterationId: 1, compareTo: 0 }, 1);
+  eq("an over-budget diff reads one file and calls the rest a coverage gap", oneShot.omitted.length, 2);
+  const split = buildFinderPrompts({ pr, files: overBudget, iterationId: 1, compareTo: 0 }, 3);
+  eq("...until it is allowed a request per part", split.chunks.length, 3);
+  eq("...and then nothing is a gap", split.omitted, []);
+  check("a split request says which part it is", split.chunks[1]!.includes("you are reviewing part 2"), split.chunks[1]!.slice(0, 600));
+  check("...and that the other parts hold different files", split.chunks[1]!.includes("do not report anything about a file you cannot see here"));
+  check("...before the diff, not after it", split.chunks[1]!.indexOf("reviewing part 2") < split.chunks[1]!.indexOf("## The change"));
+  check("...and each part actually carries a different file", split.chunks[0]!.includes("/src/p.ts") && !split.chunks[0]!.includes("### /src/q.ts"), "");
+}
+
+section("chunked finder output: three requests are still one opinion");
+{
+  // Every count downstream reads an output as a MODEL — `sources` is [out.model], the
+  // consensus warning counts distinct models, and the orchestrator compares its failure
+  // count against outputs.length. Three chunks reported as three outputs would have claimed
+  // three finders where one was configured.
+  const part = (over: Partial<import("../gates/finder").FinderOutput> = {}) => ({
+    model: "qwen3-coder",
+    findings: [],
+    rejected: 0,
+    raw: "{}",
+    seed: 7,
+    prompt: "p",
+    ...over,
+  });
+  const raw = (claim: string) => ({
+    category: "correctness" as const,
+    severity: "high" as const,
+    confidence: 0.8,
+    file: "/src/a.ts",
+    quote: "x",
+    side: "right" as const,
+    claim,
+  });
+
+  eq("one part is passed through untouched", mergeChunkOutputs([part()]), part());
+  const merged = mergeChunkOutputs([
+    part({ findings: [raw("one")], rejected: 1 }),
+    part({ findings: [raw("two")], rejected: 2 }),
+  ]);
+  eq("findings from every part are kept", merged.findings.map((f) => f.claim), ["one", "two"]);
+  eq("...as one model", merged.model, "qwen3-coder");
+  eq("...with the drops summed", merged.rejected, 3);
+  eq("...and the request count recorded", merged.chunks, 2);
+  check("the saved prompt keeps its parts in order and labelled", (merged.prompt ?? "").includes("part 1/2") && (merged.prompt ?? "").includes("part 2/2"), merged.prompt);
+
+  // A chunk that failed is a part of the diff nobody read, so the whole opinion is an error
+  // — that is what holds the --since auto resume point over the push it did not cover.
+  const partial = mergeChunkOutputs([part(), part({ error: "read ECONNRESET" }), part()]);
+  check("a failed part makes the finder an error", (partial.error ?? "").includes("part 2/3: read ECONNRESET"), partial.error);
+  eq("...and a run where every part answered is not", mergeChunkOutputs([part(), part()]).error, undefined);
 }
 
 section("redaction: credentials hidden inside a URL");

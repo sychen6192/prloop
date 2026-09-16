@@ -15,8 +15,8 @@
 //    than its middle. So the category list, the severity chain and the headings of the
 //    loaded rules are restated compactly after the diff, right where the model starts
 //    writing — and the rule headings double as the citations the validator accepts.
-import { FINDER_CATEGORIES, FINDER_PROMPT_SUFFIX_BY_MODEL } from "../config";
-import { buildDiffPayload } from "../libs/payload";
+import { FINDER_CATEGORIES, FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL } from "../config";
+import { buildDiffPayloads } from "../libs/payload";
 import type { FileDiff, PrInfo } from "../libs/types";
 import { renderPrDescription, renderRepositoryConventions } from "./untrusted";
 
@@ -182,6 +182,32 @@ export interface FinderPrompt {
   bound?: "chars" | "tokens";
 }
 
+/** Every request one finder makes for this PR: one per diff chunk, in order. */
+export interface FinderPromptSet {
+  /** Always at least one. More only when the diff outgrew a single request. */
+  chunks: string[];
+  /** Files no chunk carried — the coverage gap, meaning exactly what it always did. */
+  omitted: string[];
+  bound?: "chars" | "tokens";
+}
+
+/**
+ * Told to the model when its request holds only part of the change.
+ *
+ * Without it a finder reads a partial diff as the whole PR: the system prompt asks it to
+ * examine every hunk before returning an empty array, and rule 5 tells it to report only
+ * issues about this change. A model that cannot see the caller of the function in front of
+ * it will otherwise either invent the context or flag its absence, and neither is a finding.
+ */
+function chunkScope(index: number, total: number): string {
+  return (
+    `\n\nThis change was too large for one request, so its files were split across ${total} ` +
+    `requests and you are reviewing part ${index + 1}. The other parts hold DIFFERENT files ` +
+    `and are reviewed separately by the same process — review what is below on its own terms, ` +
+    `and do not report anything about a file you cannot see here.`
+  );
+}
+
 /** The compact restatement that follows the diff. Exported for the selftest. */
 export function renderRecap(ruleHeadings: RuleHeadingGroup[] | undefined): string {
   const loaded = (ruleHeadings ?? []).filter((g) => g.headings.length > 0);
@@ -204,7 +230,17 @@ export function renderRecap(ruleHeadings: RuleHeadingGroup[] | undefined): strin
 ${rulesBlock}`;
 }
 
+/**
+ * The first (often only) request. Kept for every caller that reviews a PR in one shot —
+ * the offline prompt tooling, scripts/local-review.ts, the selftests — and identical to what
+ * it always returned when the diff fits or chunking is off.
+ */
 export function buildFinderPrompt(input: FinderPromptInput): FinderPrompt {
+  const set = buildFinderPrompts(input, 1);
+  return { text: set.chunks[0]!, omitted: set.omitted, ...(set.bound === undefined ? {} : { bound: set.bound }) };
+}
+
+export function buildFinderPrompts(input: FinderPromptInput, maxChunks: number = FINDER_MAX_CHUNKS): FinderPromptSet {
   const scope =
     input.compareTo > 0
       ? `Review only the changes added after iteration ${input.compareTo} (iteration ${input.iterationId}).`
@@ -225,7 +261,7 @@ export function buildFinderPrompt(input: FinderPromptInput): FinderPrompt {
   // here shares one context window with the payload — and until this was counted, only the
   // diff's characters were, which is how a "safely" sized diff still arrived at the model
   // truncated (config.ts, PRR_CONTEXT_TOKENS, says what that costs).
-  const head = `## Pull Request info
+  const headFor = (note: string) => `## Pull Request info
 
 - Title: ${input.pr.title}
 - Source branch: ${input.pr.sourceBranch} → target branch: ${input.pr.targetBranch}
@@ -237,7 +273,7 @@ ${renderPrDescription(input.pr.description)}
 ## Review scope
 
 ${scope}
-${input.files.length} file(s) changed.
+${input.files.length} file(s) changed.${note}
 ${rulesBlock}
 ## The change (unified diff)
 
@@ -246,6 +282,7 @@ file line numbers, given so you can orient yourself. Do not include any line num
 output — just copy the quote verbatim.
 
 `;
+  const head = headFor("");
 
   const tail = `
 
@@ -256,10 +293,27 @@ ${renderRecap(input.ruleHeadings)}
 Emit JSON per the schema. Every finding's quote must be source text that appears in the diff
 above (with the diff's +/- prefix stripped).`;
 
-  const payload = buildDiffPayload(input.files, undefined, input.seed, {
-    model: input.model,
-    fixed: `${input.system ?? ""}\n${input.schemaText ?? ""}\n${head}${tail}`,
-  });
+  const payloads = buildDiffPayloads(
+    input.files,
+    undefined,
+    input.seed,
+    {
+      model: input.model,
+      // The chunk notice is charged to the budget whenever chunking is even possible, so
+      // every chunk is sized against the head it will actually carry. Charged only then,
+      // because maxChunks of 1 has to leave the existing budget arithmetic untouched.
+      fixed: `${input.system ?? ""}\n${input.schemaText ?? ""}\n${maxChunks > 1 ? headFor(chunkScope(0, maxChunks)) : head}${tail}`,
+    },
+    maxChunks,
+  );
 
-  return { text: `${head}${payload.text}${tail}`, omitted: payload.omittedFiles, bound: payload.bound };
+  const first = payloads[0]!;
+  return {
+    chunks: payloads.map(
+      (p, i) => `${payloads.length > 1 ? headFor(chunkScope(i, payloads.length)) : head}${p.text}${tail}`,
+    ),
+    // Identical on every chunk (libs/payload.ts), so reading it off the first is not a choice.
+    omitted: first.omittedFiles,
+    ...(first.bound === undefined ? {} : { bound: first.bound }),
+  };
 }

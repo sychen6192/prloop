@@ -236,6 +236,17 @@ they are reported by exit `3`, not by re-reviewing. A run that has already lost 
 `PRR_MAX_DIFF_CHARS` also advances whatever else failed, because holding would widen the next
 run's range and review less, not more.
 
+**A diff that does not fit can be read in more than one request.** By default it is not: the
+files past the budget are dropped from every finder's context and reported as a coverage gap,
+so a large PR exits `3` telling you the part most likely to hold the defect was never read.
+Set `PRR_FINDER_MAX_CHUNKS` above `1` and the packing continues into a second and third
+request instead of stopping. Every finder reads every chunk, so "two finders agreed" still
+means two models, and the corroboration gate is untouched; the split is decided by budget
+alone and never by the per-finder seed, so a finding is compared against the same file in the
+same part. Chunks are separate requests, not a conversation — each prompt says which part it
+holds and tells the model not to reason about files it cannot see. The cost is linear and the
+run says so before spending it.
+
 ### Unattended, over a list of PRs
 
 Static analysis needs the code on disk. Point `PRR_WORKTREE_REPO` at a clone and prloop cuts
@@ -412,6 +423,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_AGENT_TIMEOUT_MS` | `900000` | wall clock for one opencode session |
 | `PRR_RULES_DIR` | `rules/` | your team's rules as `.md` files with an `applyTo` glob |
 | `PRR_MAX_DIFF_CHARS` | `240000` | ceiling on the diff sent to a finder, in characters of the diff alone; overflow makes the run incomplete |
+| `PRR_FINDER_MAX_CHUNKS` | `1` | requests one finder may spend on a diff that does not fit; `1` = the overflow is never read. Every finder reads every chunk, so corroboration is unchanged — and the cost is linear |
 | `PRR_CONTEXT_TOKENS` | `0` (off) | the model's context window in tokens. Set it and the diff is budgeted as `window − PRR_LLM_MAX_TOKENS − (system prompt + rules + conventions + PR description + inlined schema)`, so the backend never truncates a prompt mid-hunk and corrupts the quotes anchoring depends on. Token counts are an estimate (±20%) |
 | `PRR_CONTEXT_TOKENS_BY_MODEL` | — | JSON `model → tokens`: a fleet of different families is also a fleet of different context sizes, and one number either wastes the largest or truncates the smallest |
 | `PRR_HUNK_CONTEXT_BEFORE` | `6` | context lines before each hunk (asymmetric: what precedes a change means more) |

@@ -104,6 +104,20 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   described as one: ADO has no compare-and-swap on a comment body, so the claim reads its own
   write back to narrow the race rather than to win it, and a PR prloop has never published to
   takes no lease at all.
+- **`PRR_FINDER_MAX_CHUNKS`: a diff too large for one request can be read in several.**
+  Default `1`, so nothing changes until it is asked for. Until now a diff over
+  `PRR_MAX_DIFF_CHARS` (or over the model's context window) simply lost its tail: those files
+  went into no finder's context, were reported as a coverage gap, and the run exited `3` —
+  which is honest, and still means the part of a large PR most likely to hold the defect was
+  never read by anything. The packing loop now continues into a second and third request
+  instead of stopping at the first. Every finder reads every chunk, so the corroboration
+  semantics are exactly what they were; the split is budget-driven and independent of the
+  per-finder seed, so two finders that agree agreed about the same file in the same part; and
+  `omittedFiles` keeps meaning "no request carried this", which is what the coverage gate is
+  decided on. A chunked finder is folded back into one output before anything downstream
+  counts it — three chunks are one opinion, not three finders — and a chunk that failed makes
+  that opinion an error, because nobody read those files. Each prompt says which part it is
+  holding and tells the model not to reason about files it cannot see.
 
 ### Changed
 

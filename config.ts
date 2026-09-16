@@ -93,6 +93,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_HUNK_CONTEXT_AFTER", kind: "number", section: S_BUDGET, description: "context lines kept after each hunk" },
   { name: "PRR_MAX_FILE_BYTES", kind: "number", section: S_BUDGET, description: "files larger than this are diffed, never sent whole" },
   { name: "PRR_STRICT_COVERAGE", kind: "bool", section: S_BUDGET, description: "0 = files nobody read no longer make the run incomplete" },
+  { name: "PRR_FINDER_MAX_CHUNKS", kind: "number", section: S_BUDGET, description: "requests per finder for an over-budget diff; 1 = off" },
 
   { name: "PRR_SKEPTIC_MODELS", kind: "csv", section: S_SKEPTIC, description: "verifiers; empty = no verification runs" },
   { name: "PRR_SKEPTIC_ROUNDS", kind: "number", section: S_SKEPTIC, description: "verifiers per finding; capped at the distinct model count" },
@@ -798,6 +799,18 @@ export const MAX_FILE_BYTES = numEnv("PRR_MAX_FILE_BYTES", 2_000_000, 1);
 // only one of them justifies a green gate. 0 = a partial review may still pass. Binary
 // files are never counted: there is nothing in them to review.
 export const STRICT_COVERAGE = switchEnv("PRR_STRICT_COVERAGE");
+
+// Requests one finder may spend on a diff too large for a single one. 1 = the historical
+// behaviour, where everything past the budget is simply never read and reported as a
+// coverage gap; the run exits 3 telling you the part most likely to hold the defect was not
+// looked at. Above 1, the packing loop continues into a second and third request instead of
+// stopping, and EVERY finder reads EVERY chunk — so "two finders agreed" keeps meaning what
+// it meant, and the corroboration gate is untouched.
+//
+// Default 1, because the cost is linear and real: 3 chunks is up to 3x the finder spend on a
+// large PR, and nobody should discover that from a bill. A run that would benefit says so in
+// its log.
+export const FINDER_MAX_CHUNKS = numEnv("PRR_FINDER_MAX_CHUNKS", 1, 1);
 
 // --- Adversarial verification (M3) ---
 // Skeptics should be a DIFFERENT model family from the finders. Same-family verifiers share
