@@ -352,6 +352,15 @@ number, duration, tokens, error), and `result.json` (the outcome: exit code, wha
 incomplete, the counts down the funnel, tokens, duration, version). Start there when a
 result looks wrong.
 
+`review.html` is the run on one screen: the diff, with every anchored finding sitting on the
+line it is about, every finding below the bar shown greyed with the reason it was not
+commented, and every finding that could not be anchored in its own list with the failure that
+stopped it. One self-contained file — inline CSS, no script, nothing fetched — so it opens
+from a build agent's disk as readily as from a laptop. It is what makes `--dry-run` a
+preflight you can actually read, and what makes auditing a golden set (`scripts/evaluate.ts`)
+tolerable by hand. `npx tsx scripts/demo.ts` writes one from synthetic data if you want to see
+it without a PR.
+
 `result.json` is written on **every** exit path, not just a clean one: a run that crashed
 records what killed it under `fatal`, and one that reviewed nothing (a merged PR) records
 `skippedReason`. All three carry an `identity` block — which pull request, which iteration,

@@ -26,6 +26,7 @@ import {
 } from "../libs/artifacts";
 import { adoErrorDetail } from "../ado/client";
 import { renderSummary } from "../publish/format";
+import { hunkRows, renderReviewHtml } from "../publish/reviewhtml";
 import { buildRequirementPrompt } from "../prompts/requirement";
 import {
   LINE_FIELD_MAX_CHARS,
@@ -5463,6 +5464,157 @@ section("chunked finder output: three requests are still one opinion");
   const partial = mergeChunkOutputs([part(), part({ error: "read ECONNRESET" }), part()]);
   check("a failed part makes the finder an error", (partial.error ?? "").includes("part 2/3: read ECONNRESET"), partial.error);
   eq("...and a run where every part answered is not", mergeChunkOutputs([part(), part()]).error, undefined);
+}
+
+
+section("review.html: the diff and the findings on one screen");
+{
+  // --dry-run computed a whole review and then printed `file:line — claim` lines, so
+  // checking whether a finding was right meant opening the file, finding the line, and
+  // reconstructing what the model had actually been shown. Auditing a golden set is the
+  // same problem multiplied by fifty.
+  const right = [
+    "function total(items) {",
+    "  let sum = 0;",
+    "  for (const i of items) sum += i.price;",
+    "  return sum;",
+    "}",
+  ];
+  const file = mkFile("src/total.ts", right, [3]);
+
+  // The numbering is the whole point: an anchor is a right-side file line, and without
+  // walking the +/-/space prefixes there is nothing to hang a finding on.
+  const rows = hunkRows({ leftStart: 1, leftCount: 2, rightStart: 1, rightCount: 3, body: " a\n-b\n+c\n+d\n" });
+  eq("a hunk header is a row of its own", rows[0]?.kind, "meta");
+  eq(
+    "context, deletion and addition each advance the right side correctly",
+    rows.slice(1).map((r) => [r.kind, r.left ?? null, r.right ?? null]),
+    [["ctx", 1, 1], ["del", 2, null], ["add", null, 2], ["add", null, 3]],
+  );
+  // A body that ends with a newline splits into a trailing empty string. Rendered as a
+  // context line it becomes a blank row numbered one PAST the end of the hunk — a line that
+  // does not exist, which a finding anchored there would then attach to. (A blank line in
+  // the source is " ", never "", so nothing real is lost by skipping it.)
+  eq("a trailing newline is not a line", rows.length, 5);
+  eq("...and no row claims a line past the end of the hunk", Math.max(...rows.map((r) => r.right ?? 0)), 3);
+
+  const mk = (over: Partial<AnchoredFinding>): AnchoredFinding => ({
+    category: "correctness",
+    severity: "high",
+    confidence: 0.8,
+    file: "src/total.ts",
+    quote: "sum += i.price",
+    claim: "Adds price without checking quantity.",
+    sources: ["m1"],
+    fingerprint: "abc123abc123",
+    anchor: { side: "right", startLine: 3, endLine: 3, startOffset: 1, endOffset: 40 },
+    ...over,
+  });
+  const ctx = {
+    ref: { baseUrl: "", org: "contoso", project: "Shop", repoId: "api", prId: 9 },
+    pr: { title: "Fix totals", description: "", sourceBranch: "f", targetBranch: "m", createdBy: "A", status: "active" },
+    iteration: { id: 3, sourceRefCommit: "s", targetRefCommit: "t", commonRefCommit: "b", createdDate: "" },
+    compareTo: 0,
+    files: [file],
+    skipped: [],
+    iterations: [],
+    changeTrackingIds: new Map<string, number>(),
+    fileIndex: new FileIndex([file]),
+  } as unknown as Parameters<typeof renderReviewHtml>[0]["ctx"];
+
+  const commented = mk({});
+  const below = mk({ fingerprint: "def456def456", severity: "low", claim: "Name could be clearer.", suppressedBy: "severity" });
+  const lost = mk({
+    fingerprint: "999999999999",
+    anchor: undefined,
+    anchorFailure: "quote-not-found",
+    claim: "Race on the shared counter.",
+  });
+  const html = renderReviewHtml({
+    ctx,
+    agg: {
+      inline: [commented],
+      belowBar: [below],
+      degraded: [lost],
+      stats: { raw: 3, afterDedupe: 3, anchored: 2, survived: 2, refuted: 0, inline: 1, byFailure: {}, excluded: 0, dismissed: 0 },
+    },
+    reqFindings: [],
+    durationSec: 12,
+    dryRun: true,
+  });
+
+  // Self-contained, because it is opened with a file:// URL on a build agent as often as on
+  // a laptop, and a report that needs anything else is a report that does not open.
+  check("no script of any kind", !/<script/i.test(html), "");
+  check("...and nothing fetched from the network", !/(src|href)\s*=\s*["']?(https?:|\/\/)/i.test(html), "");
+
+  const lineRow = html.indexOf('<td class="ln">3</td>');
+  const claim = html.indexOf("Adds price without checking quantity.");
+  check("a commented finding sits under the line it is about", lineRow >= 0 && claim > lineRow, `${lineRow} ${claim}`);
+  check("...and says what agreed with it", html.includes("confidence 80%"), "");
+
+  // "Why did prloop not comment on this" is the question the file is most often opened to
+  // answer, and a finding missing from it is indistinguishable from one never produced.
+  check("a finding below the bar is shown too", html.includes("Name could be clearer."), "");
+  check("...and says why it was not commented", html.includes("below the inline severity threshold"), "");
+
+  // Never on a line, because there is no line: the whole anchoring rule is that a guessed
+  // line is worse than a miss, and the report must not undo it.
+  check("a finding that did not anchor gets its own list", html.includes("no locatable line"), "");
+  check("...naming the reason", html.includes("the quoted code is not in the file"), "");
+  const diffEnd = html.indexOf("<h2>Findings with no locatable line");
+  check("...and appears nowhere in the diff", html.indexOf("Race on the shared counter.") > diffEnd, "");
+
+  check("a dry run says nothing was posted", html.includes("dry run: nothing was posted"), "");
+
+  // A diff is full of `<` and `&`, and a claim is model-written text.
+  const hostile = renderReviewHtml({
+    ctx,
+    agg: {
+      inline: [mk({ claim: "<script>alert(1)</script> & more" })],
+      belowBar: [],
+      degraded: [],
+      stats: { raw: 1, afterDedupe: 1, anchored: 1, survived: 1, refuted: 0, inline: 1, byFailure: {}, excluded: 0, dismissed: 0 },
+    },
+    reqFindings: [],
+    durationSec: 1,
+    dryRun: false,
+  });
+  check("a model-written claim cannot inject markup", !/<script/i.test(hostile) && hostile.includes("&lt;script&gt;alert(1)"), "");
+
+  // The source under review is the other half: a TSX file is mostly angle brackets, and a
+  // diff line rendered raw would close the table it is sitting in.
+  const tsx = mkFile("src/page.tsx", ["export default () => {", "  return <Summary a={1} />;", "}"], [2]);
+  const markup = renderReviewHtml({
+    ctx: { ...ctx, files: [tsx], fileIndex: new FileIndex([tsx]) },
+    agg: { inline: [], belowBar: [], degraded: [], stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 } },
+    reqFindings: [],
+    durationSec: 1,
+    dryRun: false,
+  });
+  check("...and neither can the source under review", markup.includes("&lt;Summary a={1} /&gt;") && !markup.includes("<Summary"), "");
+
+  // The artifact goes out through RunDir.save, which is the egress that redacts. A report
+  // quoting a line that holds a key would otherwise publish it into the directory people
+  // attach to bug reports.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-html-"));
+  try {
+    const leaky = mkFile("src/cfg.ts", ["const key = 'sk-live-abcdefghijklmnop';"], [1]);
+    openRunDir(tmp).save(
+      "review.html",
+      renderReviewHtml({
+        ctx: { ...ctx, files: [leaky], fileIndex: new FileIndex([leaky]) },
+        agg: { inline: [], belowBar: [], degraded: [], stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 } },
+        reqFindings: [],
+        durationSec: 1,
+        dryRun: false,
+      }),
+    );
+    const written = fs.readFileSync(path.join(tmp, "review.html"), "utf8");
+    check("a credential in the diff never reaches the file", !written.includes("sk-live-abcdefghijklmnop") && written.includes("[REDACTED]"), "");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 section("redaction: credentials hidden inside a URL");

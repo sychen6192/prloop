@@ -31,6 +31,7 @@ import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
 import type { AnchoredFinding, ModelRunner, PrRef, RequirementResult } from "./libs/types";
 import { harvestClosedThreads, publish, type PublishResult } from "./publish/publish";
+import { renderReviewHtml } from "./publish/reviewhtml";
 import { reviewOutcome } from "./publish/status";
 
 export interface ReviewRunOptions {
@@ -486,6 +487,13 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     f.changeTrackingId = ctx.changeTrackingIds.get(f.file);
   }
   run.saveJson("requirement-findings.json", reqFindings);
+  // Written here, while ctx.files is still in memory: context.json records per-file hunk and
+  // changed-line COUNTS, not the lines, so nothing on disk can reconstruct the diff after the
+  // run ends. Through run.save, which is what puts it through redactSecrets.
+  run.save(
+    "review.html",
+    renderReviewHtml({ ctx, agg, reqFindings, req, durationSec: Math.round((Date.now() - started) / 1000), dryRun: isDryRun() }),
+  );
   run.saveJson("findings.json", {
     inline: agg.inline,
     belowBar: agg.belowBar,

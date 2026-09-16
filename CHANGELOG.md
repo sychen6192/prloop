@@ -156,6 +156,20 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   `prompts/` can read the store, and the selftest pins that — and `recordDismissals` now writes
   through `redactSecrets`, which it had been bypassing by appending its own bytes rather than
   going through `libs/artifacts.ts`.
+- **`review.html` per run: the diff and the findings on one screen.** `--dry-run` computed a
+  whole review and then printed a list of `file:line — claim` lines, so checking whether a
+  finding was right meant opening the file, finding the line, and reconstructing what the
+  model had actually been shown — a preflight you could not read. Auditing a golden set is the
+  same problem times fifty. Every anchored finding now sits on its line in the rendered diff,
+  every finding below the bar is shown greyed with the reason it was not commented (a finding
+  missing from the report is indistinguishable from one the finders never produced), and every
+  finding that could not be anchored gets its own list with the failure that stopped it —
+  never a line, because a guessed line is worse than a miss. Self-contained: one file, inline
+  CSS, no script, nothing fetched from the network, since it is opened from a build agent's
+  disk as often as from a laptop. Written while `ctx.files` is still in memory, because
+  `context.json` records per-file hunk and changed-line counts rather than the lines, and out
+  through `RunDir.save` so it meets `redactSecrets` like every other artifact. `scripts/demo.ts`
+  writes one from synthetic data.
 
 ### Changed
 
