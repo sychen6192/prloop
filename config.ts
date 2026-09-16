@@ -55,6 +55,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_ADO_TIMEOUT_MS", kind: "number", section: S_ADO, description: "per-request deadline for ADO REST calls" },
   { name: "PRR_ADO_MAX_RETRIES", kind: "number", section: S_ADO, description: "attempts for a transient ADO failure" },
   { name: "PRR_ADO_CONCURRENCY", kind: "number", section: S_ADO, description: "parallel blob fetches during intake" },
+  { name: "PRR_BOT_IDENTITY_IDS", kind: "csv", section: S_ADO, description: "extra ADO identity ids whose marker comments are ours" },
 
   { name: "PRR_LLM_BASE_URL", kind: "string", section: S_MODEL, description: "OpenAI-compatible endpoint (LiteLLM / vLLM / Ollama)" },
   { name: "PRR_LLM_API_KEY", kind: "string", section: S_MODEL, secret: true, description: "key for that endpoint" },
@@ -363,6 +364,16 @@ export const ADO_TIMEOUT_MS = numEnv("PRR_ADO_TIMEOUT_MS", 60_000, 1000);
 export const ADO_MAX_RETRIES = numEnv("PRR_ADO_MAX_RETRIES", 3, 1);
 // Blob fetches in flight at once during intake (ADO rate-limits aggressive parallelism).
 export const ADO_CONCURRENCY = numEnv("PRR_ADO_CONCURRENCY", 6, 1);
+// Identities other than prloop's current credential whose marker-bearing comments are still
+// prloop's own. Needed because the credential legitimately changes: the documented path onto
+// a pipeline is to trial prloop from a laptop PAT and then move to the build service account,
+// and the threads the laptop left behind are prloop's even though another identity wrote
+// them. Without this, that first pipeline run re-reviews every PR from scratch and stops
+// harvesting the dismissals recorded against the older threads.
+export const BOT_IDENTITY_IDS: string[] = strEnv("PRR_BOT_IDENTITY_IDS", "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 // --- Corporate network ---
 // CA bundle(s) to trust, for networks with TLS interception. Comma-separated; a root and

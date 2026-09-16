@@ -75,18 +75,41 @@ export interface CommentMarkers {
 const NONE: CommentMarkers = { ours: false, summary: false, fingerprints: [] };
 
 /** Reads the protocol out of a comment body. Undefined and empty bodies read as "not ours". */
+/**
+ * The run of markers at the very start of the body — the only place identity, fingerprint
+ * and category are ever written (findingMarkers and summaryMarkers both emit them first,
+ * and always have).
+ *
+ * Reading them from anywhere in the body was a hole of prloop's own making rather than an
+ * attacker's: renderFindingComment embeds the model's `claim`, `evidence` and
+ * `suggested_fix` verbatim, so a finding that quotes a source line containing
+ * `<!-- prloop:summary -->` turned an inline thread into the summary thread on the next
+ * run, and an echoed `fp=` suppressed a different finding. Restricting to the leading run
+ * costs nothing on a live PR, because that is where every marker prloop has ever written
+ * already sits.
+ */
+const LEADING_MARKERS = /^(?:\s*<!-- prloop(?::[^>]*)? -->)+/;
+
 export function readMarkers(body: string | undefined): CommentMarkers {
   if (!body) return NONE;
+  const head = LEADING_MARKERS.exec(body)?.[0] ?? "";
+  if (!head.includes(BOT_MARKER)) return NONE;
   const fingerprints: string[] = [];
-  for (const m of body.matchAll(FP_RE)) {
+  for (const m of head.matchAll(FP_RE)) {
     const fp = m[1];
     if (fp && FP_SHAPE.test(fp)) fingerprints.push(fp);
   }
-  const cat = CAT_RE.exec(body)?.[1];
+  const cat = CAT_RE.exec(head)?.[1];
+  // Read from the WHOLE body, unlike everything above it: publish() appends the iteration
+  // marker after the rendered summary, and those bytes are already on live pull requests —
+  // markers.ts's own rule is that changing where they sit orphans every thread a previous
+  // run left behind. The guard against a forged or model-echoed iteration is not position
+  // but the pair of conditions its only reader applies: the comment must be OURS and the
+  // SUMMARY, both decided from the leading run above (publish/lifecycle.ts).
   const iter = ITERATION_RE.exec(body)?.[1];
   return {
-    ours: body.includes(BOT_MARKER),
-    summary: body.includes(SUMMARY_MARKER),
+    ours: true,
+    summary: head.includes(SUMMARY_MARKER),
     ...(fingerprints[0] === undefined ? {} : { fingerprint: fingerprints[0] }),
     fingerprints,
     ...(cat !== undefined && CATEGORIES.has(cat) ? { category: cat as FindingCategory } : {}),

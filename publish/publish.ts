@@ -4,6 +4,7 @@
 import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun } from "../config";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { AdoError } from "../ado/client";
+import { isSelfIdentity, selfIdentityId } from "../ado/identity";
 import { createThread, listThreads, updateComment, type Thread } from "../ado/threads";
 import { postStatus, type StatusState } from "../ado/statuses";
 import { reviewOutcome } from "./status";
@@ -49,12 +50,29 @@ export interface PublishResult {
   status?: StatusState;
 }
 
-function findSummaryThread(threads: Thread[]): { thread: Thread; commentId: number } | undefined {
+/**
+ * The sticky summary to edit, preferring one prloop itself wrote.
+ *
+ * Preference rather than a requirement, and the fallback is the point. A forged summary
+ * comment stops being the one prloop reads its own resume point out of, which is what the
+ * preference buys. But requiring identity outright would make a pipeline run ignore the
+ * summary a laptop run posted and open a second one beside it — and a duplicate summary is
+ * the failure this function has always existed to prevent. So when prloop has no summary of
+ * its own on the PR, it edits whichever one carries the marker, exactly as before.
+ */
+function findSummaryThread(
+  threads: Thread[],
+  selfId?: string,
+): { thread: Thread; commentId: number } | undefined {
+  let fallback: { thread: Thread; commentId: number } | undefined;
   for (const t of threads) {
-    const c = t.comments?.find((c) => !c.isDeleted && readMarkers(c.content).summary);
-    if (c) return { thread: t, commentId: c.id };
+    for (const c of t.comments ?? []) {
+      if (c.isDeleted || !readMarkers(c.content).summary) continue;
+      if (isSelfIdentity(c.author?.id, selfId)) return { thread: t, commentId: c.id };
+      fallback ??= { thread: t, commentId: c.id };
+    }
   }
-  return undefined;
+  return fallback;
 }
 
 export interface PostedPosition {
@@ -132,6 +150,16 @@ export function coveredByThread(f: AnchoredFinding, positions: PostedPosition[])
   );
 }
 
+/**
+ * Every fingerprint prloop has already said on this PR, so a re-run does not say it twice.
+ *
+ * Markers alone, deliberately. A forged `fp=` here buys one suppressed comment on one PR,
+ * and it has to guess a 12-hex hash of a quote the model has not produced yet. Requiring
+ * authorship would cost much more than that: prloop's credential is not the same on a
+ * laptop, in a pipeline and under `az login`, and a run that did not recognise the other
+ * identity's comments would post every finding again. Duplicate comments are the failure
+ * this function exists to prevent.
+ */
 function postedFingerprints(threads: Thread[]): Set<string> {
   const out = new Set<string>();
   for (const t of threads) {
@@ -180,14 +208,17 @@ export async function publish(
     return result;
   }
 
-  const threads = await listThreads(ref);
+  // Asked once, alongside the thread list it qualifies: which comments on this PR prloop
+  // actually wrote. Everything below still trusts the markers alone; only the two readers
+  // whose forging is unrecoverable consult this (publish/lifecycle.ts).
+  const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
   const seen = postedFingerprints(threads);
   const { ctx } = summaryInput;
 
   // Close our own threads whose code has since changed, before adding new ones — otherwise
   // a PR accumulates stale comments the author already addressed.
   result.resolved = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex));
-  result.dismissals = collectDismissals(threads);
+  result.dismissals = collectDismissals(threads, selfId);
   if (result.dismissals.length > 0 && LEARN_FROM_DISMISSALS) {
     // Persist into the per-repo learnings store: the next run (on this PR or any other)
     // suppresses findings matching these fingerprints instead of re-litigating them.
@@ -241,7 +272,7 @@ export async function publish(
   // every thread by a different predicate and can land on a different comment, which on a PR
   // with two summary threads would copy one thread's watermark into the other's body and
   // leave the PR carrying two different answers.
-  const existing = findSummaryThread(threads);
+  const existing = findSummaryThread(threads, selfId);
   const prior = existing
     ? readMarkers(existing.thread.comments?.find((c) => c.id === existing.commentId)?.content).iteration
     : undefined;

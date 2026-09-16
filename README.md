@@ -319,6 +319,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_MAX_SKEPTIC_FINDINGS` | `30` | fan-out ceiling; worst findings verified first, overflow logged |
 | `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |
+| `PRR_BOT_IDENTITY_IDS` | — | identity GUIDs, besides the current credential's, whose marker comments are prloop's own. Only needed when prloop's credential changed (laptop PAT → pipeline service account); without it the first run under the new identity re-reviews the PR from scratch and stops harvesting dismissals on the older threads |
 | `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size. `0` = no cap |
 | `PRR_LLM_RETRIES` | `1` | **EXTRA** attempts on transient model failures — `1` = up to two calls, `0` = never retry (never on 4xx) |
 | `PRR_LLM_MAX_TOKENS` | `8192` | **raise to 16384+ for thinking models** — reasoning is billed to this budget |

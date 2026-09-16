@@ -37,6 +37,20 @@ checkout of the repositories you review.
   removed. `HOME` itself is passed through by design, so files under it (`~/.npmrc`,
   `~/.git-credentials`, the `~/.azure` token cache) remain readable by the setup command and by
   the linters.
+- **prloop's own state on the PR is bound to the identity that wrote it.** prloop keeps its
+  cross-run state in hidden HTML comments inside its own comments (`publish/markers.ts`): the
+  `--since auto` resume point, a finding's fingerprint, its category. Those markers are text
+  anyone who can comment on the PR can type, so the two readers whose forging is not
+  recoverable also check `author.id` against the identity prloop authenticates as
+  (`_apis/connectionData`, `ado/identity.ts`): the resume point, where a forged
+  `<!-- prloop:iteration=9999 -->` would make a run review an empty diff and report a clean PR,
+  and the dismissal store, where a forged `wontFix` thread would suppress a finding on every
+  future PR in the repository. The dedupe readers deliberately stay on markers alone — forging
+  those costs one missing comment, while requiring identity there would double-post whenever
+  prloop's credential differs between a laptop and a pipeline. Markers are read only from the
+  start of a comment body, so model-written text that quotes one is not mistaken for the
+  protocol. Where `connectionData` is unavailable (some on-prem Server versions) prloop falls
+  back to trusting the markers alone and says so, once, in the run log.
 - **prloop never writes its own configuration** and never votes on a PR. It posts comments and,
   optionally, a status.
 

@@ -63,6 +63,12 @@ export interface FakeAdoState {
    * left there, which may be green over a review that never ran.
    */
   rejectStatusPost?: number;
+  /**
+   * The identity GET /_apis/connectionData answers with — who prloop's credential posts as.
+   * Undefined serves a 404, which is the on-prem Server case where prloop must fall back to
+   * trusting the markers alone.
+   */
+  selfIdentityId?: string;
 }
 
 export interface AdoRequest {
@@ -134,6 +140,13 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
         cursor = page.nextSkip;
       }
       return sendJson(res, 200, { changeEntries: [] });
+    }
+    // --- identity --------------------------------------------------------------------
+    if (method === "GET" && /\/_apis\/connectionData$/.test(path)) {
+      if (state.selfIdentityId === undefined) {
+        return sendJson(res, 404, { message: "VS402844: connectionData is not available" });
+      }
+      return sendJson(res, 200, { authenticatedUser: { id: state.selfIdentityId } });
     }
     // --- threads ---------------------------------------------------------------------
     if (method === "GET" && /\/pullRequests\/\d+\/threads$/.test(path)) {
