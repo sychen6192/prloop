@@ -242,9 +242,10 @@ function inAnyHunk(file: FileDiff, cand: Candidate, side: "right" | "left"): boo
   });
 }
 
-function touchesChangedLine(file: FileDiff, cand: Candidate): boolean {
+function touchesChangedLine(file: FileDiff, cand: Candidate, side: "right" | "left"): boolean {
+  const changed = side === "right" ? file.changedRightLines : file.changedLeftLines;
   for (let l = cand.startLine; l <= cand.endLine; l++) {
-    if (file.changedRightLines.has(l)) return true;
+    if (changed.has(l)) return true;
   }
   return false;
 }
@@ -383,9 +384,9 @@ function locate(
       const best = Math.max(...scored.map((x) => x.s));
       if (best > 0) pool = scored.filter((x) => x.s === best).map((x) => x.c);
     }
-    if (pool.length > 1 && side === "right") {
+    if (pool.length > 1) {
       // 2) prefer a candidate that sits on a line this PR actually touched
-      const onChanged = pool.filter((c) => touchesChangedLine(file, c));
+      const onChanged = pool.filter((c) => touchesChangedLine(file, c, side));
       if (onChanged.length > 0) pool = onChanged;
     }
     if (pool.length > 1) {
@@ -453,8 +454,11 @@ function locate(
  * evidence, but a common one (`}`, `return;`, `try {`) would be a guess wearing a match's
  * clothes, and guessing is the one thing this module exists to prevent.
  *
- * Right side only. `changedRightLines` is the only per-line changed set a FileDiff carries,
- * so on the left there is no way to hold up the second half of that bargain.
+ * Both sides. It used to refuse on the left, because changedRightLines was the only
+ * per-line changed set a FileDiff carried and the second half of that bargain could not be
+ * held up there — a limit of the type, not of the rule. anchorFinding retries the other
+ * side precisely because `side` is a required enum the model often guesses, so the side a
+ * finding lands on should not decide how much recovery it gets.
  */
 function firstLineOnly(
   needle: string[],
@@ -462,7 +466,7 @@ function firstLineOnly(
   lines: string[],
   side: "right" | "left",
 ): AnchorResult | undefined {
-  if (side !== "right" || needle.length < 2) return undefined;
+  if (needle.length < 2) return undefined;
   const head = needle.find((l) => l.trim() !== "");
   if (head === undefined) return undefined;
 
@@ -472,7 +476,7 @@ function firstLineOnly(
     if (cands.length === 0) continue;
     if (cands.length > 1) return undefined; // not unique: evidence, or nothing
     const cand = cands[0]!;
-    if (!touchesChangedLine(file, cand) || !inAnyHunk(file, cand, side)) return undefined;
+    if (!touchesChangedLine(file, cand, side) || !inAnyHunk(file, cand, side)) return undefined;
     return { file, anchor: mkAnchor(lines, cand, side) };
   }
   return undefined;

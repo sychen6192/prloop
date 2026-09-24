@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 # Wrapper so prloop can be run from any directory.
 set -euo pipefail
-TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve this script through any symlinks before deriving the tool directory. The
+# documented install is `ln -s <repo>/bin/prloop ~/.local/bin/prloop`, and BASH_SOURCE is
+# then the LINK's path — so a plain dirname put TOOL_DIR at ~/.local and the wrapper tried
+# to run ~/.local/loop.ts. `readlink` without -f, in a loop, works on BSD and GNU alike.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  LINK_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  # A relative link resolves against the directory the link lives in, not the cwd.
+  case "$SOURCE" in /*) ;; *) SOURCE="$LINK_DIR/$SOURCE" ;; esac
+done
+TOOL_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
 # prloop applies PRR_CA_CERTS itself (libs/tls.ts attaches it to the HTTP dispatcher), so
 # this block is not what makes the tool's own requests work. It exists for the child

@@ -9,5 +9,5 @@ corporate-ca.pem
 *.pem
 corporate-chain.pem
 
-# Ephemeral git worktrees created by Claude Code agents (isolation: worktree)
-.claude/worktrees/
+# Local scratch written by editors and tooling — never committed
+.claude/

@@ -1,0 +1,12 @@
+# Line endings are checked out identically on every platform.
+#
+# Not a style preference. The CI matrix includes Windows deliberately, and several selftests
+# assert on the BYTES of tracked files: the control-character scan walks every tracked *.ts
+# and *.md, and rules/java.md is parsed by pattern to check that each rule still carries a
+# bad snippet, a good snippet and a why. With git's Windows default (core.autocrlf=true) the
+# runner checks those same files out with CRLF, so ```java\n// bad stopped matching and the
+# assertions reported "0 bad, 0 good" about a file nobody had touched.
+#
+# A checkout whose bytes depend on the platform makes every byte-level assertion
+# platform-dependent, which is a trap rather than a feature. One rule, stated once.
+* text=auto eol=lf
