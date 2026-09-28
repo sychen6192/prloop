@@ -70,6 +70,11 @@ export interface SkepticPromptInput {
   startLine: number;
   endLine: number;
   contextLines: number;
+  /**
+   * Code the pipeline looked up for a second reading (gates/lookup.ts), already fenced.
+   * Only ever set when a first reading answered "insufficient-context".
+   */
+  related?: string;
 }
 
 // ─── Requirement-verdict skeptic ─────────────────────────────────────────────
@@ -199,11 +204,11 @@ Line prefixes: \`>\` = the line the accusation points at${side === "right" ? ", 
 
 \`\`\`
 ${snippet.join("\n")}
-\`\`\`${hunkBlock}
+\`\`\`${hunkBlock}${input.related ? `\n\n${input.related}` : ""}
 
 ## Your task
 
-Try to refute the accusation above. If the accusation turns on code that is not shown here,
+Try to refute the accusation above.${input.related ? " A first reading could not check it from the snippet alone, so the pipeline looked up where the names on the accused lines are defined and used; that code may quote as evidence like the snippet." : ""} If the accusation turns on code that is not shown here,
 answer "insufficient-context" rather than guessing. Emit your verdict as JSON per the schema.`;
 
   return { prompt, snippet: shown.join("\n") };

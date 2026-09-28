@@ -94,7 +94,10 @@ do the filtering:
    it, checked against the snippet the verifier was shown — an unevidenced refutation is
    discarded), `holds`, and `insufficient-context` for a claim about code it was not shown
    (another file, a caller, a deleted line). "I could not check this" is no longer reported
-   as "I checked it and it holds". Each round uses a *different* model — rounds beyond the
+   as "I checked it and it holds" — and it gets one second reading: the pipeline, not the
+   model, looks up the definitions and a few callers of the names on the accused lines (in
+   the PR's files, then with `git grep` at the commit) and asks that verifier again, with the
+   same powers and no more (`PRR_SKEPTIC_LOOKUP`). Each round uses a *different* model — rounds beyond the
    number of configured models are dropped, because re-sampling one model at temperature 0.2
    is not a second opinion — and a run whose skeptics all share a family with a finder says
    so, loudly, on every run.
@@ -442,6 +445,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_EXCLUDE_CATEGORIES` | — | categories never reported (e.g. `performance,maintainability`) |
 | `PRR_LEARN_FROM_DISMISSALS` | `1` | `0` = re-post findings humans dismissed as wontFix/byDesign |
 | `PRR_REQUIRE_CORROBORATION` | `1` | `0` publishes unverified single-source findings |
+| `PRR_SKEPTIC_LOOKUP` | `1` | a skeptic that answers "insufficient-context" is asked once more, shown the definitions and up to four callers of the names on the accused lines — from the PR's files, then `git grep` at the commit in `PRR_WORKTREE_REPO`. Chosen by the pipeline, fenced as the repository's text, capped at 15 files and 6,000 characters; a lookup that finds nothing or a call that fails keeps the first answer. `0` = off |
 | `PRR_STRICT_COVERAGE` | `1` | files the finder never saw (over `PRR_MAX_DIFF_CHARS`, or too large to fetch) make the run incomplete (exit 3); `0` = a partial review can still exit 0 |
 | `PRR_WORKDIR` | — | checkout at the iteration's `sourceRefCommit`; unset = static analysis skips. Files whose content differs from the iteration under review are skipped, not analysed. Tools execute the reviewed branch's code, with a secret-scrubbed environment |
 | `PRR_WORKTREE_REPO` | — | a clone of the reviewed repo; prloop cuts its own throwaway worktree at the iteration's commit and removes it afterwards. Takes precedence over `PRR_WORKDIR` — prefer it for anything unattended |

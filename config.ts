@@ -104,6 +104,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_MAX_SKEPTIC_FINDINGS", kind: "number", section: S_SKEPTIC, description: "fan-out ceiling; worst findings verified first" },
   { name: "PRR_MIN_CONSENSUS_SOURCES", kind: "number", section: S_SKEPTIC, description: "independent finders needed to publish unverified" },
   { name: "PRR_REQUIRE_CORROBORATION", kind: "bool", section: S_SKEPTIC, description: "0 = publish single-source unverified findings" },
+  { name: "PRR_SKEPTIC_LOOKUP", kind: "bool", section: S_SKEPTIC, description: "0 = no lookup and re-ask on insufficient-context" },
 
   { name: "PRR_WORKDIR", kind: "string", section: S_STATIC, description: "checkout of the PR source branch; unset = gate skips" },
   { name: "PRR_WORKTREE_REPO", kind: "string", section: S_STATIC, description: "clone to cut a throwaway worktree from" },
@@ -863,6 +864,10 @@ export const MAX_SKEPTIC_FINDINGS = numEnv("PRR_MAX_SKEPTIC_FINDINGS", 30, 1);
 export const MIN_CONSENSUS_SOURCES = numEnv("PRR_MIN_CONSENSUS_SOURCES", 2, 1);
 // 0 = publish single-source findings that no skeptic examined (looser, noisier).
 export const REQUIRE_CORROBORATION = switchEnv("PRR_REQUIRE_CORROBORATION");
+// A skeptic that answers "insufficient-context" is asked once more, shown the definitions and
+// a few callers of the names on the accused lines (gates/lookup.ts). One extra call per such
+// answer; 0 keeps the first answer.
+export const SKEPTIC_LOOKUP = switchEnv("PRR_SKEPTIC_LOOKUP");
 
 // --- Static analysis (M4) ---
 // A checkout of the PR's source branch. Linters need files on disk; without this the

@@ -24,6 +24,7 @@ import type { FinderOutput } from "../gates/finder";
 import type { RawFinding, WorkItem } from "../libs/types";
 import { createRunner } from "../models/runner";
 import { exitCodeFor, runReview } from "../orchestrator";
+import { run } from "../libs/shell";
 
 function usage(): never {
   console.error(`Usage:
@@ -74,6 +75,11 @@ async function main() {
     // directory is the review.
     process.env["PRR_DRY_RUN"] = "1";
     const criteria = criteriaFile ? fs.readFileSync(criteriaFile, "utf8") : undefined;
+    // A skeptic's second reading may `git grep` the repository at the head commit — except in
+    // a partial clone (scripts/bench.ts makes treeless ones), where searching every file would
+    // download every file.
+    const promisors = await run("git", ["-C", repo, "config", "--get-regexp", "^remote\\..*\\.promisor$"], 10_000);
+    const partial = /\btrue\b/.test(promisors.stdout);
     const result = await runReview({
       ref: ctx.ref,
       runner: await createRunner(),
@@ -81,6 +87,7 @@ async function main() {
       intake: (_ref, _compareTo, o) => buildLocalReviewContext({ repo, base, head, ...(o?.text ? { text: true } : {}) }),
       conventions: (commit) => readLocalConventions(repo, commit),
       workItems: async () => ({ items: criteria ? [localWorkItem(criteria)] : [], inheritedFrom: [] }),
+      ...(partial ? {} : { searchRepo: repo }),
     });
     const { inline, belowBar, degraded } = result.agg;
     console.log(

@@ -54,6 +54,8 @@ section("calibration: joining what we published to what humans rejected");
       { model: "sk1", verdict: "insufficient-context", error: false },
       { model: "sk1", verdict: "", error: true },
       { model: "sk2", verdict: "holds", error: false },
+      { model: "sk3", verdict: "holds", error: false, secondLook: true },
+      { model: "sk3", verdict: "insufficient-context", error: false, secondLook: true },
     ],
     dismissed: new Set(["a", "c", "zzz"]),
   });
@@ -86,6 +88,8 @@ section("calibration: joining what we published to what humans rejected");
   eq("kill rate is over answers", sk.get("sk1")?.killRate, 1 / 3);
   eq("so is the could-not-check rate", sk.get("sk1")?.uncheckedRate, 1 / 3);
   eq("a verifier that never killed anything reads zero", sk.get("sk2")?.killRate, 0);
+  eq("second readings are counted, and how many of them settled", [sk.get("sk3")?.readAgain, sk.get("sk3")?.settled], [2, 1]);
+  eq("...while the could-not-check rate is over final answers", sk.get("sk3")?.uncheckedRate, 1 / 2);
 
   const empty = calibrate({ findings: [], verdicts: [], dismissed: new Set() });
   eq("an empty store divides by nothing", [empty.findings, empty.published, empty.publishedDismissed], [0, 0, 0]);

@@ -26,7 +26,10 @@ import {
 import { type Severity } from "../../config";
 import * as path from "node:path";
 import { run } from "../../libs/shell";
-import { check, eq, section } from "./harness";
+import { declares, namesIn, relatedContext } from "../../gates/lookup";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import { check, eq, section, skip } from "./harness";
 import { mkFile, EMPTY_CANDIDATES } from "./fixtures";
 
 // --- adversarial verification ---
@@ -394,4 +397,151 @@ section("model families: same-family verification is weak verification");
   eq("...the clearing still counts", survivor.skepticVerdicts, 1);
   eq("...and the finding still publishes", finalize(EMPTY_CANDIDATES, [survivor]).inline.length, 1);
   check("...but the comment says the check was weaker", renderFindingComment(survivor).includes("same model family"));
+}
+
+section("a second reading: what a skeptic could not check, looked up by code and asked once more");
+{
+  eq(
+    "names on the accused line: called first, then types, then the rest — never keywords or two-letter names",
+    namesIn(["        BigDecimal total = line.price().multiply(qty);"]),
+    ["price", "multiply", "BigDecimal", "total", "line"],
+  );
+  eq(
+    "declarations are recognised across languages",
+    [
+      declares("    public BigDecimal price() {", "price"),
+      declares("    private final BigDecimal price;", "price"),
+      declares("  price?: number;", "price"),
+      declares("    def price(self):", "price"),
+      declares("        self.price = price", "price"),
+      declares("export const price = (x) => x;", "price"),
+      declares("func price(l Line) int {", "price"),
+    ],
+    [true, true, true, true, true, true, true],
+  );
+  eq(
+    "...and calls and uses are not",
+    [
+      declares("        return price(line);", "price"),
+      declares("    total = price(line)", "price"),
+      declares("    if (price(line) > 0) {", "price"),
+      declares("    log(price);", "price"),
+    ],
+    [false, false, false, false],
+  );
+
+  const invoice = mkFile(
+    "src/Invoice.java",
+    ["class Invoice {", "    BigDecimal total(List<Line> lines) {", "        BigDecimal sum = BigDecimal.ZERO;", "        for (Line l : lines) sum = sum.add(l.price());", "        return sum;", "    }", "}"],
+    [4],
+  );
+  const lineJava = mkFile(
+    "src/Line.java",
+    ["class Line {", "    private BigDecimal amount;", "", "    BigDecimal price() {", "        return amount == null ? null : amount;", "    }", "}"],
+    [5],
+  );
+  const report = mkFile("src/Report.java", ["class Report {", ...Array.from({ length: 6 }, (_, i) => `    void r${i}(Line l) { use(l.price()); }`), "}"], [2]);
+  const files = [invoice, lineJava, report];
+  const span = { side: "right" as const, startLine: 4, endLine: 4 };
+  const found = await relatedContext({ files }, invoice, span, 0);
+  check("the definition of a name on the accused line is found in another changed file", (found?.text ?? "").includes("definition of `price` — src/Line.java:4"), found?.text.slice(0, 400));
+  check("...fenced as the repository's text", (found?.text ?? "").includes("<related-code>") && (found?.text ?? "").includes("not instructions to you"));
+  eq("...with at most four callers of one name", (found?.text.match(/a call of `price`/g) ?? []).length, 4);
+  check("...and its lines kept, so a refutation may quote them", (found?.lines ?? []).includes("        return amount == null ? null : amount;"));
+  const shown = await relatedContext({ files }, invoice, span, 25);
+  check("what the skeptic already sees around the finding is not repeated", !(shown?.text ?? "").includes("src/Invoice.java:3"));
+
+  const gitOk = (await run("git", ["--version"], 10_000)).code === 0;
+  if (!gitOk) {
+    skip("git grep finds a definition outside the pull request", "no git on this platform");
+  } else {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-lookup-"));
+    const g = (...args: string[]) => run("git", ["-C", repo, ...args], 20_000);
+    await g("init", "-q", "-b", "main");
+    await g("config", "user.email", "selftest@example.invalid");
+    await g("config", "user.name", "selftest");
+    fs.mkdirSync(path.join(repo, "src"));
+    fs.writeFileSync(path.join(repo, "src", "Util.java"), "class Util {\n    static String normalize(String s) {\n        return s.trim();\n    }\n}\n");
+    await g("add", "-A");
+    await g("commit", "-qm", "util");
+    const commit = (await g("rev-parse", "HEAD")).stdout.trim();
+    const app = mkFile("src/App.java", ["class App {", "    String run(String x) {", "        return Util.normalize(x);", "    }", "}"], [3]);
+    const appSpan = { side: "right" as const, startLine: 3, endLine: 3 };
+    const viaRepo = await relatedContext({ files: [app], repo: { dir: repo, commit } }, app, appSpan, 25);
+    check("outside the pull request, git grep at the commit finds the rest", (viaRepo?.text ?? "").includes("definition of `normalize` — src/Util.java:2"), viaRepo?.text.slice(0, 300));
+    const absent = await relatedContext({ files: [app], repo: { dir: repo, commit: "0".repeat(40) } }, app, appSpan, 25);
+    eq("...and a commit the repository does not have finds nothing, and throws nothing", absent, undefined);
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+
+  const finding: AnchoredFinding = {
+    category: "correctness",
+    severity: "high",
+    confidence: 0.8,
+    file: "src/Invoice.java",
+    quote: "        for (Line l : lines) sum = sum.add(l.price());",
+    claim: "price() can return null, and add(null) throws",
+    sources: ["finder-a"],
+    fingerprint: "fp-lookup",
+    anchor: { side: "right", startLine: 4, endLine: 4, startOffset: 1, endOffset: 50 },
+  };
+  const calls: Array<{ model: string; user: string }> = [];
+  const scripted = (answers: Record<string, string[]>) => ({
+    chat: async (req: ChatRequest) => {
+      calls.push({ model: req.model, user: req.user });
+      const next = answers[req.model]?.shift() ?? "ERROR";
+      return next === "ERROR" ? { model: req.model, text: "", error: "timeout (180000ms)" } : { model: req.model, text: next };
+    },
+  });
+  const verdict = (v: string, reason: string, quote: string | null = null) =>
+    JSON.stringify({ verdict: v, reason, evidence_quote: quote, confidence: 0.8, suggested_severity: null });
+  const unsure = verdict("insufficient-context", "I would need to see price()");
+  const holds = verdict("holds", "price() returns null when amount is unset");
+  const opts = (models: string[], enabled = true, lookupFiles = files) => ({
+    models,
+    rounds: models.length,
+    finders: ["finder-a"],
+    lookup: { files: lookupFiles },
+    lookupEnabled: enabled,
+  });
+  const index = new FileIndex(files);
+  const lines: string[] = [];
+  attachLogSink((l) => lines.push(l));
+
+  let out = await runSkeptic(scripted({ alpha: [unsure, holds], beta: [holds] }), [finding], index, opts(["alpha", "beta"]));
+  eq("only the verifier that could not check is asked again", calls.map((c) => c.model), ["alpha", "beta", "alpha"]);
+  check("...shown the definition it said it lacked", (calls[2]?.user ?? "").includes("definition of `price` — src/Line.java:4"));
+  eq("...and its second answer replaces the first", out[0]?.verdicts.map((v) => v.verdict), ["holds", "holds"]);
+  eq("...marked as a second reading, keeping what the first one lacked", out[0]?.verdicts[0]?.secondLook?.first, "I would need to see price()");
+  check("the second prompt is kept for the audit trail", (out[0]?.lookupPrompt ?? "").includes("<related-code>"));
+  check("...and the run log says how many were read again", lines.some((l) => l.includes("read again with looked-up code")), lines.join("\n").slice(-400));
+
+  calls.length = 0;
+  out = await runSkeptic(
+    scripted({ alpha: [unsure, verdict("refuted", "the null is handled before add", "        return amount == null ? null : amount;")] }),
+    [finding],
+    index,
+    opts(["alpha"]),
+  );
+  eq("a refutation may quote the looked-up code: it was shown", [out[0]?.verdicts[0]?.verdict, out[0]?.verdicts[0]?.downgraded], ["refuted", undefined]);
+
+  calls.length = 0;
+  out = await runSkeptic(scripted({ alpha: [unsure, "ERROR"] }), [finding], index, opts(["alpha"]));
+  eq("a second call that fails keeps the first answer (fails open)", [out[0]?.verdicts[0]?.verdict, out[0]?.verdicts[0]?.secondLook], ["insufficient-context", undefined]);
+
+  const bare = mkFile("src/Bare.java", ["class Bare {", "    int x() { return 1 + 2; }", "}"], [2]);
+  const lone: AnchoredFinding = {
+    ...finding,
+    file: "src/Bare.java",
+    quote: "    int x() { return 1 + 2; }",
+    fingerprint: "fp-bare",
+    anchor: { side: "right", startLine: 2, endLine: 2, startOffset: 1, endOffset: 10 },
+  };
+  calls.length = 0;
+  await runSkeptic(scripted({ alpha: [unsure, holds] }), [lone], new FileIndex([bare]), opts(["alpha"], true, [bare]));
+  eq("a lookup that finds nothing asks nothing more", calls.length, 1);
+  calls.length = 0;
+  await runSkeptic(scripted({ alpha: [unsure, holds] }), [finding], index, opts(["alpha"], false));
+  eq("...and PRR_SKEPTIC_LOOKUP=0 never asks again", calls.length, 1);
+  detachLogSink();
 }

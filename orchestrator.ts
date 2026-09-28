@@ -58,6 +58,12 @@ export interface ReviewRunOptions {
   conventions?: (commit: string) => Promise<ConventionDoc[]>;
   /** Where the acceptance criteria come from. Defaults to the PR's linked work items. */
   workItems?: () => Promise<LinkedRequirements>;
+  /**
+   * A repository holding the commit under review, for a skeptic's second reading to
+   * `git grep` (gates/lookup.ts). Defaults to PRR_WORKTREE_REPO, which the static gate has
+   * already fetched the commit into; a local review passes its own repository.
+   */
+  searchRepo?: string;
 }
 
 export interface ReviewRunResult {
@@ -422,7 +428,13 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // over-report; this is the stage that does the killing. A skeptic stage that throws must
   // degrade to "nothing verified" (recorded as incomplete below), not abort a run that has
   // already paid for its finder calls.
-  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.fileIndex).catch(
+  const searchRepo = opts.searchRepo ?? (WORKTREE_REPO || undefined);
+  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.fileIndex, {
+    lookup: {
+      files: ctx.files,
+      ...(searchRepo && ctx.iteration.sourceRefCommit ? { repo: { dir: searchRepo, commit: ctx.iteration.sourceRefCommit } } : {}),
+    },
+  }).catch(
     (e): import("./gates/skeptic").SkepticOutcome[] => {
       const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
       stageFailures.push(why);
@@ -456,6 +468,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       // The prompt is the audit trail for a wrong refutation — without it, a killed real
       // finding cannot be debugged.
       prompt: o.prompt,
+      ...(o.lookupPrompt === undefined ? {} : { lookupPrompt: o.lookupPrompt }),
     })),
   );
 

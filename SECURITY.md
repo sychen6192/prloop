@@ -76,6 +76,12 @@ no source, no quote — and neither is ever read into a model prompt.
   a work item's type — are collapsed to one line and capped, because a newline in one of them
   forges a section of the prompt. None of this is a guarantee against a determined injection;
   it makes the boundary explicit, which is what a model can act on.
+- **Code a skeptic's second reading is shown was chosen by the pipeline, and is fenced.** The
+  definitions and callers `gates/lookup.ts` finds are the repository's text — a comment in a
+  caller can address the model as well as the diff can — so they reach the prompt inside a
+  named fence like every other block prloop did not write. The names searched for are
+  identifiers taken from the accused lines, passed to `git grep -F` as fixed strings, never
+  through a shell.
 - **A static-analysis message is source text quoted back.** It becomes the claim of a comment
   prloop signs and the body of a triage prompt, so it is collapsed to one paragraph, stripped
   of HTML comments and leading markdown structure, and capped. Finding fingerprints hash the

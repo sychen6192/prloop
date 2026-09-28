@@ -44,6 +44,8 @@ export interface CalibrationVerdict {
   model: string;
   verdict: string;
   error: boolean;
+  /** The answer to a second reading with looked-up code (PRR_SKEPTIC_LOOKUP). */
+  secondLook?: boolean;
 }
 
 /**
@@ -140,6 +142,11 @@ export interface SkepticStats {
   errors: number;
   killRate: number;
   uncheckedRate: number;
+  // Answers that were "insufficient-context" at first and were read again with looked-up
+  // code, and how many of those second readings came back holding or refuting: what the
+  // lookup bought. `unchecked` above counts final answers, after any second reading.
+  readAgain: number;
+  settled: number;
 }
 
 export interface CalibrationReport {
@@ -374,12 +381,16 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     const model = v.model || "(unknown)";
     const s =
       skeptics.get(model) ??
-      { model, answered: 0, refuted: 0, unchecked: 0, errors: 0, killRate: 0, uncheckedRate: 0 };
+      { model, answered: 0, refuted: 0, unchecked: 0, errors: 0, killRate: 0, uncheckedRate: 0, readAgain: 0, settled: 0 };
     if (v.error) s.errors++;
     else {
       s.answered++;
       if (v.verdict === "refuted") s.refuted++;
       else if (v.verdict === "insufficient-context") s.unchecked++;
+      if (v.secondLook) {
+        s.readAgain++;
+        if (v.verdict !== "insufficient-context") s.settled++;
+      }
     }
     skeptics.set(model, s);
   }
@@ -574,6 +585,7 @@ function readVerdicts(file: string, into: CalibrationVerdict[], outcomes: Calibr
         model: str(o["model"]),
         verdict: str(o["verdict"]) || legacy,
         error: typeof o["error"] === "string" && o["error"] !== "",
+        ...(typeof o["secondLook"] === "object" && o["secondLook"] !== null ? { secondLook: true } : {}),
       });
     }
   }
@@ -754,7 +766,7 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
     report.skeptics.length === 0
       ? "Skeptic verdicts\n  (no verification recorded)"
       : `Skeptic verdicts (per answer, not per finding)\n${table(
-          ["model", "answered", "refuted", "kill rate", "unchecked", "unchecked rate", "errors"],
+          ["model", "answered", "refuted", "kill rate", "unchecked", "unchecked rate", "read again", "settled", "errors"],
           report.skeptics.map((s) => [
             s.model,
             String(s.answered),
@@ -762,6 +774,8 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
             pct(s.killRate),
             String(s.unchecked),
             pct(s.uncheckedRate),
+            String(s.readAgain),
+            String(s.settled),
             String(s.errors),
           ]),
         )}`,

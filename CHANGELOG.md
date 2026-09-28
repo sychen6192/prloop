@@ -11,6 +11,18 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **A skeptic that could not check a finding gets one second reading, with code the pipeline
+  looked up.** `insufficient-context` usually names one missing piece — where a field is set,
+  whether a caller passes null — and that piece is usually one lookup away. `gates/lookup.ts`
+  takes the names on the accused lines (called functions first, then types) and finds their
+  definitions and up to four callers: first in the PR's files, already in memory, then with
+  `git grep -F -w` at the commit in `PRR_WORKTREE_REPO` (a local review searches its own
+  repository, unless it is a partial clone), within Kodus's caps of fifteen files and six
+  thousand characters. Fenced as the repository's text; the verifier that answered is asked
+  once more and may quote what it was shown as evidence. Every way it can fail keeps the first
+  answer: nothing found, a call that errored. `skeptic.json` keeps the second prompt and marks
+  the answer, and `scripts/calibrate.ts` reports per verifier how many were read again and how
+  many then held or refuted. `PRR_SKEPTIC_LOOKUP=0` turns it off.
 - **Finders see what a change sits in.** A hunk whose enclosing function, method or class
   starts above the lines it shows names it after the `@@`, as `git diff` does — found by
   per-language rules over the file's own lines and its indentation, no parser, and a hint

@@ -9,6 +9,7 @@ import {
   FINDER_MODELS,
   MAX_SKEPTIC_FINDINGS,
   SKEPTIC_CONTEXT_LINES,
+  SKEPTIC_LOOKUP,
   SKEPTIC_MAX_TOKENS,
   SKEPTIC_MODELS,
   SKEPTIC_ROUNDS,
@@ -22,6 +23,7 @@ import { SEVERITIES, type Severity } from "../config";
 import { SKEPTIC_VERDICTS, type AnchoredFinding, type ModelRunner, type SkepticVerdictKind } from "../libs/types";
 import { VERDICT_SCHEMA } from "../models/schemas";
 import { SKEPTIC_SYSTEM, buildSkepticPrompt } from "../prompts/skeptic";
+import { relatedContext, type LookupSource } from "./lookup";
 
 export interface Verdict {
   // Three answers, not two: only "refuted" kills, only "holds" clears, and
@@ -46,6 +48,10 @@ export interface Verdict {
   // killed a real finding — or an "unparseable verdict" — cannot be argued with from a
   // parsed verdict alone.
   raw?: string;
+  // This is a second reading: the first answered "insufficient-context" and was asked again
+  // with looked-up code (gates/lookup.ts). The names searched, the files the context came
+  // from, and what the first answer said it was missing.
+  secondLook?: { names: string[]; files: number; first: string };
 }
 
 export interface SkepticOutcome {
@@ -55,6 +61,8 @@ export interface SkepticOutcome {
   killed: boolean;
   // What the skeptics were shown — the audit trail for debugging a wrong refutation.
   prompt?: string;
+  // The second reading's prompt, when any verifier was asked again with looked-up code.
+  lookupPrompt?: string;
 }
 
 const VALID_SEVERITY = new Set<string>(SEVERITIES);
@@ -245,6 +253,10 @@ export interface SkepticOptions {
   models?: string[];
   rounds?: number;
   finders?: string[];
+  /** Where a second reading's context is looked up. Without it there is no second reading. */
+  lookup?: LookupSource;
+  /** PRR_SKEPTIC_LOOKUP, parameterised for the selftest. */
+  lookupEnabled?: boolean;
 }
 
 export async function runSkeptic(
@@ -255,6 +267,7 @@ export async function runSkeptic(
 ): Promise<SkepticOutcome[]> {
   const configured = opts.models ?? SKEPTIC_MODELS;
   const finders = opts.finders ?? FINDER_MODELS;
+  const lookupEnabled = opts.lookupEnabled ?? SKEPTIC_LOOKUP;
   if (findings.length === 0 || configured.length === 0) {
     return findings.map((f) => ({ finding: f, verdicts: [], killed: false }));
   }
@@ -313,7 +326,7 @@ export async function runSkeptic(
     const file = index.exact(finding.file);
     if (!file || !finding.anchor) return { finding, verdicts: [], killed: false };
 
-    const { prompt, snippet } = buildSkepticPrompt({
+    const input = {
       claim: finding.claim,
       category: finding.category,
       severity: finding.severity,
@@ -322,10 +335,35 @@ export async function runSkeptic(
       startLine: finding.anchor.startLine,
       endLine: finding.anchor.endLine,
       contextLines: SKEPTIC_CONTEXT_LINES,
-    });
-    const verdicts = await Promise.all(
+    };
+    const { prompt, snippet } = buildSkepticPrompt(input);
+    let verdicts = await Promise.all(
       roster.map((m) => verifyOne(runner, prompt, snippet, m, sharesFamily(m))),
     );
+
+    // A verifier that answered "I could not check this" gets one second reading, with the
+    // definitions and callers of the names on the accused lines. Only that verifier, only
+    // once, and every way this can fail keeps the first answer: nothing found, a second
+    // call that errored. The second answer carries the same powers as the first — refute
+    // with evidence, clear, or lower the severity — and no more.
+    let lookupPrompt: string | undefined;
+    const unsure = verdicts.flatMap((v, i) => (v.verdict === "insufficient-context" && !v.error ? [i] : []));
+    if (lookupEnabled && opts.lookup && unsure.length > 0) {
+      const related = await relatedContext(opts.lookup, file, input, SKEPTIC_CONTEXT_LINES);
+      if (related) {
+        const widened = buildSkepticPrompt({ ...input, related: related.text });
+        lookupPrompt = widened.prompt;
+        // A refutation may quote the looked-up code: it was shown.
+        const corpus = `${widened.snippet}\n${related.lines.join("\n")}`;
+        verdicts = await Promise.all(
+          verdicts.map(async (v, i) => {
+            if (!unsure.includes(i)) return v;
+            const again = await verifyOne(runner, widened.prompt, corpus, v.model, v.sameFamily === true);
+            return again.error ? v : { ...again, secondLook: { names: related.names, files: related.files, first: v.reason } };
+          }),
+        );
+      }
+    }
 
     // Only skeptics that actually answered get a vote. An "insufficient-context" answer is
     // an answer: it dilutes the majority a kill needs, which is the conservative direction.
@@ -333,7 +371,7 @@ export async function runSkeptic(
     const refutedCount = answered.filter((v) => v.verdict === "refuted").length;
     const killed = answered.length > 0 && refutedCount * 2 > answered.length;
 
-    return { finding, verdicts, killed, prompt };
+    return { finding, verdicts, killed, prompt, ...(lookupPrompt === undefined ? {} : { lookupPrompt }) };
   });
 
   const outcomes = [
@@ -358,6 +396,14 @@ export async function runSkeptic(
       `unchecked ${unchecked.length}, kept ${outcomes.length - killed}` +
       ` (${roster.length} rounds each, models ${roster.join(", ")})`,
   );
+  const second = outcomes.flatMap((o) => o.verdicts.filter((v) => v.secondLook));
+  if (second.length > 0) {
+    const settled = second.filter((v) => v.verdict !== "insufficient-context").length;
+    log(
+      `skeptic: ${second.length} "could not check" answer${second.length === 1 ? "" : "s"} read again with looked-up code ` +
+        `(PRR_SKEPTIC_LOOKUP); ${settled} now hold or refute`,
+    );
+  }
   const downgraded = outcomes.flatMap((o) => o.verdicts.filter((v) => v.downgraded));
   if (downgraded.length > 0) {
     log(
