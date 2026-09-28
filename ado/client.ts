@@ -6,7 +6,7 @@ import { logVerbose } from "../libs/log";
 import { redactSecrets } from "../libs/redact";
 import type { PrRef } from "../libs/types";
 import { AUTH_SCOPE_HINT, authHeader } from "./auth";
-import { USER_AGENT, dispatcherFor } from "../libs/proxy";
+import { USER_AGENT, dispatcherFor, fetch } from "../libs/proxy";
 
 export class AdoError extends Error {
   constructor(
@@ -214,7 +214,7 @@ async function request(url: string, opts: RequestOpts = {}): Promise<Buffer> {
         signal: ctrl.signal,
         // Node's fetch ignores HTTP(S)_PROXY; the dispatcher is how a proxy gets used at all.
         dispatcher: dispatcherFor(u.toString()),
-      } as RequestInit);
+      });
 
       // A PAT that lacks scope gets a 203 + sign-in HTML page rather than a 401.
       if (res.status === 203) {

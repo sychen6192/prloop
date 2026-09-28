@@ -151,7 +151,7 @@ environment prloop itself starts from.
 
 ## Setup
 
-Needs Node 20+, an OpenAI-compatible endpoint (LiteLLM / vLLM / Ollama `/v1`), and ADO auth —
+Needs Node 22.19+, an OpenAI-compatible endpoint (LiteLLM / vLLM / Ollama `/v1`), and ADO auth —
 either a PAT with **Code (Read & Write) + Work Items (Read)** (the requirement axis reads the
 linked work item, and a Code-only PAT fails there), or just `az login`.
 

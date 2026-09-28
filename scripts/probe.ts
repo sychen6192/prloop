@@ -11,7 +11,7 @@ import { ADO_API_VERSION, ADO_PAT, DOTENV_PATH, PRLOOP_ROOT, entryFor } from "..
 import { describeEntry } from "../libs/configreport";
 import { authHeader, describeAuthMode } from "../ado/auth";
 import { parsePrUrl, prBase } from "../ado/client";
-import { HTTPS_PROXY, HTTP_PROXY, USER_AGENT, bypassesProxy, dispatcherFor, proxySummary, redactProxy } from "../libs/proxy";
+import { HTTPS_PROXY, HTTP_PROXY, USER_AGENT, bypassesProxy, dispatcherFor, fetch, proxySummary, redactProxy } from "../libs/proxy";
 import { commandExists, run } from "../libs/shell";
 import { AZ_BIN } from "../config";
 
@@ -43,7 +43,7 @@ async function rawGet(url: string, header: string): Promise<void> {
       // Without this the request bypasses the proxy entirely and fails with ECONNREFUSED,
       // which looks like a network problem rather than a missing dispatcher.
       dispatcher: dispatcherFor(url),
-    } as RequestInit);
+    });
     const ms = Date.now() - started;
     const ctype = res.headers.get("content-type") ?? "";
     line("HTTP status", `${res.status} ${res.statusText}   (${ms}ms)`);
@@ -544,7 +544,7 @@ async function main() {
       const res = await fetch(url, {
         headers: { Authorization: header, Accept: "application/json", "User-Agent": USER_AGENT },
         dispatcher: dispatcherFor(url),
-      } as RequestInit);
+      });
       const ok = res.ok && (res.headers.get("content-type") ?? "").includes("json");
       console.log(`  api-version=${v.padEnd(4)} → ${res.status} ${res.statusText}${ok ? "  ✅" : ""}`);
       if (ok) working.push(v);

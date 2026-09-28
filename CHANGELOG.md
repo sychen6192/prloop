@@ -199,6 +199,10 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   never saw with `PRR_STRICT_COVERAGE` on) rather than a green `0`.
 - The pipeline, not the model, owns the criteria list, so the requirement axis's denominator
   stops moving between runs.
+- Node 22.19 is the floor (was 20): undici 8 does not load on Node 20, which reached end of
+  life in April 2026. CI runs 22 and 24. Requests now take `fetch` from the same undici as
+  their dispatcher — Node's global fetch is its own bundled undici, and undici 8 rejects the
+  handler an older one hands it.
 
 ### Fixed
 
