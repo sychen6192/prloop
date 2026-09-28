@@ -206,6 +206,14 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **`--since auto` no longer fails a PR for acceptance criteria an earlier push delivered.** The
+  requirement axis judged each incremental run's diff as if it were the whole PR, so a
+  criterion implemented two pushes ago came back "missing", the dispute pass — shown the same
+  partial diff — could not refute it, and the status failed the PR (exit 2) for work it
+  already contained. The axis now reads the whole PR on every run, budgets that diff in the
+  requirement model's tokens, and takes back a "missing" verdict when files were too large
+  to show it (not-verifiable, with the files named). Blobs are cached by content, so the
+  second read fetches only files the push did not touch.
 - **`result.json` is written on every exit path, and says which run it belongs to.** It was
   written in exactly one place, after `runReview` returned, so a throw inside any stage went
   to `main().catch` and left a run directory holding findings and nothing saying the run had

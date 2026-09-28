@@ -3,7 +3,7 @@
 // This axis runs blind to the code axis on purpose: if the model knew the code had no
 // defects it would be tempted to call requirements satisfied, and vice versa. Keeping them
 // independent is what stops one axis from masking the other (PROPOSAL §6.1).
-import { buildDiffPayload } from "../libs/payload";
+import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import type { CriterionRef } from "../libs/criteria";
 import type { FileDiff, PrInfo, WorkItem } from "../libs/types";
 import { neutralizeLine, renderPrDescription, renderWorkItem } from "./untrusted";
@@ -63,7 +63,10 @@ functional or behavioral changes; do not list formatting or import cleanup.
   pipeline keeps the harsher of the two.
 - Answer with the criterion's bracketed id in "criterionId", exactly as listed. Judge EVERY
   listed id, and never invent one — the id resolves back to the work item's own text, so a
-  verdict on an unlisted id is discarded. A concern no criterion covers belongs in extras.`;
+  verdict on an unlisted id is discarded. A concern no criterion covers belongs in extras.
+- The diff is the whole pull request, but it may end with a list of changed files omitted for
+  size. You were not shown their code, so a criterion that could be implemented in one of
+  them is not-verifiable, never missing.`;
 
 export interface RequirementPromptInput {
   pr: PrInfo;
@@ -82,6 +85,9 @@ export interface RequirementPromptInput {
   inheritedFrom?: number[];
   // The items the PR is linked to, for the same framing ("this PR is task #M").
   linkedIds?: number[];
+  // The diff, already budgeted for the model that will read it (gates/requirement.ts). Absent
+  // = packed here against the character ceiling alone.
+  payload?: DiffPayload;
 }
 
 const SPEC_HEADING: Record<string, string> = {
@@ -113,7 +119,7 @@ to deliver.`;
 }
 
 export function buildRequirementPrompt(input: RequirementPromptInput): string {
-  const payload = buildDiffPayload(input.files);
+  const payload = input.payload ?? buildDiffPayload(input.files);
 
   const inherited = new Set(input.inheritedFrom ?? []);
   const linked = (input.linkedIds ?? []).filter((id) => !inherited.has(id));

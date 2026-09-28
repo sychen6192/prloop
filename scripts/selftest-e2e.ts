@@ -359,7 +359,24 @@ try {
     eq("the summary is edited in place, never duplicated", summaryThreads().length, 1);
     eq("...and the resume point moves to push 2", readMarkers(summaryOf()).iteration, 2);
     check("...with the scope stated as incremental", summaryOf().includes("iteration 1 → 2 (incremental)"), summaryOf().slice(0, 400));
-    eq("a status is posted for push 2", ado.matching("POST", /\/statuses$/).length, 1);
+
+    // The requirement axis judges the pull request, not the push. Judged against push 2
+    // alone, both criteria — delivered by push 1 — came back "missing", the dispute pass saw
+    // the same partial diff and let the accusation stand, and the status failed the PR for
+    // work it already contained.
+    const reqPrompt = userPrompt(stageCalls("requirements")[0] ?? ({ body: {} } as RecordedCall));
+    check("the requirement axis is shown the file push 2 left alone", reqPrompt.includes("src/export.ts"), reqPrompt.slice(0, 300));
+    eq("...so both criteria are still implemented", result.req?.criteria.map((c) => c.verdict), ["satisfied", "satisfied"]);
+    eq("...and there is no accusation to dispute", stageCalls("req_dispute").length, 0);
+    check("the summary says so, and on what basis", summaryOf().includes("All 2 acceptance criteria for #4711 are implemented") && summaryOf().includes("Judged against the whole pull request"), summaryOf());
+    const statuses = ado.matching("POST", /\/statuses$/);
+    eq("a status is posted for push 2", statuses.length, 1);
+    eq("...and it passes: the new finding is medium and every criterion is met", statuses[0]?.body?.["state"], "succeeded");
+    eq("the exit code agrees", exitCodeFor(result), 0);
+
+    // The whole-PR read reuses what the incremental one fetched: blobs are content-addressed.
+    const blobGets = ado.matching("GET", /\/blobs\/[0-9a-f]+$/).map((r) => r.path.split("/").pop());
+    eq("no blob is fetched twice in one run", blobGets.length, new Set(blobGets).size);
   }
 
   section("the artifacts a run leaves behind");

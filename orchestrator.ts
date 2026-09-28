@@ -175,7 +175,8 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const started = Date.now();
 
   banner("Step 1/4: fetch PR changes");
-  const ctx = await (opts.intake ?? buildReviewContext)(opts.ref, opts.compareTo);
+  const intake = opts.intake ?? buildReviewContext;
+  const ctx = await intake(opts.ref, opts.compareTo);
 
   // A merged pull request refuses every write, so a review of one buys nothing and costs
   // everything: the README's cron loop kept paying for the finders, the skeptic and triage on
@@ -274,6 +275,14 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // pipeline is all cost and no benefit. On a real run its model call ran 300s past the
   // finders and step 3 sat idle the whole time; with a long timeout that idle window is the
   // full timeout. It runs in the background and is collected just before publishing.
+  //
+  // And it reads the whole pull request, never just this push. Criteria are met by the PR,
+  // and on `--since auto` the context above holds only what changed since the last review:
+  // judged against that, a criterion delivered two pushes ago came back "missing", the
+  // dispute pass saw the same partial diff and could not refute it, and the status failed
+  // the PR for work it already contained. So an incremental run reads the PR a second time,
+  // whole, through the same intake seam. Blobs are content-addressed and cached, so the
+  // second read fetches only the files this push left alone.
   const reqPromise = (
     SKIP_REQUIREMENT
       ? Promise.resolve<Awaited<ReturnType<typeof runRequirementGate>>>({
@@ -284,7 +293,9 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             skipped: "requirement check skipped by config",
           },
         })
-      : runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: ctx.files, fileIndex: ctx.fileIndex, runner: opts.runner })
+      : (ctx.compareTo > 0 ? intake(opts.ref, 0) : Promise.resolve(ctx)).then((whole) =>
+          runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: whole.files, fileIndex: whole.fileIndex, runner: opts.runner }),
+        )
   ).catch((e): Awaited<ReturnType<typeof runRequirementGate>> => {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[FAIL] requirement axis threw: ${msg}`);
@@ -481,6 +492,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   if (reqOut.raw) run.save("requirement-raw.txt", reqOut.raw);
   run.saveJson("requirement.json", req);
 
+  // Anchored against THIS push, although the verdicts were reached on the whole PR: an inline
+  // comment is a claim about the lines under review, and one on code an earlier push wrote
+  // was that push's to make. A verdict whose quote lies outside this push stays in the
+  // summary's table, like every other criterion.
   const reqFindings = toRequirementFindings(req, ctx.fileIndex);
   // Attach the tracking id ADO needs for each thread to survive future pushes.
   for (const f of [...agg.inline, ...reqFindings]) {

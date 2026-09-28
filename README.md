@@ -225,6 +225,9 @@ found it never ran) · `1` fatal.
 
 `--since auto` reads the last reviewed iteration back out of prloop's own summary comment —
 state lives on the PR, so a pipeline agent, your laptop and a cron box need no shared disk.
+Only the code axis narrows to the new push: acceptance criteria are met by the pull request as
+a whole, so the requirement axis reads the whole PR on every run (an incremental run fetches
+the files the push left alone as well) and comments inline only on lines the push changed.
 
 **A run that did not review the push does not move that resume point.** If the finder stage
 crashed, every finder failed, the skeptic stage crashed, the requirement axis errored, or a

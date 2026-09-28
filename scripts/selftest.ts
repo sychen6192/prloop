@@ -86,6 +86,7 @@ import { coverageGaps } from "../orchestrator";
 import {
   applyReqSkepticVerdicts,
   resolveDisputeVerdicts,
+  demoteUnseenMissing,
   resolveJudgments,
   toRequirementFindings,
   unmetCriteria,
@@ -3168,6 +3169,26 @@ section("requirement axis: a satisfied verdict must anchor its evidence");
   eq("a quote in a file outside the change demotes", cs[3]!.verdict, "not-verifiable");
   eq("other verdicts are not touched", cs[4]!.verdict, "missing");
   eq("...nor their notes", cs[4]!.note, "no audit call");
+}
+
+section("requirement axis: \"missing\" is only a finding about a diff read in full");
+{
+  // With files left out for size, the implementation may be in one of them, and a "missing"
+  // that fails the status would rest on code nobody looked at.
+  const mk = (verdict: CriterionCheck["verdict"]): CriterionCheck =>
+    ({ workItemId: 1, criterion: "exports a CSV", verdict, note: "n" });
+  const cs = [mk("missing"), mk("partial"), mk("misunderstood"), mk("satisfied"), mk("not-this-pr")];
+  eq("nothing changes when every file was shown", demoteUnseenMissing(cs, []), 0);
+  eq("...not even the accusation", cs[0]!.verdict, "missing");
+  const omitted = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts", "src/e.ts", "src/f.ts"];
+  eq("with files omitted, only \"missing\" is taken back", demoteUnseenMissing(cs, omitted), 1);
+  eq("...to not-verifiable, out of the unmet count", cs[0]!.verdict, "not-verifiable");
+  check("...naming the files, capped, and keeping the model's note",
+    cs[0]!.note.includes("6 changed files were too large to show (src/a.ts, src/b.ts, src/c.ts, src/d.ts, src/e.ts and 1 more)") &&
+      cs[0]!.note.endsWith("original note: n"), cs[0]!.note);
+  eq("\"partial\" and \"misunderstood\" point at code that was shown, so they stand",
+    cs.slice(1, 3).map((c) => c.verdict), ["partial", "misunderstood"]);
+  eq("...and the rest are untouched", cs.slice(3).map((c) => c.verdict), ["satisfied", "not-this-pr"]);
 }
 
 section("requirement scope: a criterion this PR never owed is not a failure");

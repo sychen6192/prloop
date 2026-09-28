@@ -10,7 +10,7 @@ import { anchorFinding } from "../anchoring/locate";
 import { extractCriteria, type CriterionRef } from "../libs/criteria";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { parseJsonObject } from "../libs/json";
-import { buildDiffPayload } from "../libs/payload";
+import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
 import { parseVerdict, type Verdict } from "./skeptic";
 import { REQ_DISPUTE_SCHEMA } from "../models/schemas";
@@ -32,6 +32,10 @@ import { REQUIREMENT_SCHEMA } from "../models/schemas";
 import { REQUIREMENT_SYSTEM, buildRequirementPrompt } from "../prompts/requirement";
 
 const VALID_VERDICT = new Set<string>(REQ_VERDICTS);
+
+// Stands in for the diff while measuring everything around it, so the real one can be packed
+// against what is left of the model's context window.
+const NO_DIFF: DiffPayload = { text: "", includedFiles: [], omittedFiles: [] };
 
 /**
  * How damning each verdict is, harshest first. Used only to settle a model that answered
@@ -123,6 +127,9 @@ function validateExtra(v: unknown): ExtraChange | undefined {
 export interface RequirementGateInput {
   ref: PrRef;
   pr: PrInfo;
+  // The WHOLE pull request, never one push of it: criteria are met by the PR, and a criterion
+  // delivered two pushes ago is not missing because this push left it alone. The orchestrator
+  // hands an incremental run the whole-PR intake for exactly that reason.
   files: FileDiff[];
   // Anchors the evidence quote behind every "satisfied" verdict (verifySatisfiedEvidence).
   fileIndex: FileIndex;
@@ -166,7 +173,7 @@ export async function runRequirementGate(
   // The unit of judgment is fixed HERE, before any model runs: same work items → same
   // criterion list → same denominator every run (see libs/criteria.ts for why).
   const refs = withSpec.flatMap(extractCriteria);
-  const prompt = buildRequirementPrompt({
+  const promptInput = {
     pr: input.pr,
     workItems: withSpec,
     files: input.files,
@@ -178,7 +185,16 @@ export async function runRequirementGate(
     // which work item is the parent and which one the PR is actually linked to.
     inheritedFrom: linked.inheritedFrom,
     linkedIds: linked.items.map((w) => w.id),
+  };
+  // Budgeted in the requirement model's tokens, like a finder's diff, and not in characters
+  // alone: this axis reads the whole pull request on every run, so it is the one request
+  // most likely to outgrow a context window — and a backend that truncates a prompt silently
+  // turns "shown the implementation" into "the implementation is missing".
+  const payload = buildDiffPayload(input.files, undefined, undefined, {
+    model: REQ_MODEL,
+    fixed: `${REQUIREMENT_SYSTEM}\n${JSON.stringify(REQUIREMENT_SCHEMA)}\n${buildRequirementPrompt({ ...promptInput, payload: NO_DIFF })}`,
   });
+  const prompt = buildRequirementPrompt({ ...promptInput, payload });
   const res = await input.runner.chat({
     model: REQ_MODEL,
     system: REQUIREMENT_SYSTEM,
@@ -235,6 +251,13 @@ export async function runRequirementGate(
     // most significant first, so slicing keeps the ranked head.
     .slice(0, MAX_EXTRAS);
 
+  const unseen = demoteUnseenMissing(criteria, payload.omittedFiles);
+  if (unseen > 0) {
+    log(
+      `requirement axis: ${unseen} missing verdicts demoted → not-verifiable ` +
+        `(${payload.omittedFiles.length} changed files were too large to show the model)`,
+    );
+  }
   await disputeAccusations(input, criteria);
   const demoted = verifySatisfiedEvidence(criteria, input.fileIndex);
   if (demoted > 0) {
@@ -278,14 +301,16 @@ async function disputeAccusations(input: RequirementGateInput, criteria: Criteri
   );
   if (accused.length === 0) return;
 
-  const payload = buildDiffPayload(input.files).text;
+  const challenges = accused.map((c, i) => ({ id: disputeId(c, i), criterion: c.criterion, verdict: c.verdict, note: c.note }));
+  // Budgeted for the model that reads it, which is not the model that made the accusations.
+  const payload = buildDiffPayload(input.files, undefined, undefined, {
+    model,
+    fixed: `${REQ_SKEPTIC_SYSTEM}\n${JSON.stringify(REQ_DISPUTE_SCHEMA)}\n${buildReqDisputePrompt(challenges, "")}`,
+  }).text;
   const res = await input.runner.chat({
     model,
     system: REQ_SKEPTIC_SYSTEM,
-    user: buildReqDisputePrompt(
-      accused.map((c, i) => ({ id: disputeId(c, i), criterion: c.criterion, verdict: c.verdict, note: c.note })),
-      payload,
-    ),
+    user: buildReqDisputePrompt(challenges, payload),
     schema: REQ_DISPUTE_SCHEMA,
     schemaName: "req_dispute",
     temperature: 0,
@@ -379,6 +404,30 @@ export function applyReqSkepticVerdicts(accused: CriterionCheck[], verdicts: Ver
     disputed++;
   }
   return disputed;
+}
+
+/**
+ * Takes "missing" back when the model was not shown the whole diff, in place. Returns how
+ * many. Exported for the selftest.
+ *
+ * "missing" is the claim that nothing in the pull request implements a criterion, and it is
+ * only a finding about a diff the model has read in full. With files left out for size the
+ * implementation may be sitting in one of them, and the accusation — which fails the status
+ * and the exit code — would rest on code nobody looked at. Demoted rather than dropped, the
+ * same way the dispute pass takes an accusation back: out of the unmet count, still visible.
+ * "partial" and "misunderstood" stand, because both point at code the model was shown.
+ */
+export function demoteUnseenMissing(criteria: CriterionCheck[], omitted: readonly string[]): number {
+  if (omitted.length === 0) return 0;
+  const names = omitted.slice(0, 5).join(", ") + (omitted.length > 5 ? ` and ${omitted.length - 5} more` : "");
+  let demoted = 0;
+  for (const c of criteria) {
+    if (c.verdict !== "missing") continue;
+    c.verdict = "not-verifiable";
+    c.note = `not judged against the whole change: ${omitted.length} changed files were too large to show (${names})${c.note ? ` — original note: ${c.note}` : ""}`;
+    demoted++;
+  }
+  return demoted;
 }
 
 export const UNVERIFIED_SATISFIED_NOTE = "claimed satisfied, but the evidence quote was not found in the diff";

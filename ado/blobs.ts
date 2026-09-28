@@ -23,8 +23,35 @@ function looksBinary(buf: Buffer): boolean {
   return false;
 }
 
+// Blobs are content-addressed, so a cached one can never be stale. The cache exists for the
+// requirement axis: an incremental review reads the pull request twice, this push for the
+// code axis and the whole PR for the requirement axis, and every file the push touched has
+// the same new blob in both. Bounded by bytes because a --batch process reviews PR after PR,
+// and oldest-first because a later PR shares least with the earliest.
+const CACHE_MAX_BYTES = 64_000_000;
+const cache = new Map<string, BlobContent>();
+let cachedBytes = 0;
+
+function remember(key: string, blob: BlobContent): BlobContent {
+  cache.set(key, blob);
+  cachedBytes += blob.bytes;
+  for (const [k, v] of cache) {
+    if (cachedBytes <= CACHE_MAX_BYTES) break;
+    cache.delete(k);
+    cachedBytes -= v.bytes;
+  }
+  return blob;
+}
+
 export async function getBlob(ref: PrRef, objectId: string | undefined): Promise<BlobContent> {
   if (!objectId) return EMPTY;
+  const key = `${ref.baseUrl}|${ref.project}|${ref.repoId}|${objectId}`;
+  const hit = cache.get(key);
+  if (hit) return hit;
+  return remember(key, await fetchBlob(ref, objectId));
+}
+
+async function fetchBlob(ref: PrRef, objectId: string): Promise<BlobContent> {
   let buf: Buffer;
   try {
     buf = await adoGetBytes(`${repoBase(ref)}/blobs/${objectId}`, {

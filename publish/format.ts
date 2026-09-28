@@ -153,7 +153,7 @@ const REQ_LABEL: Record<ReqVerdict, string> = {
 // The requirement axis gets its own block above the code axis, with its own verdict.
 // Deliberately not merged into the findings table: a shared ranking lets code findings
 // bury "this requirement was never implemented" (PROPOSAL §6.1).
-function renderRequirementSection(req: RequirementResult | undefined): string[] {
+function renderRequirementSection(req: RequirementResult | undefined, incremental: boolean): string[] {
   const lines: string[] = ["### 📋 Requirement check", ""];
 
   if (!req || req.skipped) {
@@ -194,6 +194,9 @@ function renderRequirementSection(req: RequirementResult | undefined): string[] 
         `and ${scoped.length === 1 ? "was" : "were"} not counted against this change._`,
     );
   }
+  // Said on incremental runs because the scope line above names one push, and a reader
+  // would otherwise take "all implemented" as a claim about that push alone.
+  if (incremental) lines.push("", "_Judged against the whole pull request, not only this push._");
   lines.push("", "| Status | Acceptance criterion | Note |", "| --- | --- | --- |");
   for (const c of req.criteria) {
     const loc = c.file ? ` (\`${c.file}\`)` : "";
@@ -295,7 +298,7 @@ export function renderSummary(input: SummaryInput): string {
 
   lines.push(...renderThreadStatus(input));
 
-  lines.push(...renderRequirementSection(input.req));
+  lines.push(...renderRequirementSection(input.req, ctx.compareTo > 0));
 
   lines.push("### 🔍 Code check", "");
 
