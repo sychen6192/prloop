@@ -9,7 +9,7 @@
 // State lives in the PR itself (a marker inside our own summary comment), not on disk:
 // the tool is meant to be runnable from a pipeline agent, a laptop, or a cron box without
 // them sharing a filesystem.
-import { readMarkers } from "./markers";
+import { readMarkers, spanMark, type SpanMark } from "./markers";
 import { neutralizeLine } from "../prompts/untrusted";
 import { isSelfIdentity, selfIdentityId } from "../ado/identity";
 import { listThreads, setThreadStatus, type Thread, type ThreadComment } from "../ado/threads";
@@ -172,12 +172,54 @@ export interface StaleThread {
 }
 
 /**
+ * Where the code a comment was about sits in `lines` now: the start line of the matching
+ * window nearest `near`, or undefined when that code is nowhere in the file. Exported for
+ * publish.ts, which relocates threads the same way for position dedupe.
+ */
+export function locateSpan(lines: readonly string[], span: SpanMark, near: number): number | undefined {
+  let best: number | undefined;
+  for (const start of windowsOf(lines, span.lines).get(span.hash) ?? []) {
+    if (best === undefined || Math.abs(start - near) < Math.abs(best - near)) best = start;
+  }
+  return best;
+}
+
+// Every window of a file hashed once per window length and kept for as long as the file's
+// lines are: a PR with fifty open threads in one large file would otherwise hash the whole
+// file fifty times over.
+const windowCache = new WeakMap<readonly string[], Map<number, Map<string, number[]>>>();
+
+function windowsOf(lines: readonly string[], size: number): Map<string, number[]> {
+  let bySize = windowCache.get(lines);
+  if (!bySize) windowCache.set(lines, (bySize = new Map()));
+  let windows = bySize.get(size);
+  if (!windows) {
+    windows = new Map();
+    for (let start = 1; start + size - 1 <= lines.length; start++) {
+      const hash = spanMark(lines.slice(start - 1, start - 1 + size)).hash;
+      const at = windows.get(hash);
+      if (at) at.push(start);
+      else windows.set(hash, [start]);
+    }
+    bySize.set(size, windows);
+  }
+  return windows;
+}
+
+/**
  * Threads of ours whose anchored code no longer exists in the current iteration.
  *
  * The test is deliberately narrow: the thread must be one of ours, still active, anchored
- * to a file we have in hand, and the line it points at must no longer contain what it
- * originally flagged. Anything less certain is left alone — wrongly resolving a live issue
- * is worse than leaving a stale thread for a human to close.
+ * to a file we have in hand, and what it originally flagged must be gone from that file.
+ * Anything less certain is left alone — wrongly resolving a live issue is worse than leaving
+ * a stale thread for a human to close.
+ *
+ * "Gone" is decided by content wherever the comment recorded its code (the span marker): the
+ * flagged lines appear nowhere in the file now. It used to be decided by position alone — the
+ * line the thread was posted on now past the end of the file — which closed a live thread as
+ * fixed when lines were deleted above it, and left a fixed one open whenever the file had not
+ * shrunk. A comment from before the marker still gets the position test; nothing better is
+ * known about it.
  */
 export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThread[] {
   const stale: StaleThread[] = [];
@@ -203,16 +245,20 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
     if (!fd) continue;
 
     const line = ctx.rightFileStart.line;
-    // ADO re-anchors tracked threads onto each new iteration. If the tracked line now sits
-    // outside the file, or the line is no longer one this PR touches while the file itself
-    // was rewritten, the original code is gone.
-    if (line > fd.rightLines.length) {
-      const m = readMarkers(first.content);
+    const m = readMarkers(first.content);
+    const reason = m.span
+      ? locateSpan(fd.rightLines, m.span, line) === undefined
+        ? "the code it flagged is no longer in the file"
+        : undefined
+      : line > fd.rightLines.length
+        ? "line is past the end of the file"
+        : undefined;
+    if (reason !== undefined) {
       stale.push({
         threadId: t.id,
         file: ctx.filePath,
         line,
-        reason: "line is past the end of the file",
+        reason,
         // Carried so the close can be recorded as an outcome. Absent on threads a version
         // before the marker protocol wrote; those still close, they are just not counted.
         ...(m.fingerprint ? { fingerprint: m.fingerprint } : {}),

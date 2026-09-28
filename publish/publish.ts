@@ -12,8 +12,8 @@ import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
 import { recordOutcomes } from "../libs/outcomes";
 import { log } from "../libs/log";
-import { collectDismissals, collectOutcomes, findStaleThreads, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
-import { iterationMarker, readMarkers } from "./markers";
+import { collectDismissals, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
+import { iterationMarker, readMarkers, spanMark, type SpanMark } from "./markers";
 import type { AnchoredFinding, PrRef } from "../libs/types";
 import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
@@ -123,19 +123,39 @@ export function postedPositions(threads: Thread[], index: FileIndex): PostedPosi
     if (!ctx?.filePath || !ctx.rightFileStart?.line) continue;
     const ourComment = t.comments?.find((c) => !c.isDeleted && readMarkers(c.content).ours);
     if (!ourComment) continue;
-    const cat = readMarkers(ourComment.content).category;
+    const m = readMarkers(ourComment.content);
+    // Thread paths come back from ADO in its own shape and may cite a pre-rename path;
+    // resolve through the index so a thread on the old name still occupies the renamed
+    // file's lines. A thread on a file outside this iteration keeps its normalized path
+    // — it cannot collide with a finding, which is always on a changed file.
+    const fd = index.resolvePrior(ctx.filePath);
+    let start = ctx.rightFileStart.line;
+    let end = ctx.rightFileEnd?.line ?? start;
+    // Where its code is NOW, when the comment recorded it: the posted line is where that code
+    // was, and code moves. Code that is gone occupies nothing — a finding on the new code
+    // there is a new finding, not this one again.
+    if (m.span && fd) {
+      const at = locateSpan(fd.rightLines, m.span, start);
+      if (at === undefined) continue;
+      start = at;
+      end = at + m.span.lines - 1;
+    }
     out.push({
-      // Thread paths come back from ADO in its own shape and may cite a pre-rename path;
-      // resolve through the index so a thread on the old name still occupies the renamed
-      // file's lines. A thread on a file outside this iteration keeps its normalized path
-      // — it cannot collide with a finding, which is always on a changed file.
-      file: index.resolvePrior(ctx.filePath)?.path ?? normalizePath(ctx.filePath),
-      start: ctx.rightFileStart.line,
-      end: ctx.rightFileEnd?.line ?? ctx.rightFileStart.line,
-      ...(cat ? { axis: axisOf(cat) } : {}),
+      file: fd?.path ?? normalizePath(ctx.filePath),
+      start,
+      end,
+      ...(m.category ? { axis: axisOf(m.category) } : {}),
     });
   }
   return out;
+}
+
+/** The span mark of the lines a right-side finding is anchored to, for its comment. */
+function spanOf(f: AnchoredFinding, index: FileIndex): SpanMark | undefined {
+  const a = f.anchor;
+  if (!a || a.side !== "right") return undefined;
+  const lines = index.exact(f.file)?.rightLines.slice(a.startLine - 1, a.endLine) ?? [];
+  return lines.length > 0 ? spanMark(lines) : undefined;
 }
 
 /**
@@ -346,7 +366,7 @@ export async function publish(
     }
     try {
       await createThread(ref, {
-        content: renderFindingComment(f),
+        content: renderFindingComment(f, spanOf(f, ctx.fileIndex)),
         status: "active",
         filePath: f.file,
         anchor: f.anchor,

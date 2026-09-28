@@ -387,6 +387,63 @@ try {
     eq("...setting it to fixed, not deleting it", patched[0]?.body?.["status"], "fixed");
   }
 
+  section("a comment's code is found by what it says, not by the line it was posted on");
+  {
+    // Written out literally, like every fixture here: sha1 of the flagged lines, each with
+    // its whitespace collapsed and trimmed, joined by newlines — the wire format, not the
+    // writer's opinion of it.
+    const { createHash } = await import("node:crypto");
+    const hashOf = (...lines: string[]) =>
+      createHash("sha1").update(lines.map((l) => l.replace(/\s+/g, " ").trim()).join("\n")).digest("hex").slice(0, 12);
+    eq(
+      "the span marker's bytes",
+      findingMarkers({ fingerprint: "c848ab6f5911", category: "correctness" }, { lines: 1, hash: hashOf("  charge(total);") }),
+      `<!-- prloop --><!-- prloop:fp=c848ab6f5911 --><!-- prloop:cat=correctness --><!-- prloop:span=1.${hashOf("  charge(total);")} -->`,
+    );
+    eq("...read back", readMarkers(`${BOT_MARKER}<!-- prloop:fp=c848ab6f5911 --><!-- prloop:span=2.${hashOf("a", "b")} -->\nx`).span, { lines: 2, hash: hashOf("a", "b") });
+    eq("...never from quoted text", readMarkers(`${BOT_MARKER}<!-- prloop:fp=c848ab6f5911 -->\nThe claim.\n<!-- prloop:span=2.${hashOf("a", "b")} -->`).span, undefined);
+
+    // The file as it is now: three lines were inserted at the top, and the rest moved.
+    const now = [
+      "import { charge, refund } from './pay';", // 1
+      "// one",                                    // 2
+      "// two",                                    // 3
+      "// three",                                  // 4
+      "function pay(total) {",                     // 5
+      "  charge(total);",                          // 6  (was line 3)
+      "  audit(total);",                           // 7
+      "  refund(total);",                          // 8  (was line 60 of a longer file)
+      "}",                                         // 9
+      "export { pay };",                           // 10
+    ];
+    const payNow: FileDiff = { ...mkFile("src/pay.ts", now.length), rightLines: now };
+    const movedCtx = { ...ctx, files: [payNow], fileIndex: new FileIndex([payNow]) } as ReviewContext;
+    const spanned = (id: number, line: number, fp: string, ...code: string[]): FakeThread => ({
+      id,
+      status: "active",
+      comments: [{ id: id + 1, content: `${BOT_MARKER}<!-- prloop:fp=${fp} --><!-- prloop:cat=correctness --><!-- prloop:span=${code.length}.${hashOf(...code)} -->\nclaim` }],
+      threadContext: { filePath: "/src/pay.ts", rightFileStart: { line }, rightFileEnd: { line: line + code.length - 1 } },
+    });
+    setState({
+      threads: [
+        spanned(4400, 3, "aaaa11110001", "  charge(total);"), // moved down: 3 → 6
+        spanned(4410, 60, "aaaa11110002", "  refund(total);"), // moved up, past the old end of file
+        spanned(4420, 7, "aaaa11110003", "  retry(forever);"), // fixed: gone from the file
+      ],
+    });
+    // A new finding on line 3 — code that now sits where the first thread was posted.
+    const onLine3 = finding({ fingerprint: "bbbb22220001", file: "src/pay.ts", quote: "// two", claim: "A stale comment.", anchor: { side: "right", startLine: 3, endLine: 3, startOffset: 1, endOffset: 7 } });
+    const { value: result } = await capture(() => publish(ref, { requirement: [], code: [onLine3] }, summaryInput({ ctx: movedCtx })));
+
+    eq("a finding where a moved comment used to be is posted, not taken for that comment", result.posted.map((f) => f.fingerprint), ["bbbb22220001"]);
+    const closed = ado.matching("PATCH", /\/threads\/44\d0$/).map((r) => r.path.split("/").pop());
+    check("a comment whose code moved above the old end of the file stays open", !closed.includes("4410"), closed.join(","));
+    check("...and so does the one whose code moved down", !closed.includes("4400"), closed.join(","));
+    eq("the one whose code is gone is closed, wherever the file ends", closed, ["4420"]);
+    const posted = contentOf(threadPosts().find((r) => r.body?.["threadContext"] !== undefined) ?? {});
+    check("a new comment records the code it is about", posted.includes(`<!-- prloop:span=1.${hashOf("// two")} -->`), posted.slice(0, 200));
+  }
+
   section("PR status: either axis can fail the check, and the reason says which");
   {
     // A single "3 issues" status would hide that the real problem is an unimplemented

@@ -224,6 +224,15 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   change with no code (docs, config, only deletions) still runs the requirement axis, and the
   summary and status say no code was reviewed instead of "no issues found". A changed file of
   a type prloop does not know is named in the summary rather than dropped silently.
+- **prloop's comments follow their code, not the line they were posted on.** Stale-thread
+  auto-close read "the posted line is now past the end of the file" as "the code is gone", so
+  deleting lines above a comment closed a live thread as fixed — and a fixed one stayed open
+  whenever the file had not shrunk; position dedupe likewise let a comment whose code had
+  moved down swallow a new finding on whatever code landed at its old line. Each new comment
+  now records the lines it was about (a `span` marker: line count and a hash), and both
+  checks find that code by content in the current file. Older comments keep the old rule.
+  ADO's `$iteration` position tracking is not used: what it returns for deleted code is
+  undocumented, and the content check does not need it.
 - **The diff every model reads carries git's `a/` and `b/` prefixes.** The header was written
   as `--- a${path}` for slash-prefixed paths; intake strips that slash, so every prompt read
   `--- asrc/pay.ts`. A model that copied the header into a finding's `file` was then resolved

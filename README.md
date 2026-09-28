@@ -345,7 +345,11 @@ npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
   tracks their position across new commits.
 - **No duplicates on re-run** — each comment embeds a finding fingerprint.
 - **Stale threads auto-close** when their target code is gone. The criteria are narrow on
-  purpose: wrongly closing a live issue is worse than leaving a stale comment.
+  purpose: wrongly closing a live issue is worse than leaving a stale comment. Each comment
+  records a hash of the lines it was about, and "gone" means those lines appear nowhere in
+  the file now — so code that merely moved keeps its comment open, and a comment's position
+  for dedupe is where its code is now, not where it was posted. (Comments from before that
+  marker close only when their line is past the end of the file.)
 - **The summary says what became of the last run's comments** — how many this run closed
   because the code under them changed (dated from the `--since auto` resume point, which is
   what made them stale), how many a reviewer marked fixed, how many were dismissed, and how

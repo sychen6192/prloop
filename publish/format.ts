@@ -1,7 +1,7 @@
 // Comment rendering. Every comment carries hidden markers so re-runs can recognise their
 // own threads: the bot marker identifies authorship, the fingerprint identifies the issue.
 import { MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "../config";
-import { defuseHtmlComments, findingMarkers, summaryMarkers } from "./markers";
+import { defuseHtmlComments, findingMarkers, summaryMarkers, type SpanMark } from "./markers";
 import { UNKNOWN_FILE_TYPE, detectLanguage } from "../libs/lang";
 import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
@@ -62,7 +62,7 @@ function codeFence(code: string): string {
   return "`".repeat(Math.max(3, longest + 1));
 }
 
-export function renderFindingComment(f: AnchoredFinding): string {
+export function renderFindingComment(f: AnchoredFinding, span?: SpanMark): string {
   const parts: string[] = [
     `**${SEVERITY_LABEL[f.severity] ?? f.severity}** · ${CATEGORY_LABEL[f.category] ?? f.category}`,
     "",
@@ -112,7 +112,7 @@ export function renderFindingComment(f: AnchoredFinding): string {
   // comment carries the model's claim, evidence and fix verbatim — text that quotes
   // configuration and error output as readily as the summary's run notes do.
   return redactSecrets(
-    [findingMarkers(f), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n"),
+    [findingMarkers(f, span), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n"),
   );
 }
 

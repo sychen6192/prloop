@@ -16,6 +16,7 @@
 //
 // The bytes are a wire format already sitting on live PRs. Order and spacing are fixed:
 // changing them orphans every thread a previous run left behind.
+import { createHash } from "node:crypto";
 import { FINDING_CATEGORIES, type FindingCategory } from "../config";
 
 /** Identifies authorship. On every comment prloop writes, first thing in the body. */
@@ -28,6 +29,7 @@ export const SUMMARY_MARKER = "<!-- prloop:summary -->";
 // conservative answer at every call site.
 const FP_RE = /<!-- prloop:fp=([^\s>]+) -->/g;
 const CAT_RE = /<!-- prloop:cat=([^\s>]+) -->/;
+const SPAN_RE = /<!-- prloop:span=(\d+)\.([0-9a-f]{12}) -->/;
 const ITERATION_RE = /<!-- prloop:iteration=(\d+) -->/;
 // One source, two compilations: the strip below has to match the read above byte for byte,
 // and two hand-written copies of a marker pattern is the exact drift this module was
@@ -43,9 +45,38 @@ const FP_SHAPE = /^[0-9a-f]{6,64}$/;
 
 const CATEGORIES: ReadonlySet<string> = new Set(FINDING_CATEGORIES);
 
-/** Markers for an inline finding comment: authorship, issue identity, category. */
-export function findingMarkers(f: { fingerprint: string; category: string }): string {
-  return `${BOT_MARKER}<!-- prloop:fp=${f.fingerprint} --><!-- prloop:cat=${f.category} -->`;
+/**
+ * The code a comment was about: how many lines, and a hash of their text. What lets a later
+ * run find that code again by CONTENT, wherever it has moved, instead of trusting the line
+ * number the thread was posted on.
+ *
+ * Positions alone were wrong both ways. Lines inserted above a comment moved its code down,
+ * and the old position then "covered" whatever new code landed there, suppressing a real
+ * finding; lines deleted above it could put the old position past the end of the file,
+ * which read as "the code is gone" and closed a live thread as fixed. ADO can track a
+ * thread's position to a later iteration, but what it returns for code that was deleted is
+ * undocumented, and this does not need it.
+ */
+export interface SpanMark {
+  lines: number;
+  hash: string;
+}
+
+/**
+ * The span mark of some lines. Whitespace inside a line is collapsed and each line trimmed,
+ * so a re-indent or a reformat is the same code, while any change to a token is not.
+ */
+export function spanMark(lines: readonly string[]): SpanMark {
+  const text = lines.map((l) => l.replace(/\s+/g, " ").trim()).join("\n");
+  return { lines: lines.length, hash: createHash("sha1").update(text).digest("hex").slice(0, 12) };
+}
+
+/** Markers for an inline finding comment: authorship, issue identity, category, the code. */
+export function findingMarkers(f: { fingerprint: string; category: string }, span?: SpanMark): string {
+  return (
+    `${BOT_MARKER}<!-- prloop:fp=${f.fingerprint} --><!-- prloop:cat=${f.category} -->` +
+    (span ? `<!-- prloop:span=${span.lines}.${span.hash} -->` : "")
+  );
 }
 
 /** Markers for the sticky summary comment. */
@@ -118,6 +149,8 @@ export interface CommentMarkers {
   fingerprints: string[];
   /** Absent when the marker is missing OR names a category this build does not know. */
   category?: FindingCategory;
+  /** The code the comment was about; absent on comments written before the marker. */
+  span?: SpanMark;
   /** The iteration recorded by the run that wrote this comment. */
   iteration?: number;
   /** A run that had this PR in hand when it wrote this comment (publish/lease.ts). */
@@ -168,6 +201,7 @@ export function readMarkers(body: string | undefined): CommentMarkers {
     if (fp && FP_SHAPE.test(fp)) fingerprints.push(fp);
   }
   const cat = CAT_RE.exec(head)?.[1];
+  const span = SPAN_RE.exec(head);
   const tail = TRAILING_MARKERS.exec(body)?.[0] ?? "";
   const iter = ITERATION_RE.exec(tail)?.[1];
   const run = RUN_RE.exec(tail);
@@ -177,6 +211,7 @@ export function readMarkers(body: string | undefined): CommentMarkers {
     ...(fingerprints[0] === undefined ? {} : { fingerprint: fingerprints[0] }),
     fingerprints,
     ...(cat !== undefined && CATEGORIES.has(cat) ? { category: cat as FindingCategory } : {}),
+    ...(span?.[1] === undefined || span[2] === undefined || Number(span[1]) < 1 ? {} : { span: { lines: Number(span[1]), hash: span[2] } }),
     ...(iter === undefined ? {} : { iteration: Number(iter) }),
     ...(run?.[1] === undefined || run[2] === undefined ? {} : { run: { startedAt: Number(run[1]), id: run[2] } }),
   };

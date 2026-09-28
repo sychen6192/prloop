@@ -363,6 +363,15 @@ try {
     eq("the finding both runs made is not posted again", ado.state.threads.length - threadsBefore, 1);
     eq("...and is reported as already commented", result.publishResult?.alreadyPosted.map((f) => f.anchor?.startLine), [5]);
 
+    // Push 2 fixed the refund bug. The comment records the code it was about, and that code
+    // is gone; the retry comment's code is still there, one push later and unchanged.
+    const statusOf = (claim: string) =>
+      ado.state.threads.find((t) => t.comments?.some((c) => (c.content ?? "").includes(claim)))?.status;
+    eq("the comment on the fixed refund bug is closed", statusOf("adds the fee"), "fixed");
+    eq("...the one on code still there stays open", statusOf("ends the retry loop"), "active");
+    eq("...and the run counts it", result.publishResult?.resolved, 1);
+    check("...and says so in the summary", summaryOf().includes("**1** closed by this run"), summaryOf());
+
     eq("the summary is edited in place, never duplicated", summaryThreads().length, 1);
     eq("...and the resume point moves to push 2", readMarkers(summaryOf()).iteration, 2);
     check("...with the scope stated as incremental", summaryOf().includes("iteration 1 → 2 (incremental)"), summaryOf().slice(0, 400));
