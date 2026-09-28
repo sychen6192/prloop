@@ -102,7 +102,10 @@ do the filtering:
    or a majority of the skeptics that answered actively **cleared** it. An even split clears
    nothing, and neither does a verdict of `insufficient-context`. A lone unverified finding
    stays in the summary. Each finder reads the same files in its own seeded order, so
-   agreement on a finding is not agreement on where it sat in the prompt.
+   agreement on a finding is not agreement on where it sat in the prompt. Two finders agree
+   only when they say the same thing — the same quoted code classified as the same kind of
+   problem, or claims worded alike — never merely because they pointed at the same lines: two
+   different claims about one line stay two findings, each verified and gated on its own.
 
 A fourth filter answers to the team rather than to the models: categories this repo does not
 want (`PRR_EXCLUDE_CATEGORIES`) and findings a reviewer already closed as *wontFix* never

@@ -2348,13 +2348,17 @@ section("aggregate: overlap is not agreement");
     ],
     idx,
   );
-  eq("overlapping but disagreeing findings still dedupe to one", busy.merged.length, 1);
-  eq("...with a single source", busy.merged[0]?.sources, ["a"]);
-  eq("...and the other model recorded as overlapping, not corroborating", busy.merged[0]?.overlapping, ["b"]);
+  // And then the second claim was folded into the first and never reported at all. Two
+  // claims about one line are two findings: each is verified, gated and posted on its own.
+  eq("overlapping findings with different claims stay two findings", busy.merged.length, 2);
+  eq("...each with only its own source", busy.merged.map((f) => f.sources), [["a"], ["b"]]);
+  eq("...each naming the other as overlapping, not corroborating", busy.merged.map((f) => f.overlapping), [["b"], ["a"]]);
+  check("...and each keeping its own claim", busy.merged.some((f) => f.claim.includes("races")) && busy.merged.some((f) => f.claim.includes("unused")));
   check("the comment names the overlap without counting it",
     renderFindingComment(busy.merged[0]!).includes("b flagged these lines with a different claim"));
 
-  // Two tight spans sharing a changed line: both models pointed at the same new code.
+  // Two tight spans sharing a changed line used to agree by position alone. Pointing at the
+  // same new code is not saying the same thing about it.
   const tight = anchorAndDedupe(
     [
       out("a", "    counter += it.n;\n    total += it.n;", "counter is not atomic"),
@@ -2362,7 +2366,25 @@ section("aggregate: overlap is not agreement");
     ],
     idx,
   );
-  eq("two spans of three lines or fewer overlapping on a changed line agree", tight.merged[0]?.sources.length, 2);
+  eq("tight spans on a changed line with different claims are two findings", tight.merged.map((f) => f.sources.length), [1, 1]);
+
+  // The motivating case, whole: the same quoted line, a low "unused variable" and a critical
+  // "SQL injection". It became ONE critical "unused variable" credited to both models, and
+  // the injection claim was gone.
+  const sqlLines = ["function find(db, name) {", "  const q = \"SELECT * FROM users WHERE name = '\" + name + \"'\";", "  return db.query(q);", "}"];
+  const sqlFile = mkFile("/src/find.ts", sqlLines, [1, 2, 3, 4]);
+  const both = anchorAndDedupe(
+    [
+      { model: "a", rejected: 0, raw: "", findings: [mkFinding({ file: "/src/find.ts", quote: sqlLines[1]!, category: "leftover-code", severity: "low", claim: "unused variable q is assigned and never read" })] },
+      { model: "b", rejected: 0, raw: "", findings: [mkFinding({ file: "/src/find.ts", quote: sqlLines[1]!, category: "security", severity: "critical", claim: "SQL injection: name is concatenated into the query" })] },
+    ],
+    new FileIndex([sqlFile]),
+  );
+  const injection = both.merged.find((f) => f.category === "security");
+  eq("the injection survives as its own finding", injection?.claim, "SQL injection: name is concatenated into the query");
+  eq("...at its own severity", injection?.severity, "critical");
+  eq("...found by one model, not two", injection?.sources, ["b"]);
+  eq("the unused variable keeps its own severity, not the injection's", both.merged.find((f) => f.category === "leftover-code")?.severity, "low");
 
   // Different quotes and spans, but claims with enough vocabulary in common.
   const similar = anchorAndDedupe(
@@ -2383,11 +2405,15 @@ section("aggregate: overlap is not agreement");
     ...over,
   });
   const at = (startLine: number, endLine: number) => ({ side: "right" as const, startLine, endLine, startOffset: 1, endOffset: 2 });
-  check("same quote agrees whatever the claims", findingsAgree(af({ claim: "x" }), af({ claim: "y" })));
+  check("the same quote classified alike agrees, however it is worded", findingsAgree(af({ claim: "x" }), af({ claim: "y" })));
+  check("...and so do two labels model families use for the same broken behaviour",
+    findingsAgree(af({ category: "concurrency", claim: "x" }), af({ category: "correctness", claim: "y" })));
+  check("the same quote as a different kind of problem does not",
+    !findingsAgree(af({ category: "leftover-code", claim: "unused variable" }), af({ category: "security", claim: "SQL injection" })));
   check("a long span never agrees by position alone",
-    !findingsAgree(af({ quote: "a", claim: "one thing", anchor: at(1, 8) }), af({ quote: "b", claim: "another matter" }), file.changedRightLines));
-  check("tight spans overlapping only on an unchanged line do not agree",
-    !findingsAgree(af({ quote: "a", claim: "one thing", anchor: at(2, 3) }), af({ quote: "b", claim: "another matter", anchor: at(3, 4) }), new Set([9])));
+    !findingsAgree(af({ quote: "a", claim: "one thing", anchor: at(1, 8) }), af({ quote: "b", claim: "another matter" })));
+  check("...nor does a tight one",
+    !findingsAgree(af({ quote: "a", claim: "one thing", anchor: at(2, 3) }), af({ quote: "b", claim: "another matter", anchor: at(3, 4) })));
   check("shared vocabulary below the threshold does not agree",
     !findingsAgree(af({ quote: "a", claim: "null deref when cache misses" }), af({ quote: "b", claim: "cache key collision when tenant ids clash" })));
 }
@@ -2407,12 +2433,12 @@ section("tool merges: only a fact-tier tool may raise severity");
 
   // The skeptic just argued this finding down to low; eslint rating an error-level rule
   // "high" is policy, not evidence, and must not undo that.
-  const triage = mergeToolFindings([model()], [tool("triage")], new FileIndex([]));
+  const triage = mergeToolFindings([model()], [tool("triage")]);
   eq("an agreeing triage-tier tool merges", triage.length, 1);
   eq("...corroborates", triage[0]?.sources, ["m1", "eslint"]);
   eq("...but cannot re-escalate", triage[0]?.severity, "low");
 
-  const fact = mergeToolFindings([model()], [tool("fact")], new FileIndex([]));
+  const fact = mergeToolFindings([model()], [tool("fact")]);
   eq("a fact-tier tool raises", fact[0]?.severity, "high");
 
   // A tool that overlaps with a different message saw a different problem: it stays a
@@ -2420,33 +2446,16 @@ section("tool merges: only a fact-tier tool may raise severity");
   const other = mergeToolFindings(
     [{ ...model(), quote: "x();\ny();", claim: "loop never terminates", anchor: { ...line1, endLine: 2 }, skepticVerdicts: 0 }],
     [tool("fact", { claim: "Argument of type 'string' is not assignable to parameter of type 'number'" })],
-    new FileIndex([]),
   );
   eq("a disagreeing tool finding is kept separately", other.length, 2);
   eq("...and the model finding stays single-source", other[0]?.sources, ["m1"]);
   eq("...uncleared by the tool's sighting", other[0]?.skepticVerdicts, 0);
 
-  // The index is a required argument, not an optional one. findingsAgree's changed-lines
-  // rule is the only thing that merges two tight spans whose quotes and claims differ, and
-  // it reads changedRightLines out of the index — so when the index was optional, whether
-  // these two became one comment or two depended on whether the caller passed it.
+  // Two tight spans on a line this PR changed used to merge by position alone — which made
+  // a tsc error "corroborate" a model claim about something else on the same line.
   const spanA = { ...model(), quote: "a();", claim: "one thing", anchor: { ...line1, startLine: 4, endLine: 4 } };
   const spanB = { ...tool("fact"), quote: "b();", claim: "another matter", anchor: { ...line1, startLine: 4, endLine: 4 } };
-  const onChanged: FileDiff = {
-    path: "src/a.ts", changeType: "edit", hunks: [], rightLines: [], leftLines: [],
-    changedRightLines: new Set([4]), binary: false, truncated: false, language: "typescript",
-    changedLeftLines: new Set(),
-  };
-  eq(
-    "two tight spans on a line this PR changed merge",
-    mergeToolFindings([spanA], [spanB], new FileIndex([onChanged])).length,
-    1,
-  );
-  eq(
-    "...and stay separate when the line is untouched",
-    mergeToolFindings([spanA], [spanB], new FileIndex([{ ...onChanged, changedRightLines: new Set([9]) }])).length,
-    2,
-  );
+  eq("a tool finding on the same line with a different claim stays separate", mergeToolFindings([spanA], [spanB]).length, 2);
 }
 
 section("strict-mode schema invariant");

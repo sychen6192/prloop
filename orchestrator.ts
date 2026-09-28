@@ -480,7 +480,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // suppression reason — a suppressed finding must stay visible, never vanish.
   const agg = finalize(
     candidates,
-    mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings, ctx.fileIndex),
+    mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings),
     dismissedFps,
     outcomes.filter((o) => o.killed).length,
   );

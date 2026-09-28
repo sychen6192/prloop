@@ -214,6 +214,16 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   requirement model's tokens, and takes back a "missing" verdict when files were too large
   to show it (not-verifiable, with the files named). Blobs are cached by content, so the
   second read fetches only files the push did not touch.
+- **Two models' different claims about one line are no longer merged into one.** Any
+  identical quote, or two short spans sharing a changed line, counted as agreement whatever
+  the claims said, and the merge kept the first claim while taking the higher severity from
+  the other finding. So a low "unused variable" and a critical "SQL injection" quoting the
+  same line were posted as one critical "unused variable" credited to both models — it passed
+  the consensus gate, and the injection was reported nowhere. Findings now merge only when
+  their claims agree (the same quote classified as the same kind of problem, or claims worded
+  alike); otherwise each stays its own finding with its own severity, sources, verification
+  and comment. Expect the occasional second comment on a line where two models genuinely
+  disagreed.
 - **`result.json` is written on every exit path, and says which run it belongs to.** It was
   written in exactly one place, after `runReview` returned, so a throw inside any stage went
   to `main().catch` and left a run directory holding findings and nothing saying the run had

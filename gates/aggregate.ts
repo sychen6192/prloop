@@ -60,19 +60,16 @@ export function fingerprint(f: RawFinding): string {
 const normQuote = (q: string) => q.replace(/\s+/g, " ").trim();
 
 /**
- * Two findings are the same issue if they share a file and overlapping lines, and either
- * agree on category or quote the same code. The quote clause matters for weak models:
- * category labels are unstable across model families ("concurrency" vs a coerced
- * "correctness" for the same race), and requiring an exact category match would split the
- * very consensus the multi-finder setup exists to measure.
+ * Two findings are about the same PLACE if they share a file and overlapping lines on the
+ * same side. Place alone decides nothing: it is where the question "same finding?" gets
+ * asked (findingsAgree), never its answer.
  *
  * Only called within one anchoring class — see anchorAndDedupe, which never compares an
- * anchored finding against an anchor-failed one.
+ * anchored finding against an anchor-failed one. Anchor-failed findings have no lines, so
+ * their place is their identity.
  */
-function sameIssue(a: AnchoredFinding, b: AnchoredFinding): boolean {
+function samePlace(a: AnchoredFinding, b: AnchoredFinding): boolean {
   if (a.file !== b.file) return false;
-  const agree = a.category === b.category || normQuote(a.quote) === normQuote(b.quote);
-  if (!agree) return false;
   if (!a.anchor || !b.anchor) return a.fingerprint === b.fingerprint;
   if (a.anchor.side !== b.anchor.side) return false;
   return a.anchor.startLine <= b.anchor.endLine && b.anchor.startLine <= a.anchor.endLine;
@@ -88,30 +85,30 @@ function claimTokens(claim: string): Set<string> {
   );
 }
 
+// Categories that describe the same kind of problem — broken behaviour — and that model
+// families label inconsistently: the same race comes back "concurrency" from one and a
+// coerced "correctness" from another. Outside this group a different label is a different
+// problem: "unused variable" (leftover-code) and "SQL injection" (security) on one line are
+// two findings.
+const BEHAVIOUR: ReadonlySet<string> = new Set(["correctness", "concurrency", "reliability", "data-integrity"]);
+const sameKind = (a: string, b: string) => a === b || (BEHAVIOUR.has(a) && BEHAVIOUR.has(b));
+
 /**
- * Whether two findings on the same lines are the same finding, as opposed to two findings
- * that happen to share a line. Exported for the selftest.
+ * Whether two findings in the same place are the same finding, as opposed to two findings
+ * that happen to share a line. Exported for the selftest. It decides both what merges into
+ * one comment and what counts as independent corroboration, so it asks about the CLAIM:
+ * the same quoted code classified as the same kind of problem, or claims with enough
+ * vocabulary in common (token Jaccard ≥ 0.3) to be about the same thing.
  *
- * sameIssue is deliberately loose — it is what dedupes, and a missed duplicate is two
- * comments on one line — but it also decided corroboration, and there loose is wrong: an
- * 8-line "this loop can race" and a 1-line "unused variable" in the same category
- * overlapped, merged, and the second model went into `sources` as having independently
- * found the race. The consensus gate then published one opinion as a consensus. Agreement
- * needs one of: the same quoted code; two tight spans (three lines or fewer) sharing a
- * line this PR changed — both models pointed at the same new code; or claims with enough
- * vocabulary in common (token Jaccard ≥ 0.3) to be about the same thing. `changedLines`
- * is the file's changedRightLines; without it the span rule cannot fire.
+ * Position used to be enough on its own — any identical quote, or two spans of three lines
+ * or fewer sharing a changed line, agreed whatever the claims said. "Unused variable" (low)
+ * and "SQL injection" (critical) quoting the same line then merged into one finding that
+ * kept the first claim, took the critical severity, and listed both models as having found
+ * it: it passed the consensus gate, and the injection was reported nowhere. Two claims about
+ * one line are now two findings, each verified, gated and posted on its own.
  */
-export function findingsAgree(a: AnchoredFinding, b: AnchoredFinding, changedLines?: Set<number>): boolean {
-  if (normQuote(a.quote) === normQuote(b.quote)) return true;
-  if (a.anchor && b.anchor && a.anchor.side === "right" && b.anchor.side === "right" && changedLines) {
-    const span = (x: Anchor) => x.endLine - x.startLine + 1;
-    if (span(a.anchor) <= 3 && span(b.anchor) <= 3) {
-      const from = Math.max(a.anchor.startLine, b.anchor.startLine);
-      const to = Math.min(a.anchor.endLine, b.anchor.endLine);
-      for (let l = from; l <= to; l++) if (changedLines.has(l)) return true;
-    }
-  }
+export function findingsAgree(a: AnchoredFinding, b: AnchoredFinding): boolean {
+  if (normQuote(a.quote) === normQuote(b.quote) && sameKind(a.category, b.category)) return true;
   const ta = claimTokens(a.claim);
   const tb = claimTokens(b.claim);
   if (ta.size === 0 || tb.size === 0) return false;
@@ -121,31 +118,36 @@ export function findingsAgree(a: AnchoredFinding, b: AnchoredFinding, changedLin
 }
 
 /**
- * Folds `extra` into `target`. Whether `extra` counts as corroboration is the caller's
- * verdict (`agree`, from findingsAgree): a disagreeing source is remembered under
- * `overlapping` so the summary can say another model spoke about these lines, without it
- * ever satisfying the consensus gate.
+ * Folds `extra` into `target`: two sightings of the same finding (findingsAgree), so every
+ * source counts as corroboration. Only ever called for agreeing findings — a finding with a
+ * different claim stays a finding of its own, and the two only know of each other through
+ * `overlapping`.
  */
-function mergeInto(target: AnchoredFinding, extra: AnchoredFinding, agree: boolean): void {
-  for (const s of extra.sources) {
-    if (target.sources.includes(s)) continue;
-    if (agree) target.sources.push(s);
-    else if (!target.overlapping?.includes(s)) (target.overlapping ??= []).push(s);
-  }
-  // Keep the more alarming assessment; consensus scoring in M3 refines this. Not from a
-  // triage-tier tool, though: tool merges run AFTER the skeptic, and eslint rating every
-  // error-level rule "high" re-escalated findings the verifier had just downgraded. Only a
-  // fact-tier tool (tsc, mypy) measures anything a verifier's judgment should yield to.
+function mergeInto(target: AnchoredFinding, extra: AnchoredFinding): void {
+  for (const s of extra.sources) if (!target.sources.includes(s)) target.sources.push(s);
+  // Keep the more alarming assessment of the same finding. Not from a triage-tier tool,
+  // though: tool merges run AFTER the skeptic, and eslint rating every error-level rule
+  // "high" re-escalated findings the verifier had just downgraded. Only a fact-tier tool
+  // (tsc, mypy) measures anything a verifier's judgment should yield to.
   if (extra.tier !== "triage" && severityRank(extra.severity) < severityRank(target.severity)) {
     target.severity = extra.severity;
   }
   target.confidence = Math.max(target.confidence, extra.confidence);
-  // Missing pieces are borrowed only from a source that agrees. A disagreeing finding's
-  // evidence and fix describe a different defect, and attaching them to this claim posted
-  // comments whose suggested code contradicted their own headline.
-  if (!agree) return;
   if (!target.suggested_fix && extra.suggested_fix) target.suggested_fix = extra.suggested_fix;
   if (!target.evidence && extra.evidence) target.evidence = extra.evidence;
+}
+
+/**
+ * Records, on both findings, that another model spoke about the same lines with a different
+ * claim. Named so a reader knows the line was busy; never counted as corroboration.
+ */
+function noteOverlap(a: AnchoredFinding, b: AnchoredFinding): void {
+  for (const [to, from] of [[a, b], [b, a]] as const) {
+    for (const s of from.sources) {
+      if (to.sources.includes(s) || to.overlapping?.includes(s)) continue;
+      (to.overlapping ??= []).push(s);
+    }
+  }
 }
 
 export interface AnchoredCandidates {
@@ -202,10 +204,10 @@ export function anchorAndDedupe(outputs: FinderOutput[], index: FileIndex): Anch
     }
   }
 
-  // Dedupe. Multiple models flagging the same line is signal, not duplication — merging
-  // records every source so consensus scoring can use it. Every AGREEING source, that is:
-  // a finding that merely overlaps is folded in (one comment per line) but recorded as
-  // `overlapping`, not as corroboration.
+  // Dedupe. Multiple models flagging the same finding is signal, not duplication — merging
+  // records every source so consensus scoring can use it. The same FINDING, that is: a
+  // finding with a different claim about the same lines stays separate, with its own
+  // severity and sources, and the two are only noted as `overlapping` each other.
   //
   // Anchored and anchor-failed findings are deduped in SEPARATE pools, never against each
   // other. Cross-merging is wrong in both directions: an anchor-failed duplicate processed
@@ -215,9 +217,14 @@ export function anchorAndDedupe(outputs: FinderOutput[], index: FileIndex): Anch
   const dedupe = (pool: AnchoredFinding[]): AnchoredFinding[] => {
     const out: AnchoredFinding[] = [];
     for (const f of pool) {
-      const hit = out.find((m) => sameIssue(m, f));
-      if (hit) mergeInto(hit, f, findingsAgree(hit, f, index.exact(hit.file)?.changedRightLines));
-      else out.push(f);
+      const near = out.filter((m) => samePlace(m, f));
+      const twin = near.find((m) => findingsAgree(m, f));
+      if (twin) {
+        mergeInto(twin, f);
+        continue;
+      }
+      for (const m of near) noteOverlap(m, f);
+      out.push(f);
     }
     return out;
   };
@@ -265,20 +272,12 @@ export function anchorAndDedupe(outputs: FinderOutput[], index: FileIndex): Anch
  * it as corroboration of a claim it never made or, kept single-source, sink a real tsc
  * error into a summary line under someone else's claim — so it stays a finding of its own.
  */
-export function mergeToolFindings(
-  survivors: AnchoredFinding[],
-  tools: AnchoredFinding[],
-  // For the agreement check's changed-lines rule; tool findings sit on the diff's own paths.
-  // Required, not optional: without it findingsAgree's changed-lines clause silently cannot
-  // fire, so whether a tool finding merges or stands alone depended on whether a caller
-  // remembered to pass an argument.
-  index: FileIndex,
-): AnchoredFinding[] {
+export function mergeToolFindings(survivors: AnchoredFinding[], tools: AnchoredFinding[]): AnchoredFinding[] {
   const out = [...survivors];
   for (const t of tools) {
-    const hit = out.find((m) => sameIssue(m, t));
-    if (hit && findingsAgree(hit, t, index.exact(hit.file)?.changedRightLines)) {
-      mergeInto(hit, t, true);
+    const hit = out.find((m) => samePlace(m, t) && findingsAgree(m, t));
+    if (hit) {
+      mergeInto(hit, t);
       // A tool's sighting counts as an active clearing, like it does standalone.
       hit.skepticVerdicts = Math.max(hit.skepticVerdicts ?? 0, t.skepticVerdicts ?? 0);
     } else {
