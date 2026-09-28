@@ -333,9 +333,18 @@ Without ADO credentials at all, review two git branches through the identical di
 anchoring path:
 
 ```bash
+npx tsx scripts/local-review.ts review <repo> <base> <head> [--criteria <file.md>]
 npx tsx scripts/local-review.ts prompt <repo> <base> <head> [out.md]
 npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
 ```
+
+`review` is the whole pipeline — finders, skeptic, requirement axis, static analysis, the
+gates — with your configured models, as a dry run: there is no pull request, so nothing is
+posted, and the run directory (`review.html` included) is the review. The repository's
+convention documents are read from its own history at `<base>`, and `--criteria` gives the
+requirement axis a markdown file of acceptance criteria to judge the branch against; without
+it that axis is skipped, as it is on a PR with no linked work item. `prompt` and `anchor` need
+no model endpoint at all.
 
 ## What lands on the PR
 
@@ -671,7 +680,7 @@ HTTP model transport (`selftest-runner.ts`), what publishing writes to a PR
 (`selftest-publish.ts`), ADO intake's edges (`selftest-ado.ts`), the CLI's argument grammar and
 exit codes (`selftest-cli.ts`), one pull request reviewed twice end to end — a full review,
 then `--since auto` on the next push (`selftest-e2e.ts`) — and the claims the documentation
-makes about the code (`selftest-docs.ts`). The four that talk to a network drive the real code
+makes about the code (`selftest-docs.ts`). The five that talk to a network drive the real code
 against fake `node:http` servers in `scripts/fakes/` — no credentials, no endpoint, no fixed
 ports.
 

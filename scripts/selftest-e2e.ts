@@ -14,11 +14,15 @@
 //
 // Its own file, and the servers start before the imports: config reads every PRR_* setting
 // once at import time, and the fakes' ports only exist at run time.
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { fakeAdo, type ChangePage } from "./fakes/ado";
 import { completion, fakeOpenAI, httpError, type RecordedCall, type Responder } from "./fakes/openai";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 let passed = 0;
 let failed = 0;
@@ -155,6 +159,8 @@ const EVIDENCE: Record<string, { file: string; quote: string }> = {
   "4712-AC1": { file: "appsettings.json", quote: '"InvoiceDueDays": 30' },
   "4712-AC2": { file: INVOICE, quote: "public DateTime DueDate => IssuedOn.AddDays(_options.InvoiceDueDays);" },
   "4713-AC1": { file: "docs/retry.md", quote: "A failed charge is retried three times before the order is cancelled." },
+  // The one work item a local review's --criteria file becomes.
+  "1-AC1": { file: "src/pay.ts", quote: "export function splitEvenly(totalCents: number, parts: number): number {" },
 };
 
 function finderAnswer(model: string, prompt: string): unknown {
@@ -518,6 +524,68 @@ try {
     eq("the status passes", status?.["state"], "succeeded");
     check("...without claiming it reviewed anything", !String(status?.["description"] ?? "").includes("Reviewed 0 files"), String(status?.["description"]));
     eq("...and the exit code agrees", exitCodeFor(result), 0);
+  }
+
+  section("a local branch, reviewed end to end: real pipeline, no pull request, nothing posted");
+  {
+    // scripts/local-review.ts only built prompts and matched quotes; nothing reviewed a branch
+    // before it became a PR, and nothing could run a benchmark's repositories through the
+    // real pipeline. `review` does both, as a dry run by construction.
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-local-"));
+    const git = (...args: string[]) => {
+      const r = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+      if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+    };
+    try {
+      git("init", "-q", "-b", "main");
+      git("config", "user.email", "e2e@example.invalid");
+      git("config", "user.name", "e2e");
+      fs.mkdirSync(path.join(repo, "src"));
+      fs.writeFileSync(path.join(repo, "src", "pay.ts"), PAY_1);
+      git("add", ".");
+      git("commit", "-q", "-m", "payments");
+      git("checkout", "-q", "-b", "feature");
+      fs.writeFileSync(path.join(repo, "src", "pay.ts"), PAY_2);
+      git("commit", "-q", "-am", "split evenly");
+      const criteria = path.join(repo, "criteria.md");
+      fs.writeFileSync(criteria, "- Splitting a total evenly is supported\n");
+
+      models.reset();
+      models.answerBy(reviewer);
+      ado.reset();
+      const localRuns = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-local-runs-"));
+      // Its own process, as a user would run it — and asynchronously, because the fake model
+      // endpoint answering it lives in this one.
+      const res = await new Promise<{ code: number | null; out: string }>((resolve) => {
+        const child = spawn(
+          process.execPath,
+          [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), path.join(root, "scripts", "local-review.ts"), "review", repo, "main", "feature", "--criteria", criteria],
+          { env: { ...process.env, PRR_RUNS_DIR: localRuns, PRR_DRY_RUN: "" }, stdio: ["ignore", "pipe", "pipe"] },
+        );
+        let out = "";
+        // A review that hangs must fail this net, not stall CI until the job's own timeout.
+        const timer = setTimeout(() => child.kill(), 120_000);
+        child.stdout.on("data", (c: Buffer) => (out += c.toString()));
+        child.stderr.on("data", (c: Buffer) => (out += c.toString()));
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, out });
+        });
+      });
+      try {
+        check("the local review ran", res.out.includes("Reviewed 1 files"), res.out.slice(-800));
+        check("...and reported the bug the branch introduced", res.out.includes("fractional cents"), res.out.slice(-800));
+        eq("...judged the criteria file", stageCalls("requirements").length, 1);
+        eq("...and exited clean: the finding is medium and the criterion is met", res.code, 0);
+        eq("nothing was sent to Azure DevOps at all", ado.requests.length, 0);
+        const review = fs.readdirSync(localRuns, { recursive: true }).map(String).find((p) => p.endsWith("review.html"));
+        check("the run directory holds the review", review !== undefined);
+      } finally {
+        fs.rmSync(localRuns, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
   }
 } finally {
   await ado.close();

@@ -15,6 +15,12 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   triaged tool findings and the file contents they were about — and `scripts/replay.ts <run
   dir>` re-runs everything after the models offline under the current code and settings,
   marking what changed. Opt-in: it keeps the reviewed source on disk.
+- `scripts/local-review.ts review <repo> <base> <head> [--criteria <file.md>]` reviews a local
+  branch end to end with the configured models, as a dry run: the production pipeline with only
+  the sources swapped — the diff from git, the convention documents from the repository's own
+  history, the acceptance criteria from a file. It is what an external benchmark runs through,
+  and it needs no Azure DevOps at all. `runReview` takes the conventions and the criteria as
+  providers, as it already took the intake.
 
 - Two-axis review: a **code axis** (N finder models over the diff, same prompt, in parallel)
   and a **requirement axis** (linked work items and acceptance criteria, walking one level up),

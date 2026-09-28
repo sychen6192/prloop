@@ -12,6 +12,7 @@ import { log, logVerbose } from "../libs/log";
 import { run } from "../libs/shell";
 import type { ChangeType, FileDiff, PrInfo } from "../libs/types";
 import type { ReviewContext, SkippedFile } from "../libs/context";
+import { CONVENTION_PATHS, type ConventionDoc } from "../ado/conventions";
 
 async function git(repo: string, args: string[]): Promise<string> {
   const res = await run("git", ["-C", repo, ...args], 120_000);
@@ -55,6 +56,21 @@ function mapStatus(code: string): ChangeType {
   if (c === "R") return "rename";
   if (c === "M") return "edit";
   return "other";
+}
+
+/**
+ * The repository's own convention documents at a commit, read from its history — the local
+ * counterpart of ado/conventions.ts, over the same paths, for the same reason: they are
+ * what makes the rules' "the repo's conventions override this baseline" enforceable.
+ */
+export async function readLocalConventions(repo: string, commit: string): Promise<ConventionDoc[]> {
+  const found: ConventionDoc[] = [];
+  for (const p of CONVENTION_PATHS) {
+    const rel = p.replace(/^\//, "");
+    const res = await showFile(repo, commit, rel);
+    if ("lines" in res && res.lines.length > 0) found.push({ path: p, text: res.lines.join("\n") });
+  }
+  return found;
 }
 
 export interface LocalIntakeOptions {

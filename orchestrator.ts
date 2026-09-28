@@ -19,7 +19,8 @@ import { buildReviewContext, type ReviewContext } from "./ado/intake";
 import type { IntakeProvider } from "./libs/context";
 import { FileIndex } from "./libs/fileindex";
 import { terminalPrStatus } from "./ado/iterations";
-import { fetchRepoConventions } from "./ado/conventions";
+import { fetchRepoConventions, type ConventionDoc } from "./ado/conventions";
+import type { LinkedRequirements } from "./ado/workitems";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
@@ -50,6 +51,13 @@ export interface ReviewRunOptions {
    * test — instead of being whatever ado/intake.ts happens to return.
    */
   intake?: IntakeProvider;
+  /**
+   * Where the reviewed repository's own convention documents come from, at a commit.
+   * Defaults to ADO; a local review reads them out of the repository's own history.
+   */
+  conventions?: (commit: string) => Promise<ConventionDoc[]>;
+  /** Where the acceptance criteria come from. Defaults to the PR's linked work items. */
+  workItems?: () => Promise<LinkedRequirements>;
 }
 
 export interface ReviewRunResult {
@@ -277,6 +285,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             return { files, fileIndex: new FileIndex(files) };
           },
           runner: opts.runner,
+          ...(opts.workItems ? { workItems: opts.workItems } : {}),
         })
   ).catch((e): Awaited<ReturnType<typeof runRequirementGate>> => {
     const msg = e instanceof Error ? e.message : String(e);
@@ -292,7 +301,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // and a failed fetch costs the finder its context bonus, not the run.
   const conventions = renderConventions(
     ctx.iteration.targetRefCommit && !noCode
-      ? await fetchRepoConventions(opts.ref, ctx.iteration.targetRefCommit).catch((e) => {
+      ? await (opts.conventions ?? ((commit: string) => fetchRepoConventions(opts.ref, commit)))(ctx.iteration.targetRefCommit).catch((e) => {
           log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
           return [];
         })

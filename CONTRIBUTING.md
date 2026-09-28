@@ -32,8 +32,9 @@ they fail for different reasons:
   of a run CI reads.
 - `scripts/selftest-e2e.ts` — one pull request reviewed twice, a full review and then
   `--since auto` on the next push, through every stage against a fake Azure DevOps and a fake
-  model that answers only from what its prompt shows. The place a defect between two stages
-  shows up: what the PR ends up carrying, not what one module returned.
+  model that answers only from what its prompt shows, and a local branch through
+  `local-review.ts review` with nothing posted. The place a defect between two stages shows
+  up: what the PR ends up carrying, not what one module returned.
 - `scripts/selftest-docs.ts` — the claims the documentation makes about the code (an undefined
   symbol in the README's model-call arithmetic, a Node version pinned in two places that
   disagree, a link to a path that was renamed, a selftest nobody runs). A doc that has quietly
@@ -75,6 +76,7 @@ are four different problems with four different fixes. Never collapse them into 
 Two git branches through the identical diff and anchoring path — no credentials, no PR:
 
 ```bash
+npx tsx scripts/local-review.ts review <repo> <base> <head> [--criteria <file.md>]   # real models, dry run
 npx tsx scripts/local-review.ts prompt <repo> <base> <head> [out.md]
 npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
 npx tsx scripts/demo.ts        # render comments from fake data, no network at all

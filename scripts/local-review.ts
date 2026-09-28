@@ -1,14 +1,18 @@
-// Offline review driver: build a review context from a local git branch, emit the finder
-// prompt, and (given a findings file) run the real anchoring + consensus pipeline over it.
+// Local review driver: build a review context from a local git branch instead of a pull
+// request, and review it.
 //
-// Two phases so a review can be done without a reachable model endpoint:
-//   prompt   — writes the exact prompt the finder would receive
+//   review   — the whole pipeline, real models included, as a dry run: nothing is posted,
+//              because there is no pull request. The run directory under runs/ holds the
+//              prompts, the verdicts and review.html, exactly as a PR run's would.
+//   prompt   — writes the exact prompt the finder would receive, with no model call
 //   anchor   — reads a findings JSON and reports where each comment would actually land
 //
-// The anchoring, dedupe and consensus code paths are the production ones; only the model
-// call is substituted.
+// The last two work without a reachable model endpoint. All three run the production code
+// paths; `review` substitutes only where the code comes from (git, not ADO), where the
+// repository's conventions come from (its own history) and where the criteria come from
+// (a file, when one is given).
 import * as fs from "node:fs";
-import { buildLocalReviewContext } from "../git/intake";
+import { buildLocalReviewContext, readLocalConventions } from "../git/intake";
 import { anchorAndDedupe, finalize } from "../gates/aggregate";
 import { FINDER_SEED } from "../config";
 import { buildFinderPrompt, FINDER_SYSTEM } from "../prompts/finder";
@@ -17,23 +21,77 @@ import { loadRules, renderRules, ruleHeadings, selectRules } from "../libs/rules
 import { parseJsonObject } from "../libs/json";
 import { renderSummary } from "../publish/format";
 import type { FinderOutput } from "../gates/finder";
-import type { RawFinding } from "../libs/types";
+import type { RawFinding, WorkItem } from "../libs/types";
+import { createRunner } from "../models/runner";
+import { exitCodeFor, runReview } from "../orchestrator";
 
 function usage(): never {
   console.error(`Usage:
+  tsx scripts/local-review.ts review <repo> <base> <head> [--criteria <file.md>]
   tsx scripts/local-review.ts prompt <repo> <base> <head> [out.md]
   tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json> [model name]`);
   process.exit(1);
 }
 
+/** Acceptance criteria from a file, as the one work item a local branch is judged against. */
+function localWorkItem(text: string): WorkItem {
+  return {
+    id: 1,
+    title: "local acceptance criteria",
+    type: "User Story",
+    state: "Active",
+    description: "",
+    acceptanceCriteria: text.trim(),
+    specSource: "acceptance-criteria",
+    url: "",
+  };
+}
+
 async function main() {
-  const [mode, repo, base, head, arg5, arg6] = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  const flag = (name: string) => {
+    const i = argv.indexOf(name);
+    if (i < 0) return undefined;
+    const v = argv[i + 1];
+    // A flag with nothing after it would otherwise review without the criteria and say
+    // nothing: the requirement axis skips, and the run looks like one that had none to judge.
+    if (v === undefined || v.startsWith("--")) usage();
+    argv.splice(i, 2);
+    return v;
+  };
+  const criteriaFile = flag("--criteria");
+  const [mode, repo, base, head, arg5, arg6] = argv;
   if (!mode || !repo || !base || !head) usage();
 
   const ctx = await buildLocalReviewContext({ repo, base, head });
-  if (ctx.files.length === 0) {
+  if (ctx.files.length === 0 && mode !== "review") {
     console.error("No changes to review");
     process.exit(1);
+  }
+
+  if (mode === "review") {
+    // A dry run by construction: there is no pull request to write to, and the run
+    // directory is the review.
+    process.env["PRR_DRY_RUN"] = "1";
+    const criteria = criteriaFile ? fs.readFileSync(criteriaFile, "utf8") : undefined;
+    const result = await runReview({
+      ref: ctx.ref,
+      runner: await createRunner(),
+      compareTo: 0,
+      intake: (_ref, _compareTo, o) => buildLocalReviewContext({ repo, base, head, ...(o?.text ? { text: true } : {}) }),
+      conventions: (commit) => readLocalConventions(repo, commit),
+      workItems: async () => ({ items: criteria ? [localWorkItem(criteria)] : [], inheritedFrom: [] }),
+    });
+    const { inline, belowBar, degraded } = result.agg;
+    console.log(
+      `\nReviewed ${result.ctx.files.length} files: ${inline.length} comments, ${belowBar.length} below the bar, ` +
+        `${degraded.length} unanchored` +
+        (result.req && !result.req.skipped ? `; ${result.req.criteria.length} criteria judged` : ""),
+    );
+    for (const f of inline) console.log(`  ${f.severity.padEnd(8)} ${f.file}:${f.anchor?.startLine}  ${f.claim}`);
+    if (result.incomplete.length > 0) console.log(`Incomplete: ${result.incomplete.join("; ")}`);
+    console.log(`\nThe whole run, on one screen: ${result.runDir}/review.html`);
+    process.exit(exitCodeFor(result));
   }
 
   if (mode === "prompt") {

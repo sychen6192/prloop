@@ -5,7 +5,7 @@
 // because Boards hygiene is imperfect gets switched off.
 import { createHash } from "node:crypto";
 import { MAX_EXTRAS, MAX_INLINE_REQ_COMMENTS, REQ_MODEL, SKEPTIC_MODELS } from "../config";
-import { getLinkedRequirements } from "../ado/workitems";
+import { getLinkedRequirements, type LinkedRequirements } from "../ado/workitems";
 import { anchorFinding } from "../anchoring/locate";
 import { extractCriteria, type CriterionRef } from "../libs/criteria";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
@@ -145,6 +145,8 @@ export interface RequirementGateInput {
    */
   diff: () => Promise<RequirementDiff>;
   runner: ModelRunner;
+  /** Where the criteria come from. Defaults to the PR's linked work items in ADO. */
+  workItems?: () => Promise<LinkedRequirements>;
 }
 
 export async function runRequirementGate(
@@ -152,7 +154,7 @@ export async function runRequirementGate(
 ): Promise<{ result: RequirementResult; prompt?: string; raw?: string }> {
   let linked;
   try {
-    linked = await getLinkedRequirements(input.ref);
+    linked = await (input.workItems ?? (() => getLinkedRequirements(input.ref)))();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[WARN] Failed to fetch work items: ${msg}`);
