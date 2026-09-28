@@ -42,6 +42,12 @@ export interface FakeAdoState {
   pr: Record<string, unknown>;
   iterations: Array<Record<string, unknown>>;
   changePages: ChangePage[];
+  /**
+   * The pages for one iteration compared against another, when set — used instead of
+   * changePages. A PR with more than one push answers `$compareTo` differently per push, and
+   * an incremental review is exactly the question of which files that answer contains.
+   */
+  changesFor?: (iterationId: number, compareTo: number) => ChangePage[];
   threads: FakeThread[];
   /** Work item ids the PR links to (the dedicated /workitems endpoint, not the PR body). */
   workItemRefs: number[];
@@ -140,12 +146,14 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       return sendJson(res, 200, { count: state.iterations.length, value: state.iterations });
     }
     // --- iteration changes, paged ----------------------------------------------------
-    if (method === "GET" && /\/iterations\/\d+\/changes$/.test(path)) {
+    const changes = /\/iterations\/(\d+)\/changes$/.exec(path);
+    if (method === "GET" && changes) {
       const skip = Number(query["$skip"] ?? 0);
+      const pages = state.changesFor?.(Number(changes[1]), Number(query["$compareTo"] ?? 0)) ?? state.changePages;
       // Keyed by the skip each page declares, so a client that ignores nextSkip and asks
       // again from 0 gets page one forever instead of silently "passing".
       let cursor = 0;
-      for (const page of state.changePages) {
+      for (const page of pages) {
         if (cursor === skip) return sendJson(res, 200, page);
         if (page.nextSkip === undefined) break;
         cursor = page.nextSkip;
@@ -175,7 +183,13 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       const thread: FakeThread = {
         id: nextThreadId++,
         status: (body?.["status"] as string | undefined) ?? "active",
-        comments: incoming.map((c) => ({ id: nextCommentId++, content: c.content ?? "" })),
+        // Stamped with the identity the credential authenticates as, as ADO does: prloop's
+        // identity checks read it back off its own comments on the next run.
+        comments: incoming.map((c) => ({
+          id: nextCommentId++,
+          content: c.content ?? "",
+          ...(state.selfIdentityId === undefined ? {} : { author: { id: state.selfIdentityId, displayName: "prloop" } }),
+        })),
         threadContext: body?.["threadContext"] as FakeThread["threadContext"],
       };
       state.threads.push(thread);

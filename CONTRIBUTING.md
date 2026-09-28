@@ -30,12 +30,16 @@ they fail for different reasons:
   and conventions (a sign-in page served with a 200, a 401 that must be reported).
 - `scripts/selftest-cli.ts` — the argument grammar and the exit code, which is the only part
   of a run CI reads.
+- `scripts/selftest-e2e.ts` — one pull request reviewed twice, a full review and then
+  `--since auto` on the next push, through every stage against a fake Azure DevOps and a fake
+  model that answers only from what its prompt shows. The place a defect between two stages
+  shows up: what the PR ends up carrying, not what one module returned.
 - `scripts/selftest-docs.ts` — the claims the documentation makes about the code (an undefined
   symbol in the README's model-call arithmetic, a Node version pinned in two places that
   disagree, a link to a path that was renamed, a selftest nobody runs). A doc that has quietly
   stopped being true is the one failure nothing else notices.
 
-The runner, publish and ADO nets drive the real code against fake servers in `scripts/fakes/`,
+The runner, publish, ADO and end-to-end nets drive the real code against fake servers in `scripts/fakes/`,
 built from `node:http` and plain objects — test infrastructure, never a dependency. If you add
 one: bind port 0, never a fixed port, and close the server in a `finally`. Add new test files
 rather than growing `selftest.ts`, and wire them into `npm run check` (`selftest-docs.ts` fails

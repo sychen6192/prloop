@@ -13,13 +13,14 @@ npx tsx scripts/selftest-runner.ts   # HTTP model transport: retries, fallback, 
 npx tsx scripts/selftest-publish.ts  # what publish() writes to the PR
 npx tsx scripts/selftest-ado.ts      # ADO intake edges: paging, parent PBIs, conventions
 npx tsx scripts/selftest-cli.ts      # argument grammar and exit codes
+npx tsx scripts/selftest-e2e.ts      # one PR reviewed twice end to end: full, then --since auto
 npx tsx scripts/selftest-docs.ts     # claims the docs make about the code
 npx tsx scripts/demo.ts              # render comments + review.html from fake data, no network
 npx tsx scripts/calibrate.ts         # dismissal / kill rates from runs/ + dismissals.jsonl
 npx tsx scripts/evaluate.ts          # golden-set recall: which stage lost each known defect
 ```
 
-Everything is offline-testable; no test needs ADO credentials or a model endpoint. The four
+Everything is offline-testable; no test needs ADO credentials or a model endpoint. The five
 nets that exercise side effects drive the real code against fake servers built from `node:http`
 in `scripts/fakes/` — test infrastructure, never a dependency. Every one of them binds port 0
 and closes its server in a `finally`.

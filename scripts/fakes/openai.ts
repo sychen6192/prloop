@@ -28,12 +28,19 @@ export interface FakeOpenAI extends FakeServer {
   calls: RecordedCall[];
   /** Answers for the next requests, in order. An unscripted request is answered loudly. */
   script(...responders: Responder[]): void;
+  /**
+   * Answers every request by what it asks rather than when it arrives, and takes precedence
+   * over the script. For a whole review, whose stages call concurrently: a queue would hand
+   * the skeptic an answer written for a finder whenever the two raced.
+   */
+  answerBy(route: ((call: RecordedCall) => Responder) | undefined): void;
   reset(): void;
 }
 
 export async function fakeOpenAI(): Promise<FakeOpenAI> {
   const calls: RecordedCall[] = [];
   let queue: Responder[] = [];
+  let route: ((call: RecordedCall) => Responder) | undefined;
 
   const server = await listen((req, res) => {
     void (async () => {
@@ -51,6 +58,7 @@ export async function fakeOpenAI(): Promise<FakeOpenAI> {
         at: Date.now(),
       };
       calls.push(call);
+      if (route) return route(call)(res, call);
       const next = queue.shift();
       if (!next) {
         // Never a plausible answer: an unscripted request means the code under test made a
@@ -70,9 +78,13 @@ export async function fakeOpenAI(): Promise<FakeOpenAI> {
     script: (...responders: Responder[]) => {
       queue = [...responders];
     },
+    answerBy: (fn) => {
+      route = fn;
+    },
     reset: () => {
       calls.length = 0;
       queue = [];
+      route = undefined;
     },
   };
 }

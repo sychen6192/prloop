@@ -617,9 +617,11 @@ The per-finder table is the multi-model question in numbers. Run the same golden
 `npm run check` runs it alongside the other nets: the SSE transport (`selftest-stream.ts`), the
 HTTP model transport (`selftest-runner.ts`), what publishing writes to a PR
 (`selftest-publish.ts`), ADO intake's edges (`selftest-ado.ts`), the CLI's argument grammar and
-exit codes (`selftest-cli.ts`), and the claims the documentation makes about the code
-(`selftest-docs.ts`). The three that talk to a network drive the real code against fake
-`node:http` servers in `scripts/fakes/` — no credentials, no endpoint, no fixed ports.
+exit codes (`selftest-cli.ts`), one pull request reviewed twice end to end — a full review,
+then `--since auto` on the next push (`selftest-e2e.ts`) — and the claims the documentation
+makes about the code (`selftest-docs.ts`). The four that talk to a network drive the real code
+against fake `node:http` servers in `scripts/fakes/` — no credentials, no endpoint, no fixed
+ports.
 
 `fixtures/seeded-pr.ts` is a realistic 3-language PR with seeded defects, every expected line
 verified against the real file with `grep -n`. It pins four boundaries: a duplicated line with
