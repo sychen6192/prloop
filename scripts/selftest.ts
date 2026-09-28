@@ -97,7 +97,23 @@ import { buildReqDisputePrompt } from "../prompts/skeptic";
 import { coveredByThread } from "../publish/publish";
 import { rankForVerification } from "../gates/skeptic";
 import { calibrate, groupReasons, type Bucket, type CalibrationFinding } from "./calibrate";
-import { evaluateRun, totalsOf, STAGES, type EvaluatedFinding, type GoldenSet } from "./evaluate";
+import { evaluateRun, totalsOf, STAGES, type EvaluatedFinding, type GoldenSet, type Stage } from "./evaluate";
+import {
+  candidatesOf,
+  compareScores,
+  fromAacr,
+  fromMartian,
+  matchRun,
+  nearby,
+  onLines,
+  sampleSuite,
+  suiteHash,
+  summarize,
+  type Candidate,
+  type CaseSeries,
+  type Reference,
+  type ScoreFile,
+} from "./bench";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
 import { stampHashes, stampLabel } from "../libs/stamp";
 import type { CriterionCheck, ReqVerdict, RequirementResult, WorkItem } from "../libs/types";
@@ -2225,6 +2241,184 @@ section("golden-set evaluation: which stage lost the defect, not just that one w
 // Toy fixtures prove the algorithm runs; this proves it lands on the right line in code
 // that looks like real code. Every expectation below was verified against `grep -n` on the
 // actual repository these files came from.
+section("benchmarks: imported as they score themselves, matched one to one, held to their own noise");
+{
+  // AACR: source_commit is the base and target_commit the head — its own converter says so.
+  const aacr = fromAacr(
+    [
+      {
+        githubPrUrl: "https://github.com/acme/shop/pull/12",
+        source_commit: "b".repeat(40),
+        target_commit: "c".repeat(40),
+        project_main_language: "Go",
+        comments: [
+          { note: "nil map write", path: "pkg/a.go", from_line: 9, to_line: 7, side: "right", category: "Code Defect" },
+          { note: "no path, dropped", path: "", from_line: 1, to_line: 1 },
+          { note: "deleted-side remark", path: "/pkg/a.go", from_line: 3, to_line: null, side: "left" },
+        ],
+      },
+      { githubPrUrl: "https://gitlab.com/x/y/merge_requests/1", source_commit: "a", target_commit: "b", comments: [{ note: "n", path: "p" }] },
+    ],
+    "fixture",
+  );
+  const shop = aacr.cases[0];
+  eq("AACR: one case per GitHub pull request", aacr.cases.length, 1);
+  eq("...named as the benchmark's own converter names it", shop?.id, "acme__shop@ccccccc");
+  eq(
+    "...source_commit is the base and target_commit the head",
+    [shop?.base, shop?.head, shop?.pr, shop?.repo],
+    ["b".repeat(40), "c".repeat(40), 12, "https://github.com/acme/shop"],
+  );
+  eq("...a comment with no path is dropped, the rest keep their place in the dataset", shop?.references.map((r) => r.id), ["acme__shop@ccccccc#1", "acme__shop@ccccccc#3"]);
+  eq("...a reversed range is put in order", shop?.references[0]?.lines, [7, 9]);
+  eq(
+    "...one line given is one line, and the leading slash goes",
+    [shop?.references[1]?.file, shop?.references[1]?.lines, shop?.references[1]?.side],
+    ["pkg/a.go", [3, 3], "left"],
+  );
+
+  const martian = fromMartian(
+    [
+      {
+        name: "keycloak.json",
+        entries: [
+          { url: "https://github.com/keycloak/keycloak/pull/1", comments: [{ comment: "c1", severity: "High", category: "bug" }] },
+          { url: "https://github.com/ai-code-review-evaluation/keycloak-x/pull/2", original_url: "https://github.com/keycloak/keycloak/pull/3", comments: [{ comment: "c2" }] },
+          {
+            url: "https://github.com/ai-code-review-evaluation/discourse-x/pull/4",
+            original_url: `https://github.com/discourse/discourse/commit/${"d".repeat(40)}`,
+            comments: [{ comment: "c3" }],
+          },
+          { url: "https://github.com/ai-code-review-evaluation/sentry-x/pull/5", original_url: null, comments: [{ comment: "c4" }] },
+          { url: "https://github.com/keycloak/keycloak/pull/1", comments: [{ comment: "the same pull request again" }] },
+        ],
+      },
+    ],
+    "fixture",
+  );
+  const byId = new Map(martian.cases.map((c) => [c.id, c]));
+  eq("Martian: an upstream pull request is taken as it is", [byId.get("keycloak__keycloak#1")?.pr, byId.get("keycloak__keycloak#1")?.language], [1, "Java"]);
+  eq("...a re-creation of one is reviewed as its original", byId.get("keycloak__keycloak#3")?.repo, "https://github.com/keycloak/keycloak");
+  eq(
+    "...a re-creation of a commit reviews that commit against its parent",
+    [byId.get("discourse__discourse@ddddddd")?.base, byId.get("discourse__discourse@ddddddd")?.head],
+    [`${"d".repeat(40)}^`, "d".repeat(40)],
+  );
+  check(
+    "...one with no original is left unresolved, not guessed",
+    (byId.get("ai-code-review-evaluation__sentry-x#5")?.unresolved ?? "").includes("known only to GitHub's API"),
+  );
+  check("...two entries for one pull request stay two cases", byId.has("keycloak__keycloak#1~2"));
+  eq("...and a text reference carries no location", martian.cases[0]?.references[0], { id: "keycloak__keycloak#1#1", text: "c1", category: "bug", severity: "High" });
+
+  const sampled = sampleSuite(martian, 2, 7);
+  eq("a sample is reproducible", sampled.cases.map((c) => c.id), sampleSuite(martian, 2, 7).cases.map((c) => c.id));
+  check("...keeps the dataset's order", sampled.cases.map((c) => martian.cases.indexOf(c)).every((v, i, a) => i === 0 || v > a[i - 1]!));
+  check("...and says it is a sample", sampled.source.includes("2 of 5 cases (seed 7)"), sampled.source);
+
+  const pinnedCopy = { ...aacr, cases: aacr.cases.map((c) => ({ ...c, base: "e".repeat(40), resolvedBy: "x" })) };
+  eq("pinning a case's commits does not change what the suite is", suiteHash(pinnedCopy), suiteHash(aacr));
+  check("...changing what it should find does", suiteHash({ ...aacr, cases: aacr.cases.map((c) => ({ ...c, references: c.references.slice(1) })) }) !== suiteHash(aacr));
+
+  // AACR's location rule: overlapping, or at most k lines apart.
+  const ref = (over: Partial<Reference> = {}): Reference => ({ id: "r", text: "t", file: "src/a.ts", lines: [10, 12], ...over });
+  const cand = (start: number | undefined, over: Partial<Candidate> = {}): Candidate => ({
+    stage: "inline",
+    file: "src/a.ts",
+    ...(start === undefined ? {} : { start, end: start }),
+    claim: "c",
+    sources: ["m1"],
+    ...over,
+  });
+  eq("a comment inside the range is on it", onLines(cand(11), ref(), 0), true);
+  eq("...one line either side is within k = 1", [onLines(cand(13), ref(), 1), onLines(cand(9), ref(), 1)], [true, true]);
+  eq("...but not within k = 0", onLines(cand(13), ref(), 0), false);
+  eq("...and two lines away is not within k = 1", onLines(cand(14), ref(), 1), false);
+  eq("...another file never is", onLines(cand(11, { file: "src/b.ts" }), ref(), 5), false);
+  eq("...nor is a reference on deleted lines, where prloop never comments", onLines(cand(11), ref({ side: "left" }), 5), false);
+  eq("...nor a finding with no line", onLines(cand(undefined, { stage: "anchor-failed" }), ref(), 5), false);
+  eq("an unanchored finding is near its file's references, for the ladder only", nearby([cand(undefined, { stage: "anchor-failed" })], ref(), 1), [0]);
+
+  // One to one, hits and misses alike.
+  const refs = [ref({ id: "r1", lines: [10, 10] }), ref({ id: "r2", lines: [11, 11] }), ref({ id: "r3", lines: [40, 40] })];
+  const cands: Candidate[] = [
+    cand(10, { sources: ["m1", "m2"] }),
+    cand(11, { stage: "severity", sources: ["m2"] }),
+    cand(40, { stage: "refuted" }),
+    cand(41, { stage: "cap" }),
+  ];
+  const outcomes = matchRun(refs, cands, (r) => nearby(cands, r, 1));
+  eq("one comment near two references is credited to the first only", outcomes.map((o) => o.stage), ["inline", "severity", "cap"]);
+  eq("...the second is filed under what else was near it", outcomes[1]?.sources, ["m2"]);
+  eq("...and the furthest stage wins: cut by the cap outranks refuted", outcomes[2]?.stage, "cap");
+  const lone = [cand(undefined, { stage: "anchor-failed" })];
+  eq(
+    "one unanchorable quote is one anchoring failure, not one per reference on its file",
+    matchRun([ref({ id: "a" }), ref({ id: "b" })], lone, (r) => nearby(lone, r, 1)).map((o) => o.stage),
+    ["anchor-failed", "not-found"],
+  );
+  eq(
+    "every stage of a run is a candidate",
+    candidatesOf({
+      inline: [{ file: "a", start: 1, end: 1, sources: ["m"], claim: "x" }],
+      belowBar: [{ file: "a", start: 2, end: 2, sources: ["m"], suppressedBy: "severity" }],
+      degraded: [{ file: "a", sources: ["m"], anchorFailure: "quote-not-found" }],
+      refuted: [{ file: "a", start: 3, end: 3, sources: ["m"] }],
+    }).map((c) => c.stage),
+    ["inline", "severity", "refuted", "anchor-failed"],
+  );
+
+  const series: CaseSeries[] = [
+    { key: "a", refs: 4, hits: [2, 1], hitIds: [["a1", "a2"], ["a3"]], inline: [4, 4] },
+    { key: "b", refs: 6, hits: [3, 3], hitIds: [["b1", "b2", "b3"], ["b1", "b2", "b3"]], inline: [5, 5] },
+  ];
+  const sum = summarize(series);
+  eq("recall averages each case over its runs, then pools", sum.recall.toFixed(4), ((1.5 + 3) / 10).toFixed(4));
+  eq("...per run", sum.perRun.map((r) => r.toFixed(2)), ["0.50", "0.40"]);
+  eq("...and hit in any run", sum.anyRun.toFixed(2), "0.60");
+  eq("precision is credited hits over inline comments", sum.precision.toFixed(4), (9 / 18).toFixed(4));
+  // Case a scored 2 then 1 (sample variance 0.5), b did not move: 0.5 over 10 references per
+  // reference, so one run's hits move by sqrt(0.05 * 10) and its recall by that over 10.
+  eq("one run's sd comes from the spread between runs of the same commits", sum.sd?.toFixed(5), (Math.sqrt(0.5) / 10).toFixed(5));
+  eq("...and without a repeat there is none", summarize([{ key: "a", refs: 4, hits: [2], hitIds: [["a1"]], inline: [3] }]).sd, undefined);
+
+  const scoreOf = (hits: number[][], over: Partial<ScoreFile> = {}): ScoreFile => ({
+    version: 1,
+    suite: { name: "s", hash: "h" },
+    primary: "line",
+    k: 1,
+    stamps: [],
+    unscored: [],
+    labels: {},
+    cases: hits.map((runs, ci) => ({
+      id: `c${ci}`,
+      key: `c${ci}@x..y`,
+      runs: runs.map((h, n) => ({
+        run: n + 1,
+        inline: 10,
+        refuted: { total: 0, onReference: 0 },
+        line: Array.from({ length: 10 }, (_, i) => ({ ref: `c${ci}r${i}`, stage: (i < h ? "inline" : "not-found") as Stage, sources: [] })),
+      })),
+    })),
+    ...over,
+  });
+  const verdictOf = (r: ReturnType<typeof compareScores>) => ("refused" in r ? `refused: ${r.refused}` : r.verdict);
+  const floor = scoreOf([[5, 4], [5, 6], [3, 3], [4, 5]]);
+  eq("two single runs cannot be told from a re-run", verdictOf(compareScores(scoreOf([[5], [5]]), scoreOf([[4], [4]]))), "no noise estimate");
+  eq("a change inside the measured noise is within it", verdictOf(compareScores(floor, scoreOf([[5], [5], [4], [4]]))), "within noise");
+  const drop = compareScores(floor, scoreOf([[1], [1], [0], [1]]));
+  eq("a drop past two sd of it is a regression", verdictOf(drop), "worse");
+  check("...naming what the baseline found and the candidate did not", "lost" in drop && drop.lost.includes("c0r4"));
+  eq("...and a rise past it an improvement", verdictOf(compareScores(floor, scoreOf([[9], [9], [9], [9]]))), "better");
+  const partial = compareScores(floor, scoreOf([[5, 4], [5, 6]]));
+  eq("only cases both sides scored are compared", "cases" in partial ? partial.cases : -1, 2);
+  check("a different suite is refused", verdictOf(compareScores(floor, scoreOf([[1]], { suite: { name: "s", hash: "other" } }))).includes("different suites"));
+  check("...and a different line tolerance", verdictOf(compareScores(floor, scoreOf([[1]], { k: 3 }))).includes("line tolerances"));
+  const judgedBy = (model: string) => scoreOf([[1]], { primary: "judged", judge: { model, prompt: "p" } });
+  check("...and judged scores under two judges", verdictOf(compareScores(judgedBy("a"), judgedBy("b"))).includes("judged differently"));
+  check("...while one judge compares", !verdictOf(compareScores(judgedBy("a"), judgedBy("a"))).startsWith("refused"));
+}
+
 section("real PR anchoring (seeded-defect range)");
 {
   const seeded: FileDiff[] = SEEDED_FILES.map((f) => {

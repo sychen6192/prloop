@@ -32,9 +32,11 @@ they fail for different reasons:
   of a run CI reads.
 - `scripts/selftest-e2e.ts` — one pull request reviewed twice, a full review and then
   `--since auto` on the next push, through every stage against a fake Azure DevOps and a fake
-  model that answers only from what its prompt shows, and a local branch through
-  `local-review.ts review` with nothing posted. The place a defect between two stages shows
-  up: what the PR ends up carrying, not what one module returned.
+  model that answers only from what its prompt shows; a local branch through
+  `local-review.ts review` with nothing posted; and a benchmark through `bench.ts` — run twice,
+  scored by line and by a judge, compared, and refused a second configuration. The place a
+  defect between two stages shows up: what the PR ends up carrying, not what one module
+  returned.
 - `scripts/selftest-docs.ts` — the claims the documentation makes about the code (an undefined
   symbol in the README's model-call arithmetic, a Node version pinned in two places that
   disagree, a link to a path that was renamed, a selftest nobody runs). A doc that has quietly

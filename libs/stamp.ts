@@ -37,13 +37,21 @@ export interface RunStamp {
 
 const hash12 = (text: string) => createHash("sha1").update(text).digest("hex").slice(0, 12);
 
+// The benchmark judge's prompt scores reviews and shapes none. Hashing it would split two
+// identical reviews into two groups whenever the judge was reworded; a judged score records
+// the judge's own hash instead (scripts/bench.ts).
+const NOT_REVIEW_PROMPTS = new Set(["prompts/judge.ts"]);
+
 /** The files every prompt is built from, and the opencode agent's own instructions. */
 function promptSources(root: string): string {
   const parts: string[] = [];
   for (const dir of ["prompts", "agents"]) {
     let names: string[];
     try {
-      names = fs.readdirSync(path.join(root, dir)).filter((n) => n.endsWith(".ts") || n.endsWith(".md")).sort();
+      names = fs
+        .readdirSync(path.join(root, dir))
+        .filter((n) => (n.endsWith(".ts") || n.endsWith(".md")) && !NOT_REVIEW_PROMPTS.has(`${dir}/${n}`))
+        .sort();
     } catch {
       continue;
     }

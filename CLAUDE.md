@@ -13,12 +13,13 @@ npx tsx scripts/selftest-runner.ts   # HTTP model transport: retries, fallback, 
 npx tsx scripts/selftest-publish.ts  # what publish() writes to the PR
 npx tsx scripts/selftest-ado.ts      # ADO intake edges: paging, parent PBIs, conventions
 npx tsx scripts/selftest-cli.ts      # argument grammar and exit codes
-npx tsx scripts/selftest-e2e.ts      # one PR reviewed twice end to end: full, then --since auto
+npx tsx scripts/selftest-e2e.ts      # one PR reviewed twice end to end, a local branch, a benchmark
 npx tsx scripts/selftest-docs.ts     # claims the docs make about the code
 npx tsx scripts/demo.ts              # render comments + review.html from fake data, no network
 npx tsx scripts/calibrate.ts         # dismissal / kill rates from runs/ + dismissals.jsonl
 npx tsx scripts/evaluate.ts          # golden-set recall: which stage lost each known defect
 npx tsx scripts/replay.ts <run dir>  # re-run everything after the models, offline (PRR_SAVE_REPLAY=1 runs)
+npx tsx scripts/bench.ts <import|run|score|compare>  # a public benchmark (AACR, Martian) end to end
 ```
 
 Everything is offline-testable; no test needs ADO credentials or a model endpoint. The five
@@ -60,7 +61,7 @@ and closes its server in a `finally`.
 | `rules/` | reviewer rules as markdown with `applyTo` globs |
 | `publish/` | comment rendering, the hidden marker protocol, dedup (fingerprint + position), lifecycle |
 | `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types and the ReviewContext contract (SSOT) |
-| `scripts/` | selftests (+ `fakes/`), doctor/probe/tlsfix diagnostics, local-review |
+| `scripts/` | selftests (+ `fakes/`), doctor/probe/tlsfix diagnostics, local-review, evaluate/calibrate/replay/bench |
 
 ## Conventions
 

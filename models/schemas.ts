@@ -226,6 +226,22 @@ export const TRIAGE_SCHEMA = {
   },
 } as const;
 
+// Benchmark judge (scripts/bench.ts, prompts/judge.ts): which numbered candidates describe the
+// reference comment's issue. Numbers, not quotes or text: the judge's only job is to point.
+export const JUDGE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["same_issue", "reason"],
+  properties: {
+    same_issue: {
+      type: "array",
+      items: { type: "integer" },
+      description: "The numbers of the candidates that identify the same issue as the reference; empty when none do.",
+    },
+    reason: { type: "string", description: "One sentence." },
+  },
+} as const;
+
 /**
  * The schema as prompt text, for paths that cannot enforce it at the token layer: the
  * opencode runner (no response_format pass-through) and the HTTP runner with

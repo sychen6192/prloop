@@ -21,6 +21,14 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   history, the acceptance criteria from a file. It is what an external benchmark runs through,
   and it needs no Azure DevOps at all. `runReview` takes the conventions and the criteria as
   providers, as it already took the intake.
+- `scripts/bench.ts` runs a public benchmark end to end: `import` turns AACR-Bench's
+  `positive_samples.json` or Martian's `golden_comments/` into one suite format, `run` reviews
+  every case through `local-review.ts review` against a bare treeless clone fetched with git
+  alone (pinning a pull request's base from its merge base when the dataset names only the
+  pull request), `score` matches the way AACR does — within ±k lines, one comment per
+  reference — with an optional model judge as a second, labelled number, and `compare` sets
+  two configurations against the re-run noise `--repeat 2` measured, refusing across judges,
+  tolerances and suites and exiting `2` on a regression past it.
 
 - Two-axis review: a **code axis** (N finder models over the diff, same prompt, in parallel)
   and a **requirement axis** (linked work items and acceptance criteria, walking one level up),

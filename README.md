@@ -592,6 +592,7 @@ npm run check                 # typecheck + selftest
 npx tsx scripts/demo.ts       # render comments from fake data, no ADO or model calls
 npx tsx scripts/calibrate.ts  # is it getting better? joins runs/ to the dismissal store
 npx tsx scripts/replay.ts <run dir>  # re-run a saved run after a threshold or code change
+npx tsx scripts/bench.ts run <suite.json> <out dir>  # a public benchmark, reviewed and scored
 ```
 
 `scripts/replay.ts` re-runs everything after the models — anchoring, dedupe, the skeptic's
@@ -671,6 +672,47 @@ is a measured mistake; the rest are reported as unattributed and counted against
 The per-finder table is the multi-model question in numbers. Run the same golden set with
 `PRR_FINDER_MODELS=a` and then `a,b` into different `PRR_RUNS_DIR`s and compare.
 
+`scripts/bench.ts` asks the same question of references somebody else labelled, at a scale a
+hand-written golden set never reaches: [AACR-Bench](https://github.com/alibaba/aacr-bench)
+(196 PRs in its published set, 10 languages, 1,506 references, each with a path and a line
+range) and [Martian's Code Review Bench](https://github.com/withmartian/code-review-benchmark)
+(50 PRs, 173 references, text only — Java through Keycloak). Keep everything under `runs/`,
+which git ignores:
+
+```bash
+npx tsx scripts/bench.ts import aacr positive_samples.json runs/bench/aacr.json [--sample 30]
+npx tsx scripts/bench.ts run runs/bench/aacr.json runs/bench/aacr-base --repeat 2
+npx tsx scripts/bench.ts score runs/bench/aacr.json runs/bench/aacr-base [--judge <model>]
+# change a prompt, a model or a setting, then into a NEW directory:
+npx tsx scripts/bench.ts run runs/bench/aacr.json runs/bench/aacr-try
+npx tsx scripts/bench.ts score runs/bench/aacr.json runs/bench/aacr-try
+npx tsx scripts/bench.ts compare runs/bench/aacr-base/score.json runs/bench/aacr-try/score.json
+```
+
+`run` reviews every case with `local-review.ts review` in its own process — your models, as a
+dry run, static analysis off — against a bare treeless clone under `runs/bench/repos/`,
+fetched with git alone: every commit of the default branch and no file until a diff reads
+one (keycloak's is 14 MB). A pull request's base is not recorded in git, so a case that names
+only a pull request is pinned from it: its head from `refs/pull/<n>/head`, its base from the
+merge base with the default branch, or the first parent of the merge commit when it was merged
+with one. The commits are written back into the suite, so every later directory reviews the
+same diff. `run` resumes where it stopped, and refuses to add a run made under another
+configuration (another run stamp) to a directory: one directory, one configuration.
+
+`score` matches the way AACR does — a comment within ±k lines of a reference (`--k`, default
+`1`), each comment credited to at most one reference — and files every miss under the same
+stages as `evaluate.ts`. `--judge <model>` adds a model's opinion of whether the comments on
+those lines are the same issue, as a second, labelled number; Martian's references carry no
+location, so there the judge is the only matcher and the score says so. Judges agree with
+developers' own labels only 0.44–0.62 of the time, so a judged score holds only under its judge
+model and prompt: both are recorded, verdicts are cached (re-scoring is free), and `compare`
+refuses to set two judges against each other. `--repeat 2` measures the noise — how far recall
+moves when the same commits are reviewed again — and `compare` calls a change better or worse
+only past twice that, and exits `2` on a regression; with no repeat on either side it says the
+difference cannot be told from a re-run. Two of Martian's fifty cases are re-creations whose
+base only GitHub's API knows; they are listed as unresolved until you set `base` and `head` in
+the suite by hand.
+
 `scripts/selftest.ts` is the regression net for anchoring — **run it after touching
 `libs/diff.ts` or `anchoring/locate.ts`**. Its assertions map directly onto the causes of
 "comment on the wrong line".
@@ -679,7 +721,8 @@ The per-finder table is the multi-model question in numbers. Run the same golden
 HTTP model transport (`selftest-runner.ts`), what publishing writes to a PR
 (`selftest-publish.ts`), ADO intake's edges (`selftest-ado.ts`), the CLI's argument grammar and
 exit codes (`selftest-cli.ts`), one pull request reviewed twice end to end — a full review,
-then `--since auto` on the next push (`selftest-e2e.ts`) — and the claims the documentation
+then `--since auto` on the next push — plus a local branch and a benchmark run, scored and
+compared (`selftest-e2e.ts`), and the claims the documentation
 makes about the code (`selftest-docs.ts`). The five that talk to a network drive the real code
 against fake `node:http` servers in `scripts/fakes/` — no credentials, no endpoint, no fixed
 ports.

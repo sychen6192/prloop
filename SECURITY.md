@@ -99,6 +99,11 @@ no source, no quote — and neither is ever read into a model prompt.
 - **prloop never writes its own configuration** and never votes on a PR. It posts comments and,
   optionally, a status.
 
+`scripts/bench.ts` clones public repositories and reviews them like any other change, so their
+code goes to the configured model endpoint too; its clones, runs and scores stay wherever you
+point it (the README uses `runs/bench/`). Clone and fetch run with the same scrubbed
+environment as the static tools, and it executes nothing from the repositories it clones.
+
 Known limit worth stating: a `runs/` directory created before prloop made them owner-only
 keeps its old mode. On an existing install, run `chmod -R go-rwx runs/` once.
 

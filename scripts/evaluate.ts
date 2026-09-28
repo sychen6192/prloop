@@ -99,6 +99,8 @@ export interface EvaluatedFinding {
   suppressedBy?: string;
   /** From findings.json degraded: why the quote would not resolve to a line. */
   anchorFailure?: string;
+  /** What the finding said: scripts/bench.ts shows it to a judge. */
+  claim?: string;
 }
 
 export interface RunArtifacts {
@@ -143,8 +145,8 @@ function overlaps(f: EvaluatedFinding, r: Region): boolean {
   return f.start <= r.lines[1] && (f.end ?? f.start) >= r.lines[0];
 }
 
-/** Rank within belowBar: closest to having been published first. */
-const SUPPRESSION_RANK: Record<string, Stage> = {
+/** The stage each publish gate's suppression files a finding under. */
+export const SUPPRESSION_RANK: Record<string, Stage> = {
   cap: "cap",
   severity: "severity",
   "no-corroboration": "no-corroboration",
@@ -306,6 +308,7 @@ function toFinding(v: unknown): EvaluatedFinding | undefined {
     ...(typeof o["category"] === "string" ? { category: o["category"] } : {}),
     ...(typeof o["suppressedBy"] === "string" ? { suppressedBy: o["suppressedBy"] } : {}),
     ...(typeof o["anchorFailure"] === "string" ? { anchorFailure: o["anchorFailure"] } : {}),
+    ...(typeof o["claim"] === "string" ? { claim: o["claim"] } : {}),
   };
 }
 

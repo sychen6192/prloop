@@ -217,6 +217,23 @@ function disputeAnswer(prompt: string): unknown {
   return { verdicts };
 }
 
+/**
+ * The benchmark judge (scripts/bench.ts): a candidate is the reference's issue when both name
+ * the same thing. Read out of the fences the prompt puts them in, so a candidate is judged on
+ * what it says and a reference on what it says, never on the framing around them.
+ */
+const JUDGE_TOPICS = ["fractional", "fee", "header"];
+function judgeAnswer(prompt: string): unknown {
+  const reference = /<reference-comment>\n([\s\S]*?)\n<\/reference-comment>/.exec(prompt)?.[1]?.toLowerCase() ?? "";
+  const list = /<candidate-comments>\n([\s\S]*?)\n<\/candidate-comments>/.exec(prompt)?.[1] ?? "";
+  const topics = JUDGE_TOPICS.filter((t) => reference.includes(t));
+  const same = list.split("\n").flatMap((l) => {
+    const m = /^\[(\d+)\] /.exec(l);
+    return m && topics.some((t) => l.toLowerCase().includes(t)) ? [Number(m[1])] : [];
+  });
+  return { same_issue: same, reason: same.length > 0 ? "the same problem" : "different problems" };
+}
+
 /** Routes by the stage asking — its schema — never by arrival order: the stages run concurrently. */
 function reviewer(call: RecordedCall): Responder {
   const schema = String((call.body["response_format"] as { json_schema?: { name?: string } } | undefined)?.json_schema?.name ?? "");
@@ -233,9 +250,58 @@ function reviewer(call: RecordedCall): Responder {
       return json(requirementAnswer(prompt));
     case "req_dispute":
       return json(disputeAnswer(prompt));
+    case "judge":
+      return json(judgeAnswer(prompt));
     default:
       return httpError(500, JSON.stringify({ error: { message: `fake reviewer: no stage called ${schema}` } }));
   }
+}
+
+// ─── Local repositories and scripts, for the sections that run without ADO ───
+
+/** A throwaway repository whose `feature` branch adds splitEvenly — and its bug — to PAY_1. */
+function payRepo(prefix: string): { repo: string; git: (...args: string[]) => string } {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const git = (...args: string[]) => {
+    const r = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "e2e@example.invalid");
+  git("config", "user.name", "e2e");
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "pay.ts"), PAY_1);
+  git("add", ".");
+  git("commit", "-q", "-m", "payments");
+  git("checkout", "-q", "-b", "feature");
+  fs.writeFileSync(path.join(repo, "src", "pay.ts"), PAY_2);
+  git("commit", "-q", "-am", "split evenly");
+  git("checkout", "-q", "main");
+  return { repo, git };
+}
+
+/**
+ * One of this repository's scripts in its own process, as a user runs it — and asynchronously,
+ * because the fake endpoints answering it live in this one. A script that hangs fails the net
+ * instead of stalling CI until the job's own timeout.
+ */
+function script(name: string, args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ code: number | null; out: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(
+      process.execPath,
+      [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), path.join(root, "scripts", name), ...args],
+      { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "";
+    const timer = setTimeout(() => child.kill(), 180_000);
+    child.stdout.on("data", (c: Buffer) => (out += c.toString()));
+    child.stderr.on("data", (c: Buffer) => (out += c.toString()));
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, out });
+    });
+  });
 }
 
 // ─── The run ─────────────────────────────────────────────────────────────────
@@ -531,59 +597,147 @@ try {
     // scripts/local-review.ts only built prompts and matched quotes; nothing reviewed a branch
     // before it became a PR, and nothing could run a benchmark's repositories through the
     // real pipeline. `review` does both, as a dry run by construction.
-    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-local-"));
-    const git = (...args: string[]) => {
-      const r = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
-      if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
-    };
+    const { repo } = payRepo("prloop-local-");
+    const localRuns = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-local-runs-"));
     try {
-      git("init", "-q", "-b", "main");
-      git("config", "user.email", "e2e@example.invalid");
-      git("config", "user.name", "e2e");
-      fs.mkdirSync(path.join(repo, "src"));
-      fs.writeFileSync(path.join(repo, "src", "pay.ts"), PAY_1);
-      git("add", ".");
-      git("commit", "-q", "-m", "payments");
-      git("checkout", "-q", "-b", "feature");
-      fs.writeFileSync(path.join(repo, "src", "pay.ts"), PAY_2);
-      git("commit", "-q", "-am", "split evenly");
-      const criteria = path.join(repo, "criteria.md");
+      const criteria = path.join(localRuns, "criteria.md");
       fs.writeFileSync(criteria, "- Splitting a total evenly is supported\n");
-
       models.reset();
       models.answerBy(reviewer);
       ado.reset();
-      const localRuns = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-local-runs-"));
-      // Its own process, as a user would run it — and asynchronously, because the fake model
-      // endpoint answering it lives in this one.
-      const res = await new Promise<{ code: number | null; out: string }>((resolve) => {
-        const child = spawn(
-          process.execPath,
-          [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), path.join(root, "scripts", "local-review.ts"), "review", repo, "main", "feature", "--criteria", criteria],
-          { env: { ...process.env, PRR_RUNS_DIR: localRuns, PRR_DRY_RUN: "" }, stdio: ["ignore", "pipe", "pipe"] },
-        );
-        let out = "";
-        // A review that hangs must fail this net, not stall CI until the job's own timeout.
-        const timer = setTimeout(() => child.kill(), 120_000);
-        child.stdout.on("data", (c: Buffer) => (out += c.toString()));
-        child.stderr.on("data", (c: Buffer) => (out += c.toString()));
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          resolve({ code, out });
-        });
+      const res = await script("local-review.ts", ["review", repo, "main", "feature", "--criteria", criteria], {
+        PRR_RUNS_DIR: localRuns,
+        PRR_DRY_RUN: "",
       });
-      try {
-        check("the local review ran", res.out.includes("Reviewed 1 files"), res.out.slice(-800));
-        check("...and reported the bug the branch introduced", res.out.includes("fractional cents"), res.out.slice(-800));
-        eq("...judged the criteria file", stageCalls("requirements").length, 1);
-        eq("...and exited clean: the finding is medium and the criterion is met", res.code, 0);
-        eq("nothing was sent to Azure DevOps at all", ado.requests.length, 0);
-        const review = fs.readdirSync(localRuns, { recursive: true }).map(String).find((p) => p.endsWith("review.html"));
-        check("the run directory holds the review", review !== undefined);
-      } finally {
-        fs.rmSync(localRuns, { recursive: true, force: true });
-      }
+      check("the local review ran", res.out.includes("Reviewed 1 files"), res.out.slice(-800));
+      check("...and reported the bug the branch introduced", res.out.includes("fractional cents"), res.out.slice(-800));
+      eq("...judged the criteria file", stageCalls("requirements").length, 1);
+      eq("...and exited clean: the finding is medium and the criterion is met", res.code, 0);
+      eq("nothing was sent to Azure DevOps at all", ado.requests.length, 0);
+      const review = fs.readdirSync(localRuns, { recursive: true }).map(String).find((p) => p.endsWith("review.html"));
+      check("the run directory holds the review", review !== undefined);
     } finally {
+      fs.rmSync(localRuns, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  }
+
+  section("a benchmark, end to end: run twice, score by line and by judge, compare, one configuration per directory");
+  {
+    // scripts/bench.ts drives local-review in child processes, pins each case to commits, and
+    // scores what the runs left on disk — every step its own process here, as a user runs it.
+    const { repo, git } = payRepo("prloop-bench-upstream-");
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-bench-"));
+    try {
+      const main = git("rev-parse", "main");
+      const feature = git("rev-parse", "feature");
+      // GitHub keeps a pull request's head at refs/pull/<n>/head, and so does this upstream.
+      git("update-ref", "refs/pull/7/head", feature);
+      const located = path.join(work, "located.json");
+      const textOnly = path.join(work, "text-only.json");
+      fs.writeFileSync(
+        located,
+        JSON.stringify({
+          name: "located",
+          source: "selftest",
+          cases: [
+            {
+              id: "shop@1",
+              repo,
+              base: main,
+              head: feature,
+              references: [
+                { id: "shop@1#1", text: "splitEvenly() returns fractional cents", file: "src/pay.ts", lines: [15, 15], category: "Code Defect" },
+                { id: "shop@1#2", text: "refund() no longer gives the fee back", file: "src/pay.ts", lines: [11, 11], category: "Code Defect" },
+                { id: "shop@1#3", text: "the old refund added the fee", file: "src/pay.ts", lines: [11, 11], side: "left", category: "Maintainability" },
+              ],
+            },
+          ],
+        }),
+      );
+      fs.writeFileSync(
+        textOnly,
+        JSON.stringify({
+          name: "text-only",
+          source: "selftest",
+          cases: [
+            {
+              id: "shop#7",
+              repo,
+              pr: 7,
+              references: [
+                { id: "shop#7#1", text: "Splitting a total evenly can yield fractional cents" },
+                { id: "shop#7#2", text: "The CSV export is missing its header row" },
+              ],
+            },
+          ],
+        }),
+      );
+      models.reset();
+      models.answerBy(reviewer);
+      ado.reset();
+      const out = path.join(work, "out");
+      const repos = path.join(work, "repos");
+      const bench = (...args: string[]) => script("bench.ts", args);
+
+      const ran = await bench("run", located, out, "--repeat", "2", "--repos", repos);
+      check("bench run reviews the case twice", ran.code === 0 && ran.out.includes("run 2/2: 2 inline comments"), ran.out.slice(-1500));
+      eq("...with both finders each time", stageCalls("findings").length, 4);
+      const pinned = JSON.parse(fs.readFileSync(located, "utf8")) as { cases: Array<{ base: string; head: string; resolvedBy?: string }> };
+      eq("the suite is pinned to the commits reviewed", [pinned.cases[0]?.base, pinned.cases[0]?.head, pinned.cases[0]?.resolvedBy], [main, feature, "base from the dataset"]);
+      const resumed = await bench("run", located, out, "--repeat", "2", "--repos", repos);
+      check("a second run of the same command resumes: nothing left to review", resumed.code === 0 && stageCalls("findings").length === 4, resumed.out.slice(-800));
+
+      const byLine = await bench("score", located, out);
+      check("score, by location", byLine.code === 0 && byLine.out.includes("Recall, on the reference's lines (±1): 33.3% of 3 references"), byLine.out.slice(-2500));
+      check("...per run and in any run", byLine.out.includes("(run 1 33.3%, run 2 33.3%; hit in any run 33.3%)"), byLine.out.slice(-2500));
+      check("...precision over the inline comments", byLine.out.includes("Precision: 50.0% of 4 inline comments"), byLine.out.slice(-2500));
+      check("...and the noise the repeat measured", byLine.out.includes("Noise: one run's recall moves by ±0.0 pt"), byLine.out.slice(-2500));
+      check("a reference on deleted lines is named, not silently unreachable", byLine.out.includes("1 reference is on deleted lines"), byLine.out.slice(-2500));
+      const score = JSON.parse(fs.readFileSync(path.join(out, "score.json"), "utf8")) as {
+        primary: string;
+        cases: Array<{ runs: Array<{ line?: Array<{ ref: string; stage: string }> }> }>;
+      };
+      eq(
+        "each reference is filed under the furthest stage it reached",
+        score.cases[0]?.runs[0]?.line?.map((o) => o.stage),
+        // The hit; a hallucinated quote on the same file that would not anchor; a deleted line.
+        ["inline", "anchor-failed", "not-found"],
+      );
+      eq("...in both runs", score.cases[0]?.runs.length, 2);
+
+      const judged = await bench("score", located, out, "--judge", "judge-m");
+      check("the judge is a second, labelled number", judged.code === 0 && judged.out.includes("Secondary, the judge on the same candidates:"), judged.out.slice(-2500));
+      check("...naming the judge", judged.out.includes("judged by judge-m (prompt "), judged.out.slice(-2500));
+      eq("...asked only about what is on a reference's lines, once per distinct question", stageCalls("judge").length, 2);
+      const rejudged = await bench("score", located, out, "--judge", "judge-m");
+      check("re-scoring under the same judge costs no call", rejudged.out.includes("0 judge calls made") && stageCalls("judge").length === 2, rejudged.out.slice(-600));
+
+      fs.copyFileSync(path.join(out, "score.json"), path.join(work, "baseline.json"));
+      const compared = await bench("compare", path.join(work, "baseline.json"), path.join(out, "score.json"));
+      check("compare: two scores of the same runs are within noise", compared.code === 0 && compared.out.includes("Within noise"), compared.out);
+
+      const textOut = path.join(work, "text-out");
+      const textRun = await bench("run", textOnly, textOut, "--repos", repos);
+      const textSuite = JSON.parse(fs.readFileSync(textOnly, "utf8")) as { cases: Array<{ base?: string; head?: string; resolvedBy?: string }> };
+      check("a pull request with no base is resolved from git alone", textRun.code === 0, textRun.out.slice(-1500));
+      eq(
+        "...its head from refs/pull/7/head and its base from the merge base",
+        [textSuite.cases[0]?.head, textSuite.cases[0]?.base, textSuite.cases[0]?.resolvedBy],
+        [feature, main, "head from refs/pull/7/head; base = merge base with main"],
+      );
+      const noJudge = await bench("score", textOnly, textOut);
+      check("references with no location refuse a score without a judge", noJudge.code === 1 && noJudge.out.includes("only a judge can match them"), noJudge.out.slice(-600));
+      const textScore = await bench("score", textOnly, textOut, "--judge", "judge-m");
+      check("...and are scored by it", textScore.code === 0 && textScore.out.includes("Recall, the same issue, judged by judge-m"), textScore.out.slice(-2500));
+      check("...one of two found", textScore.out.includes("50.0% of 2 references"), textScore.out.slice(-2500));
+
+      const mixed = await script("bench.ts", ["run", located, out, "--repeat", "3", "--repos", repos], { PRR_MIN_INLINE_SEVERITY: "high" });
+      check("a run under another configuration is refused, not averaged in", mixed.code === 1 && mixed.out.includes("the run was removed"), mixed.out.slice(-1200));
+      check("...and leaves nothing behind", !fs.existsSync(path.join(out, "runs", "shop_1", "run-3")));
+      eq("no step of any of it talked to Azure DevOps", ado.requests.length, 0);
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
       fs.rmSync(repo, { recursive: true, force: true });
     }
   }
