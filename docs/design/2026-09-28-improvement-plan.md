@@ -1,9 +1,10 @@
 # Improvement plan, round 2: what other reviewers know that prloop does not
 
 Date: 2026-09-28
-Status: **proposed** — nothing below is implemented. Items are numbered 1–24 so they cannot be
-confused with the lettered items of the [2026-09-15 plan](./2026-09-15-improvement-plan.md),
-which is fully shipped.
+Status: **implemented** — all 24 items, in the commits after the one that added this file. §10
+records where the code departs from the text below, and what is still open. Items are numbered
+1–24 so they cannot be confused with the lettered items of the
+[2026-09-15 plan](./2026-09-15-improvement-plan.md), which is fully shipped.
 
 Method: three independent read-only sweeps, run in parallel.
 
@@ -401,3 +402,38 @@ v0.21.2, Semgrep `56e04ee`, Martian `e616e84`.
 - Uber uReview — <https://www.uber.com/blog/ureview/>
 - BitsAI-CR — <https://arxiv.org/abs/2501.15134>; AutoCommenter — <https://arxiv.org/abs/2405.13565>; RovoDev — <https://arxiv.org/abs/2601.01129>; Kuaishou — <https://arxiv.org/abs/2505.17928>; Beko/Qodo — <https://arxiv.org/abs/2412.18531>
 - Cursor Bugbot — <https://cursor.com/blog/building-bugbot>; Cloudflare — <https://blog.cloudflare.com/ai-code-review>
+
+---
+
+## 10. Where the implementation departs from this plan
+
+Everything not listed here was built as written.
+
+- **2.** Findings that share a place without agreeing stay **separate threads**, each naming the
+  other, instead of one thread listing both claims: one thread has one status, so a `wontFix`
+  could not say which claim the reviewer rejected, and the dismissal store suppresses by claim on
+  every future PR. Not re-scored with `scripts/evaluate.ts` — no golden set was at hand.
+- **5.** Not checked against a live PR first, and ADO's `$iteration` position tracking is **not
+  used**: its REST reference does not say what it returns for code that was deleted. Instead each
+  new comment carries a span marker (the anchored lines' count and hash), and both the stale check
+  and position dedupe look for that code in the current file. Older comments keep the old rule.
+- **6.** No first tag was cut. Tagging a release is the maintainer's decision, not a hygiene fix.
+- **11.** `scripts/bench.ts` imports, runs, scores and compares both benchmarks, tested end to end
+  against a fake model — but **no benchmark has been run with real models**, so PROPOSAL §12's
+  "one finder or N" is still unanswered. That takes a model endpoint and a few hours.
+- **12.** The scope line comes from per-language rules over the file's own lines; the optional
+  `ast-grep` upgrade was not taken, because it is a dependency.
+- **16.** PR-Agent's always-zero list was not offered as `PRR_EXCLUDE_CATEGORIES` candidates: the
+  plan made that wait on item 8's rates, which only live PRs produce.
+- **18.** Risk tiers ship **off** (`PRR_RISK_TIERS=1` turns them on): fewer finders find less, and
+  `scripts/bench.ts compare` is how to decide that the saving is worth it.
+- **19.** The optional skip of verification for findings below the inline bar was not done; like
+  16, the plan made it wait on item 8's measurements.
+- **20.** Lines already carrying a Copilot thread are not skipped (optional in the plan).
+- **23.** `KNOWN_KEYS` is built from the readers' declarations, but `.env.example` and the README
+  table stay **hand-written**, held to the declarations by `scripts/selftest.ts`: generated, they
+  would lose the prose around each setting. The lease and the token totals moved into the run;
+  the log sink and clock, the call log and the current run directory stay per process on
+  purpose — one review per process, and `--batch` runs each pull request in a child.
+- **24.** The thread and status shapes in `libs/host.ts` are Azure DevOps's, unchanged. A second
+  host would map onto them; no second host was written.
