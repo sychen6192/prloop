@@ -11,6 +11,23 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **The unattended mode, packaged for Azure DevOps.** `--active <project or repository URL>`
+  asks Azure DevOps for the active, non-draft pull requests and reviews them as `--batch` would
+  a file, so a scheduled sweep no longer depends on a list somebody keeps up to date.
+  `PRR_BATCH_PARALLEL` runs that many at once, each child with its share of
+  `PRR_LLM_CONCURRENCY` and `PRR_ADO_CONCURRENCY` rather than all of it (N children at the full
+  limit would be N times what the endpoint was sized for), its output prefixed with its pull
+  request. `PRR_REPO_OVERRIDES` names a JSON file of per-repository `PRR_` settings for the
+  children, every key checked before anything runs. A run warns loudly when its runs directory
+  — where reviewers' dismissals are learned — is prloop's own checkout inside a CI job's
+  workspace, or under the temporary directory: neither outlives the job, and every dismissed
+  comment comes back. A run whose lease ran out and was taken over while it was still
+  reviewing now finds that out just before posting and posts nothing, with the reason as exit
+  `3`, instead of interleaving its comments and summary with the run that took over. And
+  `examples/azure-pipelines/` has a build-validation pipeline and a scheduled sweep to start
+  from, both carrying the runs directory between jobs with the Cache task — which saves only
+  after a job that succeeded, so they fail the job only when prloop could not run and leave
+  the merge gate to the status prloop posts.
 - **`PRR_RISK_TIERS=1`: review depth from the change itself, Cloudflare's trivial / lite /
   full.** Every finder and verifier call carries the same system prompt, rules and repository
   conventions, so on a three-line change the fixed part of the prompt is nearly all of the
@@ -364,6 +381,8 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- The README's cost formula: the requirement axis disputes its accusations in one batched
+  call, and `partial` is one of them — `1 + D` calls, not `1 + A`.
 - **A local review no longer shows the base branch's later changes as the branch reverting
   them.** `git/intake.ts` listed the changed files three-dot, against the merge base, but read
   each file's left side at the base branch's tip. Once the base had moved on after the fork,

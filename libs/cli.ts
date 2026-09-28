@@ -18,6 +18,8 @@ export interface CliArgs {
   since?: number | "auto";
   /** --batch: a file of PR URLs, one per line. Mutually exclusive with a URL argument. */
   batch?: string;
+  /** --active: a project or repository URL whose active pull requests are the batch. */
+  active?: string;
   dryRun: boolean;
   /** --config, or PRR_SHOW_CONFIG when the caller passed it in. */
   showConfig: boolean;
@@ -27,7 +29,7 @@ export interface CliArgs {
 }
 
 /** Options that take a value; their value must never be mistaken for the positional URL. */
-const VALUED = ["--since", "--batch"] as const;
+const VALUED = ["--since", "--batch", "--active"] as const;
 
 export function parseArgs(argv: readonly string[], showConfigEnv = false): CliArgs {
   const sinceIdx = argv.indexOf("--since");
@@ -54,6 +56,11 @@ export function parseArgs(argv: readonly string[], showConfigEnv = false): CliAr
   if (batchIdx >= 0 && (batch === undefined || batch.startsWith("-"))) {
     error ??= `--batch takes a file of pull request URLs, one per line, got: ${batch ?? "(nothing)"}`;
   }
+  const activeIdx = argv.indexOf("--active");
+  const active = activeIdx >= 0 ? argv[activeIdx + 1] : undefined;
+  if (activeIdx >= 0 && (active === undefined || active.startsWith("-"))) {
+    error ??= `--active takes a project or repository URL, got: ${active ?? "(nothing)"}`;
+  }
 
   // The positional scan skips the VALUE of every valued option: "3", "auto" and a file path
   // do not start with "-", so without this `prloop --since 3 <URL>` takes "3" for the PR URL
@@ -66,11 +73,15 @@ export function parseArgs(argv: readonly string[], showConfigEnv = false): CliAr
   if (url !== undefined && batch !== undefined) {
     error ??= "--batch reviews a list of pull requests; do not also pass a URL";
   }
+  if (activeIdx >= 0 && (url !== undefined || batchIdx >= 0)) {
+    error ??= "--active reviews the active pull requests it finds; do not also pass a URL or --batch";
+  }
 
   return {
     ...(url !== undefined ? { url } : {}),
     ...(since !== undefined ? { since } : {}),
     ...(batch !== undefined && !batch.startsWith("-") ? { batch } : {}),
+    ...(active !== undefined && !active.startsWith("-") ? { active } : {}),
     dryRun: argv.includes("--dry-run"),
     showConfig: wantsConfigDump(argv, showConfigEnv),
     help: argv.includes("-h") || argv.includes("--help"),

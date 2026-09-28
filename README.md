@@ -20,18 +20,19 @@ outer one: re-run per PR iteration with `--since auto`.
 ```
 Step 1  fetch PR changes            ADO REST → blob bytes → Myers diff        0 model calls
 Step 2  ┌ static analysis           linters over PRR_WORKDIR                  0
-        ├ requirement axis          work items vs diff, then a dispute pass   1 + A
-        │                           over its own accusations
+        ├ requirement axis          work items vs diff, then one batched      1 + D
+        │                           dispute of its own accusations
         └ code axis                 N finders, same prompt, in parallel       N
 Step 3  anchor → filter → skeptic   quote → line number, then refutation      M×R + T
         → triage                    excluded/dismissed drop before the skeptic
 Step 4  publish                     sticky summary + inline threads           0
 ```
 
-`N` = finder models · `R` = `PRR_SKEPTIC_ROUNDS` · `M` = anchored findings **that survive the
-noise filter** (exclusions and prior dismissals cost no verification tokens) · `A` = criteria
-the requirement axis accused of being `missing` or `misunderstood`, each disputed once ·
-`T` = triage batches, ten tool findings each. All model calls share one concurrency pool
+`N` = finder models · `R` = `PRR_SKEPTIC_ROUNDS` (both fewer for a small change under
+`PRR_RISK_TIERS`) · `M` = anchored findings **that survive the noise filter** (exclusions,
+prior dismissals and findings already posted cost no verification tokens) · `D` = 1 when the
+requirement axis accused any criterion of being `missing`, `partial` or `misunderstood` — one
+batched call disputes all of them — else 0 · `T` = triage batches, ten tool findings each. All model calls share one concurrency pool
 (`PRR_LLM_CONCURRENCY`) and retry on transient failures.
 
 The requirement axis is not part of the step-2 barrier — its result is only needed at publish
@@ -66,11 +67,11 @@ the other's output.
   misunderstood / not-verifiable`, plus out-of-scope changes. It reports *how* it failed, not
   a percentage — a percentage is not actionable.
 
-  It gets **its own verification**, deliberately narrower than the code axis's. The two
-  verdicts that accuse the author — `missing` and `misunderstood` — are refutable claims about
-  the diff, so each gets one attempt from the first skeptic model: one round, not a majority
-  vote, because every call here re-reads the finder-sized diff and is priced like an extra
-  finder. A refutation never flips a verdict to `satisfied`; it demotes it to
+  It gets **its own verification**, deliberately narrower than the code axis's. The three
+  verdicts that accuse the author — `missing`, `partial` and `misunderstood` — are refutable
+  claims about the diff, so all of them go to the first skeptic model in one batched call: one
+  round, not a majority vote, because the call re-reads the finder-sized diff and is priced
+  like an extra finder. A refutation never flips a verdict to `satisfied`; it demotes it to
   `not-verifiable` with the refuter's evidence, taking the accusation out of the unmet count
   while leaving the disagreement visible. `satisfied` — the one verdict that closes a
   criterion — is held to the same quote contract as a code finding: its evidence quote is
@@ -304,11 +305,40 @@ table at the end — one line per PR with its exit code and what actually happen
 out of each run's own `result.json`, because the code alone cannot tell "clean" from "the PR
 had already merged" — and then exits `1` > `2` > `3` > `0`, worst wins. The whole file is
 validated first, so a typo on line 40 surfaces immediately rather than two hours in. Each PR
-is a separate process (per-run state is module-global in four places) and they run one at a
-time: the only throttle prloop has on a model endpoint is `PRR_LLM_CONCURRENCY`, which is per
-process. If three pull requests in a row fail before producing a review, the rest are
-abandoned — that is a credential, an endpoint or a proxy, not those pull requests, and the
-remaining PRs would each pay a full retry budget to find that out.
+is a separate process (per-run state is module-global in four places), one at a time unless
+`PRR_BATCH_PARALLEL` says more — and then each child gets its share of
+`PRR_LLM_CONCURRENCY` and `PRR_ADO_CONCURRENCY` rather than all of it, since both limits are
+per process and N children at the full limit would be N times what the endpoint was sized
+for; side by side, every line a child prints is prefixed with its pull request. If three pull
+requests in a row fail before producing a review, the rest are abandoned — that is a
+credential, an endpoint or a proxy, not those pull requests, and the remaining PRs would each
+pay a full retry budget to find that out.
+
+A list nobody keeps up to date reviews last week's pull requests. `--active` asks Azure DevOps
+instead — every active, non-draft PR of a project or a repository — and runs them exactly as
+`--batch` would:
+
+```bash
+prloop --active https://dev.azure.com/contoso/Shop --since auto            # a whole project
+prloop --active https://dev.azure.com/contoso/Shop/_git/shop-api --since auto
+```
+
+Repositories rarely want the same settings. `PRR_REPO_OVERRIDES` names a JSON file of
+per-repository `PRR_` settings, applied to that repository's children — a larger fleet for the
+payments service, `PRR_SENSITIVE_PATHS` for the one with migrations. Every key is checked
+before anything is reviewed.
+
+**Where the learning lives.** A reviewer's *won't fix* is remembered in
+`runs/<org>/<project>/<repo>/dismissals.jsonl`, and a pipeline agent's workspace does not
+outlive its job: a hosted agent starts empty, a pool of self-hosted ones spreads jobs across
+machines. prloop warns loudly when `PRR_RUNS_DIR` sits inside a CI workspace or the temp
+directory. Point it at persistent storage, or restore and save it around the job, as the
+examples do.
+
+**In Azure Pipelines**, two starting points are in `examples/azure-pipelines/`:
+`pr-validation.yml` runs as a branch policy's build validation, one review per push with the
+job's own token, and `scheduled-sweep.yml` sweeps a project's active pull requests on a
+schedule with `--active`. Both cache the runs directory between jobs.
 
 **Two runs on one PR post everything twice.** A tick that runs long and the next one — or
 your laptop beside the pipeline — both read the PR's existing comments before either has
@@ -319,6 +349,9 @@ default). A run that finds the PR held reviews nothing, spends nothing, and exit
 review is already happening. The lease is given back by the summary the run posts, so the
 normal path costs no extra write, and an expired one is taken over with a warning naming the
 knob — if reviews here legitimately run longer than the window, raise it. `0` turns it off.
+And a run whose lease ran out and was taken over while it was still reviewing finds that out
+just before posting, and posts nothing (exit `3`, reason named) rather than interleave its
+comments and summary with the run that took over.
 
 This is not a mutex, and it is not sold as one: Azure DevOps has no compare-and-swap on a
 comment body, so two runs starting in the same round trip can still both proceed (the claim
@@ -456,6 +489,8 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_MAX_SKEPTIC_FINDINGS` | `30` | fan-out ceiling; worst findings verified first, overflow logged |
 | `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |
+| `PRR_BATCH_PARALLEL` | `1` | pull requests a `--batch` or `--active` run reviews at once, each in its own process; each child gets its share of `PRR_LLM_CONCURRENCY` and `PRR_ADO_CONCURRENCY`, never all of it, and prints its lines prefixed with its pull request |
+| `PRR_REPO_OVERRIDES` | — | a JSON file mapping a repository name (or `project/repo`) to the `PRR_` settings its batch children run with, e.g. `{"payments-api": {"PRR_FINDER_MODELS": "a,b,c", "PRR_SENSITIVE_PATHS": "**/ledger/**"}}`. Every key is checked before anything is reviewed; `PRR_RUNS_DIR` cannot be set per repository |
 | `PRR_BOT_IDENTITY_IDS` | — | identity GUIDs, besides the current credential's, whose marker comments are prloop's own. Only needed when prloop's credential changed (laptop PAT → pipeline service account); without it the first run under the new identity re-reviews the PR from scratch and stops harvesting dismissals on the older threads |
 | `PRR_LLM_CONCURRENCY` | `6` | in-flight model calls across all stages; match your endpoint's batch size. `0` = no cap |
 | `PRR_LLM_RETRIES` | `1` | **EXTRA** attempts on transient model failures — `1` = up to two calls, `0` = never retry (never on 4xx) |

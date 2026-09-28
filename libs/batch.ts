@@ -13,16 +13,100 @@
 // run directory and log under the first one's clock. Making all four per-run is a much larger
 // change than this one, and it would buy nothing a child process does not already give.
 //
-// SEQUENTIAL, with no concurrency option. The only throttle prloop has on a model endpoint is
-// PRR_LLM_CONCURRENCY, which is per process; N children at once multiply it by N, silently,
-// past whatever the endpoint was sized for. A shell loop is sequential too, so this is no
-// slower than what it replaces — it just keeps the exit codes.
+// Sequential unless PRR_BATCH_PARALLEL says otherwise, and then never at N times the endpoint's
+// size. The only throttles prloop has are PRR_LLM_CONCURRENCY and PRR_ADO_CONCURRENCY, and
+// both are per process: N children at the full limit would multiply them by N, silently, past
+// whatever the endpoint was sized for. So each child is handed its share of each limit.
+//
+// A child's settings are the parent's, plus what PRR_REPO_OVERRIDES says for its repository:
+// the child reads its configuration when it starts, which is what makes per-repository
+// settings free here and impossible inside one process.
 import * as fs from "node:fs";
+import * as readline from "node:readline";
 import { spawn } from "node:child_process";
 import { parsePrUrl } from "../ado/client";
 import { latestResult } from "./artifacts";
 import { log } from "./log";
 import type { PrRef } from "./types";
+
+/** Set in every child's environment, so a warning the parent already gave is not repeated per child. */
+export const BATCH_CHILD_ENV = "PRLOOP_BATCH_CHILD";
+
+// Settings a repository may not override: the batch reads each child's result.json out of
+// the runs directory, so a child writing somewhere else would be reported as having written
+// nothing.
+const NOT_PER_REPO = new Set(["PRR_RUNS_DIR"]);
+
+/**
+ * PRR_REPO_OVERRIDES: a JSON object of repository → { PRR_… setting: value }. The repository
+ * is its name or `project/repo`, compared without case. Every problem is collected and thrown
+ * together, before anything is reviewed — a misspelled setting in a nightly sweep would
+ * otherwise configure nothing, silently, for every pull request of that repository.
+ */
+export function parseRepoOverrides(text: string, known: ReadonlySet<string>): Map<string, Record<string, string>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`PRR_REPO_OVERRIDES is not JSON: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error('PRR_REPO_OVERRIDES must be a JSON object: {"repository": {"PRR_SETTING": "value"}}');
+  }
+  const out = new Map<string, Record<string, string>>();
+  const problems: string[] = [];
+  for (const [repo, settings] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+      problems.push(`${repo}: expected an object of PRR_ settings`);
+      continue;
+    }
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(settings as Record<string, unknown>)) {
+      if (!known.has(key)) problems.push(`${repo}: ${key} is not a prloop setting`);
+      else if (NOT_PER_REPO.has(key)) problems.push(`${repo}: ${key} cannot be set per repository`);
+      else if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") env[key] = String(value);
+      else problems.push(`${repo}: ${key} must be a string, a number or a boolean`);
+    }
+    out.set(repo.toLowerCase(), env);
+  }
+  if (problems.length > 0) throw new Error(`PRR_REPO_OVERRIDES: ${problems.join("; ")}`);
+  return out;
+}
+
+/** The settings for one pull request's repository: `project/repo` wins over the bare name. */
+export function overridesFor(overrides: ReadonlyMap<string, Record<string, string>>, ref: PrRef): Record<string, string> {
+  return overrides.get(`${ref.project}/${ref.repoId}`.toLowerCase()) ?? overrides.get(ref.repoId.toLowerCase()) ?? {};
+}
+
+export interface BatchOptions {
+  /** How many pull requests run at once. */
+  parallel?: number;
+  overrides?: ReadonlyMap<string, Record<string, string>>;
+  /** The whole-process limits a child gets a share of: PRR_LLM_CONCURRENCY and PRR_ADO_CONCURRENCY. */
+  limits?: { llm: number; ado: number };
+}
+
+/**
+ * One child's environment: the parent's, the repository's overrides, and its share of each
+ * concurrency limit. A share is at least one; a limit of 0 (no cap) stays 0.
+ */
+export function childEnv(
+  base: NodeJS.ProcessEnv,
+  overrides: Record<string, string>,
+  parallel: number,
+  limits: { llm: number; ado: number },
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, ...overrides, [BATCH_CHILD_ENV]: "1" };
+  if (parallel > 1) {
+    const share = (key: string, limit: number) => {
+      const own = Number(overrides[key] ?? limit);
+      if (Number.isFinite(own) && own > 0) env[key] = String(Math.max(1, Math.floor(own / parallel)));
+    };
+    share("PRR_LLM_CONCURRENCY", limits.llm);
+    share("PRR_ADO_CONCURRENCY", limits.ado);
+  }
+  return env;
+}
 
 export interface BatchList {
   urls: string[];
@@ -119,19 +203,30 @@ export function childCommand(argv: readonly string[]): { file: string; args: str
   return { file: process.execPath, args: [...process.execArgv, process.argv[1] ?? "", ...argv] };
 }
 
-/** Everything the caller passed except `--batch` and its value, forwarded to every child. */
+/** Everything the caller passed except `--batch` / `--active` and their values, forwarded to every child. */
 export function forwardedArgs(argv: readonly string[]): string[] {
-  const i = argv.indexOf("--batch");
-  return i < 0 ? [...argv] : [...argv.slice(0, i), ...argv.slice(i + 2)];
+  const out = [...argv];
+  for (const flag of ["--batch", "--active"]) {
+    const i = out.indexOf(flag);
+    if (i >= 0) out.splice(i, 2);
+  }
+  return out;
 }
 
-async function runOne(url: string, forward: readonly string[]): Promise<number> {
+async function runOne(url: string, forward: readonly string[], env: NodeJS.ProcessEnv, prefix?: string): Promise<number> {
   const { file, args } = childCommand([url, ...forward]);
   return new Promise<number>((resolve) => {
-    // Inherited, not captured: a batch of thirty reviews is hours of output, and buffering it
+    // Streamed, not captured: a batch of thirty reviews is hours of output, and buffering it
     // to print at the end means an operator watching a cron sees nothing until it finishes —
-    // and a run that hangs shows nothing at all.
-    const child = spawn(file, args, { stdio: "inherit" });
+    // and a run that hangs shows nothing at all. Alone, a child writes straight to ours; beside
+    // others, every line it writes is prefixed with its pull request, or the logs of three
+    // reviews would interleave past reading.
+    const child = spawn(file, args, { stdio: prefix === undefined ? "inherit" : ["ignore", "pipe", "pipe"], env });
+    if (prefix !== undefined) {
+      for (const [stream, to] of [[child.stdout, process.stdout], [child.stderr, process.stderr]] as const) {
+        if (stream) readline.createInterface({ input: stream }).on("line", (line) => to.write(`${prefix} ${line}\n`));
+      }
+    }
     child.on("error", (e) => {
       log(`[FAIL] could not start a review of ${url}: ${e.message}`);
       resolve(1);
@@ -141,32 +236,41 @@ async function runOne(url: string, forward: readonly string[]): Promise<number> 
   });
 }
 
-export async function runBatch(urls: readonly string[], forward: readonly string[]): Promise<BatchOutcome[]> {
-  const out: BatchOutcome[] = [];
+export async function runBatch(urls: readonly string[], forward: readonly string[], opts: BatchOptions = {}): Promise<BatchOutcome[]> {
+  const parallel = Math.max(1, Math.min(opts.parallel ?? 1, urls.length));
+  const out: BatchOutcome[] = urls.map((url) => ({ url, ref: parsePrUrl(url), detail: "not attempted", durationSec: 0 }));
+  let next = 0;
   let fatalStreak = 0;
-  for (const [i, url] of urls.entries()) {
-    const ref = parsePrUrl(url);
-    if (fatalStreak >= FATAL_STREAK_LIMIT) {
-      out.push({ url, ref, detail: "not attempted", durationSec: 0 });
-      continue;
+  let abandoned = false;
+  const worker = async (): Promise<void> => {
+    while (!abandoned && next < urls.length) {
+      const i = next++;
+      const { url, ref } = out[i]!;
+      const startedAt = Date.now();
+      log(`\n[${i + 1}/${urls.length}] ${url}`);
+      const env = childEnv(process.env, overridesFor(opts.overrides ?? new Map(), ref), parallel, opts.limits ?? { llm: 0, ado: 0 });
+      const exitCode = await runOne(url, forward, env, parallel > 1 ? `[${i + 1}/${urls.length} !${ref.prId}]` : undefined);
+      const durationSec = Math.round((Date.now() - startedAt) / 1000);
+      // The exit code alone cannot say what happened: 0 covers both "clean" and "the PR had
+      // already merged", and 3 names no stage. The child wrote all of it down (libs/artifacts.ts).
+      const detail = describeResult(latestResult(ref, startedAt), exitCode);
+      out[i] = { url, ref, exitCode, detail, durationSec };
+      // Counted in the order children finish: side by side, "in a row" means one after
+      // another to come back, and three fatal ones still say the credential is wrong.
+      fatalStreak = exitCode === 1 ? fatalStreak + 1 : 0;
+      if (fatalStreak >= FATAL_STREAK_LIMIT && !abandoned) {
+        abandoned = true;
+        if (next < urls.length) {
+          log(
+            `\n[FAIL] ${FATAL_STREAK_LIMIT} pull requests in a row failed before producing a review. ` +
+              `That is a credential, an endpoint or a proxy, not these pull requests — abandoning the ` +
+              `remaining ${urls.length - next} rather than paying their retry budgets too`,
+          );
+        }
+      }
     }
-    const startedAt = Date.now();
-    log(`\n[${i + 1}/${urls.length}] ${url}`);
-    const exitCode = await runOne(url, forward);
-    const durationSec = Math.round((Date.now() - startedAt) / 1000);
-    // The exit code alone cannot say what happened: 0 covers both "clean" and "the PR had
-    // already merged", and 3 names no stage. The child wrote all of it down (libs/artifacts.ts).
-    const detail = describeResult(latestResult(ref, startedAt), exitCode);
-    out.push({ url, ref, exitCode, detail, durationSec });
-    fatalStreak = exitCode === 1 ? fatalStreak + 1 : 0;
-    if (fatalStreak >= FATAL_STREAK_LIMIT && i + 1 < urls.length) {
-      log(
-        `\n[FAIL] ${FATAL_STREAK_LIMIT} pull requests in a row failed before producing a review. ` +
-          `That is a credential, an endpoint or a proxy, not these pull requests — abandoning the ` +
-          `remaining ${urls.length - i - 1} rather than paying their retry budgets too`,
-      );
-    }
-  }
+  };
+  await Promise.all(Array.from({ length: parallel }, worker));
   return out;
 }
 

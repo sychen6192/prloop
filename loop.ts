@@ -4,9 +4,15 @@
 // Exit codes: 0 = reviewed, no high-risk findings; 2 = high-risk findings posted;
 // 3 = review incomplete (a stage or the publish step failed); 1 = fatal (auth, network,
 // bad arguments).
+import * as fs from "node:fs";
 import {
+  ADO_CONCURRENCY,
+  BATCH_PARALLEL,
   FINDER_MODELS,
   FINDING_CATEGORIES,
+  KNOWN_KEYS,
+  LLM_CONCURRENCY,
+  REPO_OVERRIDES,
   LLM_BASE_URL,
   MIN_CONSENSUS_SOURCES,
   REQUIRE_CORROBORATION,
@@ -23,8 +29,9 @@ import { postStatus } from "./ado/statuses";
 import { unmetCriteria } from "./gates/requirement";
 import { claimRunLease, releaseRunLease, runId } from "./publish/lease";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
-import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir } from "./libs/artifacts";
-import { batchExitCode, forwardedArgs, readBatchList, renderBatchReport, runBatch } from "./libs/batch";
+import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir, runsDirWarning } from "./libs/artifacts";
+import { BATCH_CHILD_ENV, batchExitCode, forwardedArgs, parseRepoOverrides, readBatchList, renderBatchReport, runBatch } from "./libs/batch";
+import { discoverActivePrs, parseScopeUrl } from "./ado/discover";
 import { parseArgs } from "./libs/cli";
 import { runStamp } from "./libs/stamp";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
@@ -42,7 +49,10 @@ Options:
   --since <iteration>   review only changes after that iteration (incremental)
   --since auto          resume from the last reviewed iteration
   --batch <file>        review every PR URL in the file, one per line (# comments allowed),
-                        one after another; exits with the worst outcome in the list
+                        PRR_BATCH_PARALLEL at a time; exits with the worst outcome in the list
+  --active <URL>        the same over every active, non-draft PR of a project
+                        (https://dev.azure.com/{org}/{project}) or a repository
+                        (…/{project}/_git/{repo})
   --dry-run             compute everything, post nothing
   --config              print every setting, its value and its source, then exit
   -h, --help            show this help
@@ -50,6 +60,15 @@ Options:
 Exit codes: 0 clean | 2 blocking findings | 3 review incomplete (a stage failed) | 1 fatal
 
 Env vars: see .env.example`;
+
+/** A file the run cannot do without, or a fatal naming it. */
+function readFileOrDie(file: string): string {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch (e) {
+    die(`could not read ${file}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 
 /** Asked for help: that is a successful run, so stdout and exit 0. */
 function help(): never {
@@ -112,11 +131,25 @@ async function main() {
   // and this process only tallies the results (libs/batch.ts says why a child rather than a
   // loop in here). The whole file is validated first, so a typo on line 40 of a 60-line list
   // surfaces now rather than two hours in.
-  if (cli.batch) {
-    const urls = readBatchList(cli.batch);
-    banner(`prloop: ${urls.length} pull requests from ${cli.batch}`);
+  // Once, in the process that owns the job: a batch's children inherit a marker instead of
+  // repeating it thirty times.
+  const runsWarning = process.env[BATCH_CHILD_ENV] ? undefined : runsDirWarning();
+  if (runsWarning) log(`[WARN] ${runsWarning}`);
+
+  if (cli.batch || cli.active) {
+    // Everything that can be wrong with the batch is found before the first child starts: the
+    // list, the overrides, the scope.
+    const overrides = REPO_OVERRIDES
+      ? parseRepoOverrides(readFileOrDie(REPO_OVERRIDES), new Set(KNOWN_KEYS.map((k) => k.name)))
+      : new Map<string, Record<string, string>>();
+    const urls = cli.batch ? readBatchList(cli.batch) : await discoverActivePrs(parseScopeUrl(cli.active!));
+    banner(`prloop: ${urls.length} pull requests from ${cli.batch ?? cli.active}${BATCH_PARALLEL > 1 ? `, ${BATCH_PARALLEL} at a time` : ""}`);
     const started = Date.now();
-    const outcomes = await runBatch(urls, forwardedArgs(args));
+    const outcomes = await runBatch(urls, forwardedArgs(args), {
+      parallel: BATCH_PARALLEL,
+      overrides,
+      limits: { llm: LLM_CONCURRENCY, ado: ADO_CONCURRENCY },
+    });
     const codes = outcomes.map((o) => o.exitCode).filter((c): c is number => c !== undefined);
     banner(`Done: ${outcomes.length} pull requests in ${Math.round((Date.now() - started) / 60000)}m`);
     console.log(renderBatchReport(outcomes));

@@ -59,6 +59,11 @@ export interface FakeAdoState {
   /** Blob object id → its bytes. */
   blobs: Record<string, string>;
   /**
+   * What GET …/pullrequests lists, for a project or one repository (ado/discover.ts). Paged by
+   * `$top` / `$skip`; `searchCriteria.status` is recorded but not applied — these are all active.
+   */
+  activePrs?: Array<{ pullRequestId: number; isDraft?: boolean; repository: { name: string; project?: { name: string } } }>;
+  /**
    * Lets a test make one thread POST fail: return the status to reject it with, or
    * undefined to accept. A comment that cannot be posted is a first-class outcome
    * (PublishResult.failed), not an exception the run dies on.
@@ -140,6 +145,15 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
     requests.push({ method, path, query, body });
 
     // --- pull request itself ---------------------------------------------------------
+    const listing = /\/_apis\/git\/(?:repositories\/([^/]+)\/)?pullrequests$/i.exec(path);
+    if (method === "GET" && listing) {
+      const repo = listing[1] === undefined ? undefined : decodeURIComponent(listing[1]);
+      const all = (state.activePrs ?? []).filter((p) => repo === undefined || p.repository.name === repo);
+      const skip = Number(query["$skip"] ?? 0);
+      const top = Number(query["$top"] ?? 100);
+      const value = all.slice(skip, skip + top);
+      return sendJson(res, 200, { count: value.length, value });
+    }
     if (method === "GET" && /\/pullRequests\/\d+$/.test(path)) {
       return sendJson(res, 200, state.pr);
     }

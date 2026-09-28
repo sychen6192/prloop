@@ -62,6 +62,7 @@ and closes its server in a `finally`.
 | `rules/` | reviewer rules as markdown with `applyTo` globs |
 | `publish/` | comment rendering, the hidden marker protocol, dedup (fingerprint + position), lifecycle |
 | `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types and the ReviewContext contract (SSOT) |
+| `examples/` | Azure Pipelines YAML to start from: build validation, and a scheduled sweep with `--active` |
 | `scripts/` | selftests (+ `fakes/`, and `selftest/`: one module per area plus the shared harness), doctor/probe/tlsfix diagnostics, local-review, evaluate/calibrate/replay/bench |
 
 ## Conventions

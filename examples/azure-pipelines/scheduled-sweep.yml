@@ -1,0 +1,66 @@
+# A scheduled sweep: every active, non-draft pull request of a project, each reviewed from where
+# its last review left off. For teams that would rather not add a build to every branch policy,
+# or that want reviews of pull requests whose policies do not run one.
+#
+# Setup
+#   1. A variable group named `prloop` with the model settings from .env.example.
+#   2. The build service identity needs "Contribute to pull requests" on every repository in
+#      the project, and read access to work items.
+#   3. Optional: PRR_REPO_OVERRIDES pointing at a JSON file in this repository, for settings
+#      that differ per repository (README, "Unattended, over a list of PRs").
+trigger: none
+pr: none
+
+schedules:
+  - cron: "0 */2 * * 1-5"
+    displayName: every two hours on working days (UTC)
+    branches:
+      include: [main]
+    # Reviews depend on the pull requests, not on commits to this repository.
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: prloop
+  - name: PRR_RUNS_DIR
+    value: $(Pipeline.Workspace)/prloop-runs
+  - name: PRR_POST_STATUS
+    value: "1"
+  # Two pull requests at a time, each with half of PRR_LLM_CONCURRENCY and PRR_ADO_CONCURRENCY.
+  - name: PRR_BATCH_PARALLEL
+    value: "2"
+
+steps:
+  # This pipeline lives in prloop's repository, or a mirror of it.
+  - checkout: self
+
+  - task: NodeTool@0
+    inputs:
+      versionSpec: "22.x"
+
+  - task: Cache@2
+    displayName: Restore what reviewers taught prloop
+    inputs:
+      key: 'prloop-runs | sweep | "$(System.TeamProject)" | "$(Build.BuildId)"'
+      restoreKeys: |
+        prloop-runs | sweep | "$(System.TeamProject)"
+      path: $(PRR_RUNS_DIR)
+
+  - script: npm ci
+
+  # The batch exits with the worst outcome in it. As in pr-validation.yml, only 1 — prloop
+  # could not run — fails the job, so the cache of dismissals is saved; each pull request's
+  # own status carries its 2 or 3, and the table printed at the end names every one.
+  - bash: |
+      set +e
+      npx tsx loop.ts --active "$(System.CollectionUri)$(System.TeamProject)" --since auto
+      code=$?
+      echo "prloop exited $code"
+      [ "$code" = "1" ] && exit 1
+      exit 0
+    displayName: prloop sweep
+    env:
+      PRR_ADO_PAT: $(System.AccessToken)
+      PRR_LLM_API_KEY: $(PRR_LLM_API_KEY)

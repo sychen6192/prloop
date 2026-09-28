@@ -167,6 +167,22 @@ export async function claimRunLease(ref: PrRef, now: number = Date.now()): Promi
 }
 
 /**
+ * Whether another run has taken this pull request over since this one claimed it: the lease
+ * ran out mid-review and a later run wrote its own marker. Read off the thread list publish()
+ * has just fetched, which is the last moment before anything is written — posting anyway would
+ * put this run's comments beside the other run's, and whichever summary lands second would
+ * overwrite the other's resume point.
+ */
+export function leaseTakenOver(threads: Thread[], selfId?: string): string | undefined {
+  if (!held) return undefined;
+  const summary = ownSummary(threads, selfId);
+  const current = summary ? readMarkers(summary.body).run : undefined;
+  return current && current.id !== RUN_ID
+    ? `run ${current.id} took this pull request over while this run was reviewing it (PRR_RUN_LEASE_MS ran out)`
+    : undefined;
+}
+
+/**
  * Gives the PR back, if this run still has it.
  *
  * A normal run needs nothing from this: publish() rewrites the summary from scratch, and the

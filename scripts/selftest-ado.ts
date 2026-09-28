@@ -270,6 +270,44 @@ try {
     const { lines: allDenied } = await capture(() => fetchRepoConventions(ref, "tgt3"));
     eq("six failures are one warning, not six", allDenied.filter((l) => l.includes("[WARN]")).length, 1);
   }
+  section("--active: the pull requests to review, asked of Azure DevOps");
+  {
+    const { discoverActivePrs, parseScopeUrl } = await import("../ado/discover");
+    // Every form a browser shows a project or a repository in.
+    const cloud = parseScopeUrl("https://dev.azure.com/contoso/Shop", "");
+    eq("a project URL names the project", [cloud.webBase, cloud.project, cloud.repo], ["https://dev.azure.com/contoso", "Shop", undefined]);
+    const repo = parseScopeUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequests?_a=active", "");
+    eq("a repository URL names the repository too, whatever page it is on", [repo.project, repo.repo], ["Shop", "shop-api"]);
+    eq("an old-style host keeps the organisation in the name", parseScopeUrl("https://contoso.visualstudio.com/Shop", "").webBase, "https://contoso.visualstudio.com");
+    const onPrem = parseScopeUrl("https://tfs.contoso.local/tfs/DefaultCollection/My%20Shop/_git/api", "");
+    eq("an on-prem server keeps its collection", [onPrem.webBase, onPrem.project, onPrem.repo], ["https://tfs.contoso.local/tfs/DefaultCollection", "My Shop", "api"]);
+    eq("the API host may differ from the browser's", parseScopeUrl("https://dev.azure.com/contoso/Shop", "https://api.contoso.local/").baseUrl, "https://api.contoso.local");
+    let noProject = "";
+    try {
+      parseScopeUrl("https://dev.azure.com/", "");
+    } catch (e) {
+      noProject = e instanceof Error ? e.message : String(e);
+    }
+    check("a URL with no project is refused, not guessed", noProject.includes("No project"), noProject);
+
+    const pr = (id: number, name: string, isDraft = false) => ({ pullRequestId: id, isDraft, repository: { name, project: { name: "Shop" } } });
+    setState({ activePrs: [pr(12, "shop-api"), pr(7, "shop-web"), pr(9, "shop-api", true), ...Array.from({ length: 150 }, (_, i) => pr(100 + i, "bulk"))] });
+    const { value: urls, lines } = await capture(() => discoverActivePrs(parseScopeUrl(`${ado.origin}/contoso/Shop`, ado.origin)));
+    eq("every active pull request of the project, oldest first, past one page", [urls.length, urls[0], urls[1]], [
+      152,
+      `${ado.origin}/contoso/Shop/_git/shop-web/pullrequest/7`,
+      `${ado.origin}/contoso/Shop/_git/shop-api/pullrequest/12`,
+    ]);
+    check("...drafts left out, and said so", !urls.some((u) => u.endsWith("/9")) && lines.some((l) => l.includes("1 draft left out")), lines.join(" | "));
+    check("...each a URL a review can be run on", urls.every((u) => parsePrUrl(u).prId > 0));
+    const repoUrls = (await capture(() => discoverActivePrs(parseScopeUrl(`${ado.origin}/contoso/Shop/_git/shop-api`, ado.origin)))).value;
+    eq("a repository URL lists only that repository's", repoUrls, [`${ado.origin}/contoso/Shop/_git/shop-api/pullrequest/12`]);
+    check(
+      "...asked for active ones only",
+      ado.matching("GET", /pullrequests$/i).every((r) => r.query["searchCriteria.status"] === "active"),
+      JSON.stringify(ado.matching("GET", /pullrequests$/i).map((r) => r.query)),
+    );
+  }
 } finally {
   await ado.close();
 }

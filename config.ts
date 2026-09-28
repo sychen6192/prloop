@@ -56,6 +56,8 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_ADO_MAX_RETRIES", kind: "number", section: S_ADO, description: "attempts for a transient ADO failure" },
   { name: "PRR_ADO_CONCURRENCY", kind: "number", section: S_ADO, description: "parallel blob fetches during intake" },
   { name: "PRR_BOT_IDENTITY_IDS", kind: "csv", section: S_ADO, description: "extra ADO identity ids whose marker comments are ours" },
+  { name: "PRR_BATCH_PARALLEL", kind: "number", section: S_ADO, description: "pull requests a batch reviews at once; splits concurrency" },
+  { name: "PRR_REPO_OVERRIDES", kind: "string", section: S_ADO, description: "JSON file: repository name -> its own PRR_ settings" },
 
   { name: "PRR_LLM_BASE_URL", kind: "string", section: S_MODEL, description: "OpenAI-compatible endpoint (LiteLLM / vLLM / Ollama)" },
   { name: "PRR_LLM_API_KEY", kind: "string", section: S_MODEL, secret: true, description: "key for that endpoint" },
@@ -372,6 +374,14 @@ export const ADO_TIMEOUT_MS = numEnv("PRR_ADO_TIMEOUT_MS", 60_000, 1000);
 export const ADO_MAX_RETRIES = numEnv("PRR_ADO_MAX_RETRIES", 3, 1);
 // Blob fetches in flight at once during intake (ADO rate-limits aggressive parallelism).
 export const ADO_CONCURRENCY = numEnv("PRR_ADO_CONCURRENCY", 6, 1);
+// `--batch` / `--active`: how many pull requests run at once, each in its own process. The
+// model and ADO concurrency limits are per process, so each child is given its share of them
+// rather than all of them — N children at the full limit would be N times what the endpoint
+// was sized for (libs/batch.ts).
+export const BATCH_PARALLEL = numEnv("PRR_BATCH_PARALLEL", 1, 1);
+// A JSON file mapping a repository's name (or `project/repo`) to the PRR_ settings its batch
+// children run with: another fleet for one repository, categories excluded for another.
+export const REPO_OVERRIDES = strEnv("PRR_REPO_OVERRIDES", "");
 // Identities other than prloop's current credential whose marker-bearing comments are still
 // prloop's own. Needed because the credential legitimately changes: the documented path onto
 // a pipeline is to trial prloop from a laptop PAT and then move to the build service account,

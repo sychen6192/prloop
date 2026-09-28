@@ -1,0 +1,75 @@
+# prloop as a branch policy's build validation: one review of the pull request that queued it,
+# resumed where the last review of that pull request left off.
+#
+# Setup
+#   1. A variable group named `prloop` with the model settings from .env.example —
+#      PRR_LLM_BASE_URL, PRR_LLM_API_KEY (as a secret), PRR_FINDER_MODELS, PRR_SKEPTIC_MODELS, …
+#   2. The project's build service identity needs "Contribute to pull requests" on the
+#      repository under review, and read access to work items for the requirement axis.
+#   3. In the target branch's policies, add this pipeline under Build validation, and add a
+#      Status check for the status prloop posts (PRR_STATUS_GENRE / PRR_STATUS_NAME). That
+#      status is the merge gate — see the last step for why the job itself is not.
+#
+# Azure Repos does not read `pr:` triggers from YAML; the branch policy is what queues this.
+trigger: none
+
+resources:
+  repositories:
+    # prloop itself. A GitHub service connection, or `type: git` if it is mirrored into Azure Repos.
+    - repository: prloop
+      type: github
+      name: <owner>/prloop
+      endpoint: <github service connection>
+      ref: refs/heads/main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: prloop
+  # Outside prloop's checkout, and carried between jobs by the Cache task below: this is where
+  # reviewers' dismissals are learned (dismissals.jsonl). A workspace alone does not outlive
+  # the job, and every "won't fix" would be forgotten by the next push.
+  - name: PRR_RUNS_DIR
+    value: $(Pipeline.Workspace)/prloop-runs
+  - name: PRR_POST_STATUS
+    value: "1"
+
+steps:
+  - checkout: prloop
+    path: prloop
+
+  - task: NodeTool@0
+    inputs:
+      versionSpec: "22.x"
+
+  # A new key every run and the latest one restored: caches are immutable per key, so this is
+  # how the store moves forward.
+  - task: Cache@2
+    displayName: Restore what reviewers taught prloop
+    inputs:
+      key: 'prloop-runs | "$(System.TeamProject)" | "$(Build.Repository.Name)" | "$(Build.BuildId)"'
+      restoreKeys: |
+        prloop-runs | "$(System.TeamProject)" | "$(Build.Repository.Name)"
+      path: $(PRR_RUNS_DIR)
+
+  - script: npm ci
+    workingDirectory: $(Pipeline.Workspace)/prloop
+
+  # Exit codes: 0 clean, 2 blocking findings, 3 review incomplete, 1 prloop could not run.
+  # Only 1 fails the job. The Cache task saves only after a job that succeeded, so a job that
+  # failed on every blocking finding would also forget every dismissal learned during it; 2
+  # and 3 reach the pull request as the status prloop posts, which is what the policy checks.
+  - bash: |
+      set +e
+      npx tsx loop.ts "$(System.CollectionUri)$(System.TeamProject)/_git/$(Build.Repository.Name)/pullrequest/$(System.PullRequest.PullRequestId)" --since auto
+      code=$?
+      echo "prloop exited $code"
+      [ "$code" = "1" ] && exit 1
+      exit 0
+    displayName: prloop review
+    workingDirectory: $(Pipeline.Workspace)/prloop
+    env:
+      # Secrets reach a script only when mapped. The job's own token posts as the build service.
+      PRR_ADO_PAT: $(System.AccessToken)
+      PRR_LLM_API_KEY: $(PRR_LLM_API_KEY)

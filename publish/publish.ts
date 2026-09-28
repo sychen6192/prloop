@@ -14,6 +14,7 @@ import { recordOutcomes } from "../libs/outcomes";
 import { log } from "../libs/log";
 import { collectDismissals, collectFinalOutcomes, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
 import { iterationMarker, readMarkers, spanMark, type SpanMark } from "./markers";
+import { leaseTakenOver } from "./lease";
 import type { AnchoredFinding, PrRef } from "../libs/types";
 import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, ToolEvidence, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
@@ -316,6 +317,15 @@ export async function publish(
     // and "summary comment failed to post" would both be true and neither would say why.
     result.gaps.push(`could not read the PR's comment threads: ${msg}`);
     await reportStatus();
+    return result;
+  }
+  // The lease, once more, now that nothing has been written yet: a review that outlived it
+  // and was taken over stands down here rather than posting beside the run that took over.
+  const lost = leaseTakenOver(threads, selfId);
+  if (lost) {
+    log(`[WARN] ${lost} — posting nothing, so the two reviews do not interleave`);
+    for (const f of findings) result.failed.push({ finding: f, error: `not posted: ${lost}` });
+    result.gaps.push(lost);
     return result;
   }
   const seen = postedFingerprints(threads);

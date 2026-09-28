@@ -1388,6 +1388,20 @@ try {
     await capture(() => releaseRunLease(ref));
     eq("a run that never claimed makes no request to release", ado.requests.length, 0);
 
+    // Taken over mid-review: this run's lease ran out, another run claimed the PR, and this
+    // one is about to post. It must not — its comments would sit beside the other run's, and
+    // whichever summary lands second overwrites the other's resume point.
+    fresh({ threads: [withSummary()] });
+    await capture(() => claimRunLease(ref, NOW));
+    ado.state.threads[0]!.comments![0]!.content = setRunMarker(summaryBody, runMarker(NOW + 1, "deadbeef"));
+    ado.reset();
+    const late = await capture(() =>
+      publish(ref, { requirement: [], code: [finding({ fingerprint: "late0001" })] }, summaryInput(), known()),
+    );
+    eq("a run taken over before it posted posts nothing", threadPosts().length + commentPatches().length, 0);
+    check("...and says who took over, as a reason the review is incomplete", late.value.gaps.some((g) => g.includes("deadbeef") && g.includes("took this pull request over")), JSON.stringify(late.value.gaps));
+    eq("...with its findings reported as not posted", late.value.failed.map((f) => f.finding.fingerprint), ["late0001"]);
+
     // The normal release, in the one place it actually happens.
     fresh({ threads: [withSummary()] });
     await capture(() => claimRunLease(ref, NOW));
