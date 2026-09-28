@@ -338,12 +338,14 @@ try {
   models.answerBy(reviewer);
 
   const { parsePrUrl } = await import("../ado/client");
+  const { adoHost } = await import("../ado/host");
   const { runReview, exitCodeFor } = await import("../orchestrator");
   const { createRunner } = await import("../models/runner");
   const { resolveLastReviewedIteration } = await import("../publish/lifecycle");
   const { readMarkers } = await import("../publish/markers");
 
   const ref = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4821");
+  const host = adoHost(ref);
   const runner = await createRunner();
 
   const threadPosts = () => ado.matching("POST", /\/threads$/);
@@ -364,7 +366,7 @@ try {
 
   section("push 1, full review: what reaches the pull request");
   {
-    const { value: result } = await capture(() => runReview({ ref, runner, compareTo: 0 }));
+    const { value: result } = await capture(() => runReview({ host, runner, compareTo: 0 }));
 
     eq("each finder is asked once", stageCalls("findings").length, 2);
     check(
@@ -424,9 +426,9 @@ try {
     models.answerBy(reviewer);
     const threadsBefore = ado.state.threads.length;
 
-    const since = await resolveLastReviewedIteration(ref);
+    const since = await resolveLastReviewedIteration(host);
     eq("the resume point is read back off the PR", since, 1);
-    const { value: result } = await capture(() => runReview({ ref, runner, compareTo: since ?? 0 }));
+    const { value: result } = await capture(() => runReview({ host, runner, compareTo: since ?? 0 }));
 
     const changeReqs = ado.matching("GET", /\/iterations\/2\/changes$/);
     check("intake asks for the changes since push 1", changeReqs.some((r) => r.query["$compareTo"] === "1"), JSON.stringify(changeReqs.map((r) => r.query)));
@@ -586,7 +588,7 @@ try {
       story(4712, ["The invoice due period is configurable", "An invoice's due date follows from the configured period"]),
     );
     const csRef = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4822");
-    const { value: result } = await capture(() => runReview({ ref: csRef, runner, compareTo: 0 }));
+    const { value: result } = await capture(() => runReview({ host: adoHost(csRef), runner, compareTo: 0 }));
 
     const finderPrompts = stageCalls("findings").map(userPrompt);
     eq("both finders are asked", finderPrompts.length, 2);
@@ -609,7 +611,7 @@ try {
     const doc = "# Retries\n\nA failed charge is retried three times before the order is cancelled.\n";
     nextPr("Document the retry policy", { "docs/retry.md": { blob: "d1d1d1", text: doc } }, story(4713, ["The retry policy is documented"]));
     const docsRef = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4823");
-    const { value: result } = await capture(() => runReview({ ref: docsRef, runner, compareTo: 0 }));
+    const { value: result } = await capture(() => runReview({ host: adoHost(docsRef), runner, compareTo: 0 }));
 
     eq("no finder is asked about a change with no code", stageCalls("findings").length, 0);
     eq("the requirement axis still is", stageCalls("requirements").length, 1);

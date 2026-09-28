@@ -32,11 +32,9 @@
 //     the PR is going to fail at publish and say so.
 import { randomBytes } from "node:crypto";
 import { RUN_LEASE_MS } from "../config";
-import { isSelfIdentity, selfIdentityId } from "../ado/identity";
-import { listThreads, updateComment, type Thread } from "../ado/threads";
+import { isSelfIdentity, type ReviewHost, type Thread } from "../libs/host";
 import { log, logVerbose } from "../libs/log";
 import { readMarkers, runMarker, setRunMarker } from "./markers";
-import type { PrRef } from "../libs/types";
 
 /**
  * This process, as it appears on the wire. Random rather than derived from the host: the one
@@ -108,13 +106,13 @@ const ageText = (ms: number) => `${Math.round(Math.abs(ms) / 1000)}s`;
  * Called before the review, not before the process: standing down has to be cheaper than
  * the thing it prevents, and everything expensive happens after this returns.
  */
-export async function claimRunLease(ref: PrRef, now: number = Date.now()): Promise<LeaseDecision> {
+export async function claimRunLease(host: ReviewHost, now: number = Date.now()): Promise<LeaseDecision> {
   if (RUN_LEASE_MS === 0) return { acquired: true };
 
   let threads: Thread[];
   let selfId: string | undefined;
   try {
-    [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+    [threads, selfId] = await Promise.all([host.threads(), host.selfId()]);
   } catch (e) {
     log(`[WARN] could not read the run lease: ${e instanceof Error ? e.message : String(e)} — reviewing anyway`);
     return { acquired: true };
@@ -148,7 +146,7 @@ export async function claimRunLease(ref: PrRef, now: number = Date.now()): Promi
 
   const marker = runMarker(now, RUN_ID);
   try {
-    await updateComment(ref, summary.threadId, summary.commentId, setRunMarker(summary.body, marker));
+    await host.updateComment(summary.threadId, summary.commentId, setRunMarker(summary.body, marker));
   } catch (e) {
     log(`[WARN] could not take the run lease: ${e instanceof Error ? e.message : String(e)} — reviewing anyway`);
     return { acquired: true };
@@ -160,7 +158,7 @@ export async function claimRunLease(ref: PrRef, now: number = Date.now()): Promi
   // other one writes still sees its own id. It turns an unbounded overlap into a
   // sub-round-trip one, for the price of a GET.
   try {
-    const after = ownSummary(await listThreads(ref), selfId);
+    const after = ownSummary(await host.threads(), selfId);
     const winner = after ? readMarkers(after.body).run : undefined;
     if (winner && winner.id !== RUN_ID) {
       return { acquired: false, reason: `run ${winner.id} claimed this pull request at the same moment` };
@@ -204,15 +202,15 @@ export function leaseTakenOver(threads: Thread[], selfId: string | undefined, le
  * buys two things: it never strips a marker another run has since written over ours, and a
  * publish that quietly failed to update the summary still gets the lease released.
  */
-export async function releaseRunLease(ref: PrRef, lease: LeaseHandle | undefined): Promise<void> {
+export async function releaseRunLease(host: ReviewHost, lease: LeaseHandle | undefined): Promise<void> {
   if (!lease || lease.released) return;
   lease.released = true;
   try {
-    const summary = ownSummary(await listThreads(ref), await selfIdentityId(ref));
+    const summary = ownSummary(await host.threads(), await host.selfId());
     if (!summary) return;
     const current = readMarkers(summary.body).run;
     if (!current || current.id !== lease.id) return;
-    await updateComment(ref, summary.threadId, summary.commentId, setRunMarker(summary.body, ""));
+    await host.updateComment(summary.threadId, summary.commentId, setRunMarker(summary.body, ""));
     logVerbose(`Released the run lease ${lease.id}`);
   } catch (e) {
     // Best effort by design. A lease nobody released expires on its own, which is the

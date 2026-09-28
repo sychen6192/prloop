@@ -25,7 +25,7 @@ import {
 } from "./config";
 import { FINDING_CATEGORIES } from "./libs/taxonomy";
 import { parsePrUrl } from "./ado/client";
-import { postStatus } from "./ado/statuses";
+import { adoHost } from "./ado/host";
 import { unmetCriteria } from "./gates/requirement";
 import { claimRunLease, releaseRunLease, runId, type LeaseHandle } from "./publish/lease";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
@@ -36,7 +36,8 @@ import { parseArgs } from "./libs/cli";
 import { runStamp } from "./libs/stamp";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
-import type { ModelRunner, PrRef } from "./libs/types";
+import type { ReviewHost } from "./libs/host";
+import type { ModelRunner } from "./libs/types";
 import { NO_TOKENS, createRunner, tokensOf } from "./models/runner";
 import { cleanupAllWorktrees } from "./git/worktree";
 import { exitCodeFor, runReview } from "./orchestrator";
@@ -84,7 +85,7 @@ function usage(): never {
 }
 
 /** Set once the PR URL parses, so every exit path can say which run this was. */
-let fatalRef: PrRef | undefined;
+let fatalHost: ReviewHost | undefined;
 /** The run lease this process took, if any: the fatal path gives it back like the others do. */
 let heldLease: LeaseHandle | undefined;
 /** The review's runner, once it has one: what the run spent is read off it on every exit. */
@@ -98,9 +99,9 @@ const startedAt = new Date().toISOString();
  * config.json beside it, to learn which pull request a result belonged to.
  */
 function runIdentity(iteration?: number, compareTo?: number) {
-  if (!fatalRef) return undefined;
+  if (!fatalHost) return undefined;
   return {
-    ref: fatalRef,
+    ref: fatalHost.ref,
     ...(iteration === undefined ? {} : { iteration }),
     ...(compareTo === undefined ? {} : { compareTo }),
     dryRun: isDryRun(),
@@ -174,10 +175,11 @@ async function main() {
   if (cli.dryRun) process.env["PRR_DRY_RUN"] = "1";
 
   const ref = parsePrUrl(url);
+  const host = adoHost(ref);
   // Kept where the fatal handler can reach it: a run that dies before publish() posts no
   // status at all, so whatever an earlier run left on the PR still stands — and on a re-run
   // of the same iteration that is quite possibly a green one gating the merge.
-  fatalRef = ref;
+  fatalHost = host;
   banner(`prloop: ${ref.org}/${ref.project}/${ref.repoId} PR !${ref.prId}`);
   // Said once, before anything is spent: an edit to .env that a shell export is quietly
   // discarding, and a setting name that configures nothing. Both used to be visible only to
@@ -213,7 +215,7 @@ async function main() {
   // entirely — it writes nothing, so it cannot collide with anything, and taking a lease it
   // would then have to release is the opposite of "compute everything, post nothing".
   if (!isDryRun()) {
-    const lease = await claimRunLease(ref);
+    const lease = await claimRunLease(host);
     heldLease = lease.lease;
     if (!lease.acquired) {
       const reason = lease.reason ?? "another run holds this pull request";
@@ -239,7 +241,7 @@ async function main() {
   }
 
   if (sinceAuto) {
-    const last = await resolveLastReviewedIteration(ref);
+    const last = await resolveLastReviewedIteration(host);
     if (last === undefined) log("--since auto: no prior review found, doing a full review");
     else {
       compareTo = last;
@@ -249,12 +251,12 @@ async function main() {
   if (compareTo > 0) log(`Incremental mode: reviewing only changes after iteration ${compareTo}`);
 
   reviewRunner = await createRunner();
-  const result = await runReview({ ref, runner: reviewRunner, compareTo, ...(heldLease ? { lease: heldLease } : {}) });
+  const result = await runReview({ host, runner: reviewRunner, compareTo, ...(heldLease ? { lease: heldLease } : {}) });
 
   // Here rather than in a `finally`, because every exit below is a process.exit() and those
   // do not run one. A normal review has already released it — publish() rewrites the summary
   // and the new body carries no marker — so on that path this costs one GET and no write.
-  await releaseRunLease(ref, heldLease);
+  await releaseRunLease(host, heldLease);
 
   banner("Done");
   log(`Elapsed ${result.durationSec}s, artifacts: ${result.runDir}`);
@@ -342,13 +344,13 @@ main().catch(async (e) => {
   // worth keeping.
   // Released before anything else: the next tick of a cron should be able to retry
   // immediately, not wait out an hour of a lease held by a process that is already dead.
-  if (fatalRef) await releaseRunLease(fatalRef, heldLease).catch(() => undefined);
+  if (fatalHost) await releaseRunLease(fatalHost, heldLease).catch(() => undefined);
   // And the worktrees a crash left standing: one per dead tick would pile up on a cron box.
   await cleanupAllWorktrees();
 
-  if (POST_STATUS && fatalRef && !isDryRun()) {
+  if (POST_STATUS && fatalHost && !isDryRun()) {
     try {
-      await postStatus(fatalRef, "error", `Review crashed: ${String(e instanceof Error ? e.message : e)}`);
+      await fatalHost.postStatus("error", `Review crashed: ${String(e instanceof Error ? e.message : e)}`);
     } catch (inner) {
       log(`[WARN] could not report the crash as a PR status: ${inner instanceof Error ? inner.message : String(inner)}`);
     }
@@ -360,12 +362,12 @@ main().catch(async (e) => {
   // left nothing on disk whatsoever — the auth and proxy lines existed only on a terminal
   // nobody was watching. Written into this run's own directory when it got one, so the
   // forensics sit beside the prompts that produced them.
-  if (fatalRef) {
+  if (fatalHost) {
     try {
       const dir = currentRunDir();
       // tee on the fallback: attachLogSink replays the backlog, so the [WARN] lines printed
       // before intake land in run.log rather than being lost with the terminal.
-      const run = dir ? openRunDir(dir) : createFatalRunDir(fatalRef);
+      const run = dir ? openRunDir(dir) : createFatalRunDir(fatalHost.ref);
       run.saveJson(
         "result.json",
         buildResultSummary({

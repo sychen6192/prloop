@@ -41,8 +41,16 @@ _Avoid_: tag, annotation, sentinel
 Everything one review reads: the iteration's file diffs with real line indexes, what was
 skipped and why, and the FileIndex built from them. Its contract — what a provider must
 guarantee — lives in `libs/context.ts`, not in either provider; `ado/` builds one from the
-REST API, `git/` from a working tree.
+REST API, `git/` from a working tree, each as its ReviewHost's `intake`.
 _Avoid_: state, payload, snapshot
+
+**ReviewHost**:
+The service a pull request lives on, as the pipeline sees it: where the change, the
+repository's conventions and the acceptance criteria come from, and where threads and the
+merge-gate status go. The contract is `libs/host.ts`; `ado/host.ts` answers it for a pull
+request, `git/host.ts` for a local branch (no threads, every write refused). Nothing in the
+pipeline reaches Azure DevOps any other way.
+_Avoid_: backend, platform, client
 
 **FileIndex**:
 The one resolver from a foreign path string — model-quoted or tool-reported — to a FileDiff

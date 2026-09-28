@@ -8,7 +8,7 @@ import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/typ
 import type { AggregateResult } from "../gates/aggregate";
 import type { CategoryHint } from "../libs/learnings";
 import type { ThreadTally, WatermarkDecision } from "./lifecycle";
-import type { ReviewContext } from "../ado/intake";
+import type { ReviewContext } from "../libs/context";
 import type { StaticResult } from "../gates/static";
 import { sanitizeToolMessage } from "../prompts/untrusted";
 import { describeTier, type RiskTier } from "../libs/tier";

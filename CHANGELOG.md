@@ -307,6 +307,16 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- **Azure DevOps sits behind one interface, `ReviewHost` (`libs/host.ts`).** The orchestrator,
+  the requirement axis and three `publish/` modules used to import `ado/` directly, and the
+  seams that grew around that one at a time — an intake, a conventions reader, a work-item
+  reader, a reader of the fingerprints already posted — were four optional parameters with
+  four ADO defaults. Now a review is handed a host: `ado/host.ts` for a pull request,
+  `git/host.ts` for a local branch (no threads, every write refused), or the in-memory
+  `scripts/fakes/host.ts` a test can build in one line. The thread shapes stay Azure DevOps's
+  and the hidden-marker bytes are unchanged; a second service would be an adapter onto them,
+  not a rewrite. `scripts/selftest-docs.ts` fails on a pipeline module that imports `ado/`
+  again. Nothing a user sees changes.
 - **Internals that other code depended on by accident, made explicit.** Every `PRR_*` knob is
   declared by the `config.ts` reader that reads it — kind, section, one-line description — and
   `KNOWN_KEYS` is built from those declarations, so the hand-kept second list of names, and the

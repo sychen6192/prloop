@@ -3,8 +3,6 @@
 // Everything downstream (finder prompt, anchoring, publishing) reads from here.
 import { ADO_CONCURRENCY } from "../config";
 import { getBlob } from "./blobs";
-// Re-exported for the callers that grew up importing it from here; libs/context.ts owns it.
-export type { ReviewContext } from "../libs/context";
 import { getIterationChanges, getPrInfo, listIterations } from "./iterations";
 import { buildHunks, diffLines } from "../libs/diff";
 import { FileIndex, normalizePath } from "../libs/fileindex";

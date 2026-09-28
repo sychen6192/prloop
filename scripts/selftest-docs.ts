@@ -98,6 +98,27 @@ console.log("\nEntry points the selftests cannot reach");
   check("README still documents --config as the settings dump", readme.includes("prloop --config"));
 }
 
+console.log("\nThe pipeline reaches Azure DevOps only through a ReviewHost");
+{
+  // CLAUDE.md says so, and the claim is the whole value of libs/host.ts: a local review, an
+  // in-memory test host or a second service can stand in for ADO only while nothing in the
+  // pipeline calls ado/ behind the host's back. It used to — the requirement axis, three
+  // publish/ modules and the orchestrator each imported it directly — and every one of those
+  // imports was reasonable on the day it was written.
+  check("CLAUDE.md states the rule", read("CLAUDE.md").includes("only through a `ReviewHost`"));
+  const pipeline = [
+    "orchestrator.ts",
+    ...["anchoring", "gates", "models", "prompts", "publish"].flatMap((dir) =>
+      readdirSync(path.join(root, dir))
+        .filter((f) => f.endsWith(".ts"))
+        .map((f) => `${dir}/${f}`),
+    ),
+  ];
+  check("the scan found the pipeline's modules", pipeline.length > 20, String(pipeline.length));
+  const reaches = pipeline.filter((f) => /(?:from|import\()\s*["'](?:\.\.?\/)+ado\//.test(read(f)));
+  check("no pipeline module imports ado/", reaches.length === 0, reaches.join(", "));
+}
+
 console.log("\nPaths documents point at");
 {
   // docs/superpowers/specs/ was renamed to docs/design/; a stale link in a doc is silent.

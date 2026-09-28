@@ -10,7 +10,7 @@ import { buildHunks, diffLines } from "../libs/diff";
 import { splitLines } from "../libs/text";
 import { log, logVerbose } from "../libs/log";
 import { run } from "../libs/shell";
-import type { ChangeType, FileDiff, PrInfo } from "../libs/types";
+import type { ChangeType, FileDiff, PrInfo, PrRef } from "../libs/types";
 import type { ReviewContext, SkippedFile } from "../libs/context";
 import { gatherConventions, type ConventionDoc } from "../libs/conventions";
 
@@ -82,6 +82,15 @@ export async function readLocalConventions(repo: string, commit: string, changed
   );
   if (failures.length > 0) log(`[WARN] repo conventions: ${failures.length} could not be read. First: ${failures[0]}`);
   return docs;
+}
+
+/**
+ * The pull request reference a local review files its runs under. prId 0 and the empty
+ * baseUrl are sentinels — there is no pull request — and git/host.ts, not these, is what keeps
+ * a local review from ever reaching Azure DevOps.
+ */
+export function localRef(repo: string): PrRef {
+  return { baseUrl: "", org: "local", project: "local", repoId: repo, prId: 0 };
 }
 
 export interface LocalIntakeOptions {
@@ -195,8 +204,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
   // Real commits, not empty strings. orchestrator.ts fetches the repository's convention
   // files at ctx.iteration.targetRefCommit and hands ctx.iteration.sourceRefCommit to the
   // static gate; a sentinel there satisfies the type and then silently means "no
-  // conventions" and "no source commit". prId 0 and the empty baseUrl stay sentinels — there
-  // is no PR — and every ADO call is gated on having one before it runs.
+  // conventions" and "no source commit". Only the ref is a sentinel (localRef).
   const iteration = {
     id: 1,
     sourceRefCommit: (await git(opts.repo, ["rev-parse", opts.head])).trim(),
@@ -205,7 +213,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     createdDate: "",
   };
   return {
-    ref: { baseUrl: "", org: "local", project: "local", repoId: opts.repo, prId: 0 },
+    ref: localRef(opts.repo),
     pr,
     iterations: [iteration],
     iteration,

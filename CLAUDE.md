@@ -49,21 +49,26 @@ and closes its server in a `finally`.
   severities, categories — is not configuration and lives in `libs/taxonomy.ts`.
 - **Every model call goes through `models/runner.ts`** (concurrency, retries, streaming,
   token accounting). Never call fetch directly for model traffic.
+- **The pipeline reaches Azure DevOps only through a `ReviewHost`** (`libs/host.ts`):
+  `orchestrator.ts`, `gates/`, `publish/` and the rest of the pipeline import nothing from
+  `ado/`. A PR run gets `ado/host.ts`, a local review `git/host.ts`, a test the in-memory
+  `scripts/fakes/host.ts`; `scripts/selftest-docs.ts` fails on an import that goes around it.
+  The hidden markers are the host-independent part — a host stores a body and never rewrites it.
 
 ## Layout
 
 | dir | role |
 | --- | --- |
 | `orchestrator.ts` | the one control flow: intake → gates → publish |
-| `ado/` | Azure DevOps REST (auth, blobs, threads, work items, conventions) |
-| `git/` | local intake from a working tree, and the throwaway worktree the static gate runs in |
+| `ado/` | Azure DevOps REST (auth, blobs, threads, work items, conventions), bound to one PR as a `ReviewHost` by `ado/host.ts` |
+| `git/` | a local branch as a `ReviewHost` (intake from a working tree), and the throwaway worktree the static gate runs in |
 | `gates/` | finder, skeptic, requirement, static analysis, aggregation |
 | `anchoring/` | quote → line resolution (the reason this tool exists) |
 | `models/` | runner adapters (OpenAI-compatible HTTP, opencode CLI) + JSON schemas |
 | `prompts/` | every prompt, one file per stage |
 | `rules/` | reviewer rules as markdown with `applyTo` globs |
 | `publish/` | comment rendering, the hidden marker protocol, dedup (fingerprint + position), lifecycle |
-| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types and the ReviewContext contract (SSOT) |
+| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types, and the ReviewContext and ReviewHost contracts (SSOT) |
 | `examples/` | Azure Pipelines YAML to start from: build validation, and a scheduled sweep with `--active` |
 | `scripts/` | selftests (+ `fakes/`, and `selftest/`: one module per area plus the shared harness), doctor/probe/tlsfix diagnostics, local-review, evaluate/calibrate/replay/bench |
 

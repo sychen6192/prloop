@@ -11,11 +11,9 @@
 // them sharing a filesystem.
 import { readMarkers, spanMark, type SpanMark } from "./markers";
 import { neutralizeLine } from "../prompts/untrusted";
-import { isSelfIdentity, selfIdentityId } from "../ado/identity";
-import { listThreads, setThreadStatus, type Thread, type ThreadComment } from "../ado/threads";
 import type { FileIndex } from "../libs/fileindex";
+import { isSelfIdentity, type ReviewHost, type Thread, type ThreadComment } from "../libs/host";
 import { log, logVerbose } from "../libs/log";
-import type { PrRef } from "../libs/types";
 
 /**
  * The iteration recorded by our last run, read back from the sticky summary.
@@ -64,9 +62,9 @@ export function lastReviewedIteration(threads: Thread[], selfId?: string): numbe
  * so failing here costs a tick and saves the entire model budget of a run that was going to
  * fail at the end anyway.
  */
-export async function resolveLastReviewedIteration(ref: PrRef): Promise<number | undefined> {
+export async function resolveLastReviewedIteration(host: ReviewHost): Promise<number | undefined> {
   try {
-    const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+    const [threads, selfId] = await Promise.all([host.threads(), host.selfId()]);
     return lastReviewedIteration(threads, selfId);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -307,7 +305,7 @@ export function findStaleThreads(threads: Thread[], index: FileIndex, tools?: To
 }
 
 /**
- * Closes them, and returns the ones ADO accepted.
+ * Closes them, and returns the ones the host accepted.
  *
  * The ones it accepted, not the ones we asked about: a close that failed left the thread
  * open, and recording it as an outcome would book a comment as acted on because we tried to
@@ -315,11 +313,11 @@ export function findStaleThreads(threads: Thread[], index: FileIndex, tools?: To
  * human fixes — prloop's auto-close sets the same `fixed` status a person does and leaves no
  * comment behind, so the next run cannot tell them apart from the thread alone.
  */
-export async function resolveStaleThreads(ref: PrRef, stale: StaleThread[]): Promise<StaleThread[]> {
+export async function resolveStaleThreads(host: ReviewHost, stale: StaleThread[]): Promise<StaleThread[]> {
   const closed: StaleThread[] = [];
   for (const s of stale) {
     try {
-      await setThreadStatus(ref, s.threadId, "fixed");
+      await host.setThreadStatus(s.threadId, "fixed");
       closed.push(s);
       logVerbose(`  Closed thread ${s.threadId} (${s.file}:${s.line}): ${s.reason}`);
     } catch (e) {

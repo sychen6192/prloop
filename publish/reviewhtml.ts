@@ -21,7 +21,7 @@
 // redactSecrets like every other egress.
 import { detectLanguage } from "../libs/lang";
 import type { AggregateResult } from "../gates/aggregate";
-import type { ReviewContext } from "../ado/intake";
+import type { ReviewContext } from "../libs/context";
 import type { AnchoredFinding, FileDiff, Hunk, ReqVerdict, RequirementResult } from "../libs/types";
 
 const SEVERITY_ORDER = ["critical", "high", "medium", "low"] as const;

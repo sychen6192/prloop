@@ -8,11 +8,12 @@
 //   anchor   — reads a findings JSON and reports where each comment would actually land
 //
 // The last two work without a reachable model endpoint. All three run the production code
-// paths; `review` substitutes only where the code comes from (git, not ADO), where the
-// repository's conventions come from (its own history) and where the criteria come from
-// (a file, when one is given).
+// paths; `review` substitutes only the host (git/host.ts): where the code comes from (git,
+// not ADO), where the repository's conventions come from (its own history) and where the
+// criteria come from (a file, when one is given).
 import * as fs from "node:fs";
-import { buildLocalReviewContext, readLocalConventions } from "../git/intake";
+import { localHost } from "../git/host";
+import { buildLocalReviewContext } from "../git/intake";
 import { anchorAndDedupe, finalize } from "../gates/aggregate";
 import { FINDER_SEED } from "../config";
 import { buildFinderPrompt, FINDER_SYSTEM } from "../prompts/finder";
@@ -21,7 +22,7 @@ import { loadRules, renderRules, ruleHeadings, selectRules } from "../libs/rules
 import { parseJsonObject } from "../libs/json";
 import { renderSummary } from "../publish/format";
 import type { FinderOutput } from "../gates/finder";
-import type { RawFinding, WorkItem } from "../libs/types";
+import type { RawFinding } from "../libs/types";
 import { createRunner } from "../models/runner";
 import { exitCodeFor, runReview } from "../orchestrator";
 import { run } from "../libs/shell";
@@ -32,20 +33,6 @@ function usage(): never {
   tsx scripts/local-review.ts prompt <repo> <base> <head> [out.md]
   tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json> [model name]`);
   process.exit(1);
-}
-
-/** Acceptance criteria from a file, as the one work item a local branch is judged against. */
-function localWorkItem(text: string): WorkItem {
-  return {
-    id: 1,
-    title: "local acceptance criteria",
-    type: "User Story",
-    state: "Active",
-    description: "",
-    acceptanceCriteria: text.trim(),
-    specSource: "acceptance-criteria",
-    url: "",
-  };
 }
 
 async function main() {
@@ -81,14 +68,9 @@ async function main() {
     const promisors = await run("git", ["-C", repo, "config", "--get-regexp", "^remote\\..*\\.promisor$"], 10_000);
     const partial = /\btrue\b/.test(promisors.stdout);
     const result = await runReview({
-      ref: ctx.ref,
+      host: localHost({ repo, base, head, ...(criteria === undefined ? {} : { criteria }) }),
       runner: await createRunner(),
       compareTo: 0,
-      intake: (_ref, _compareTo, o) => buildLocalReviewContext({ repo, base, head, ...(o?.text ? { text: true } : {}) }),
-      conventions: (commit, paths) => readLocalConventions(repo, commit, paths),
-      // No pull request, so nothing is posted yet and every finding is verified.
-      posted: async () => new Set(),
-      workItems: async () => ({ items: criteria ? [localWorkItem(criteria)] : [], inheritedFrom: [] }),
       ...(partial ? {} : { searchRepo: repo }),
     });
     const { inline, belowBar, degraded } = result.agg;

@@ -3,10 +3,7 @@
 // issue twice (the "re-review amnesia" failure mode).
 import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun } from "../config";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
-import { AdoError } from "../ado/client";
-import { isSelfIdentity, selfIdentityId } from "../ado/identity";
-import { createThread, listThreads, updateComment, type Thread } from "../ado/threads";
-import { postStatus, type StatusState } from "../ado/statuses";
+import { isSelfIdentity, refusalStatus, type ReviewHost, type StatusState, type Thread } from "../libs/host";
 import { reviewOutcome } from "./status";
 import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
@@ -15,7 +12,7 @@ import { log } from "../libs/log";
 import { collectDismissals, collectFinalOutcomes, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
 import { iterationMarker, readMarkers, spanMark, type SpanMark } from "./markers";
 import { leaseTakenOver, type LeaseHandle } from "./lease";
-import type { AnchoredFinding, PrRef } from "../libs/types";
+import type { AnchoredFinding } from "../libs/types";
 import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, ToolEvidence, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
 
@@ -23,8 +20,8 @@ export interface PublishResult {
   summaryThreadId?: number;
   posted: AnchoredFinding[];
   alreadyPosted: AnchoredFinding[];
-  // `status` is ADO's, when it gave one. A 4xx is final (ado/client.ts does not retry below
-  // 500), which is what tells the watermark decision apart from a transport blip.
+  // `status` is the host's, when it gave one. A 4xx is final (ado/client.ts does not retry
+  // below 500), which is what tells the watermark decision apart from a transport blip.
   failed: Array<{ finding: AnchoredFinding; error: string; status?: number }>;
   // Our own threads auto-closed because the code they pointed at changed.
   resolved: number;
@@ -208,8 +205,8 @@ function postedFingerprints(threads: Thread[]): Set<string> {
 }
 
 /** Every fingerprint already on the pull request, read on its own for the skeptic's filter. */
-export async function postedFingerprintsOnPr(ref: PrRef): Promise<Set<string>> {
-  return postedFingerprints(await listThreads(ref));
+export async function postedFingerprintsOnPr(host: ReviewHost): Promise<Set<string>> {
+  return postedFingerprints(await host.threads());
 }
 
 /**
@@ -221,20 +218,20 @@ export async function postedFingerprintsOnPr(ref: PrRef): Promise<Set<string>> {
  * richest the dismissal and outcome stores ever get. Returning early without this would trade
  * the whole harvest for the model budget it was meant to save.
  */
-export async function harvestClosedThreads(ref: PrRef): Promise<{ dismissals: number; outcomes: number }> {
-  const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+export async function harvestClosedThreads(host: ReviewHost): Promise<{ dismissals: number; outcomes: number }> {
+  const [threads, selfId] = await Promise.all([host.threads(), host.selfId()]);
   const dismissals = collectDismissals(threads, selfId);
   // The fixes first: the store keeps the first record per finding, and a comment fixed
   // before the merge must not be filed as ignored because it is also past the merge.
   const outcomes = [...collectOutcomes(threads, selfId), ...collectFinalOutcomes(threads, selfId)];
   return {
-    dismissals: LEARN_FROM_DISMISSALS ? recordDismissals(ref, dismissals) : 0,
-    outcomes: recordOutcomes(ref, outcomes),
+    dismissals: LEARN_FROM_DISMISSALS ? recordDismissals(host.ref, dismissals) : 0,
+    outcomes: recordOutcomes(host.ref, outcomes),
   };
 }
 
 export async function publish(
-  ref: PrRef,
+  host: ReviewHost,
   axes: { requirement: AnchoredFinding[]; code: AnchoredFinding[] },
   summaryInput: SummaryInput,
   /**
@@ -289,7 +286,7 @@ export async function publish(
     });
     result.status = outcome.state;
     try {
-      await postStatus(ref, outcome.state, outcome.description, { iterationId: ctx.iteration.id });
+      await host.postStatus(outcome.state, outcome.description, { iterationId: ctx.iteration.id });
       log(`Reported PR status: ${outcome.state} (${outcome.description})`);
     } catch (e) {
       log(`[FAIL] PR status report failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -317,7 +314,7 @@ export async function publish(
   let threads: Thread[];
   let selfId: string | undefined;
   try {
-    [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+    [threads, selfId] = await Promise.all([host.threads(), host.selfId()]);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[FAIL] Could not read the PR's existing comments: ${msg}`);
@@ -342,7 +339,7 @@ export async function publish(
 
   // Close our own threads whose code has since changed, before adding new ones — otherwise
   // a PR accumulates stale comments the author already addressed.
-  const closed = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex, known.toolEvidence));
+  const closed = await resolveStaleThreads(host, findStaleThreads(threads, ctx.fileIndex, known.toolEvidence));
   result.resolved = closed.length;
   // From the same pre-close snapshot as the outcomes below, so a thread this run has just
   // closed is still `active` in it and cannot also be booked as a reviewer's fix.
@@ -369,13 +366,13 @@ export async function publish(
       })),
   ];
   if (result.outcomes.length > 0) {
-    const newly = recordOutcomes(ref, result.outcomes);
+    const newly = recordOutcomes(host.ref, result.outcomes);
     if (newly > 0) log(`Recorded ${newly} findings the author acted on (scripts/calibrate.ts reports the rate)`);
   }
   if (result.dismissals.length > 0 && LEARN_FROM_DISMISSALS) {
     // Persist into the per-repo learnings store: the next run (on this PR or any other)
     // suppresses findings matching these fingerprints instead of re-litigating them.
-    const newly = recordDismissals(ref, result.dismissals);
+    const newly = recordDismissals(host.ref, result.dismissals);
     log(
       `Found ${result.dismissals.length} comments dismissed by a human` +
         (newly > 0 ? ` (${newly} newly recorded — future runs will not repeat them)` : " (all already recorded)"),
@@ -395,7 +392,7 @@ export async function publish(
       continue;
     }
     try {
-      await createThread(ref, {
+      await host.createThread({
         content: renderFindingComment(f, spanOf(f, ctx.fileIndex), anchoredLines(f, ctx.fileIndex)),
         status: "active",
         filePath: f.file,
@@ -411,7 +408,7 @@ export async function publish(
       log(`[FAIL] Could not create comment ${f.file}:${f.anchor.startLine}: ${msg}`);
       // The status is kept, not just stringified: whether this rejection can ever succeed
       // again is what decides if the run may advance the resume point (watermarkFor).
-      const status = e instanceof AdoError ? e.status : undefined;
+      const status = refusalStatus(e);
       result.failed.push({ finding: f, error: msg, ...(status === undefined ? {} : { status }) });
     }
   }
@@ -475,13 +472,13 @@ export async function publish(
 
   try {
     if (existing) {
-      await updateComment(ref, existing.thread.id, existing.commentId, summaryBody);
+      await host.updateComment(existing.thread.id, existing.commentId, summaryBody);
       result.summaryThreadId = existing.thread.id;
       log(`Updated summary comment (thread ${existing.thread.id})`);
     } else {
       // Closed, not active: the summary is informational and should never trip a
       // "comment resolution required" policy.
-      const t = await createThread(ref, { content: summaryBody, status: "closed" });
+      const t = await host.createThread({ content: summaryBody, status: "closed" });
       result.summaryThreadId = t.id;
       log(`Created summary comment (thread ${t.id})`);
     }

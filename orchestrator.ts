@@ -19,12 +19,10 @@ import {
   isDryRun,
 } from "./config";
 import { describeTier, runTier } from "./libs/tier";
-import { buildReviewContext, type ReviewContext } from "./ado/intake";
-import type { IntakeProvider } from "./libs/context";
+import type { ReviewContext } from "./libs/context";
+import type { ConventionDoc } from "./libs/conventions";
 import { FileIndex } from "./libs/fileindex";
-import { terminalPrStatus } from "./ado/iterations";
-import { fetchRepoConventions, type ConventionDoc } from "./ado/conventions";
-import type { LinkedRequirements } from "./ado/workitems";
+import type { ReviewHost } from "./libs/host";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, markEarlierPushes, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
@@ -40,36 +38,21 @@ import { toReplayBundle } from "./libs/replay";
 import { tokensOf } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
-import type { AnchoredFinding, ModelRunner, PrRef, RequirementResult } from "./libs/types";
+import type { AnchoredFinding, ModelRunner, RequirementResult } from "./libs/types";
 import { harvestClosedThreads, postedFingerprintsOnPr, publish, type PublishResult } from "./publish/publish";
 import type { LeaseHandle } from "./publish/lease";
 import { renderReviewHtml } from "./publish/reviewhtml";
 import { reviewOutcome } from "./publish/status";
 
 export interface ReviewRunOptions {
-  ref: PrRef;
+  /**
+   * The pull request, and everything the review reads from or writes to the service hosting
+   * it (libs/host.ts). ado/host.ts for a pull request, git/host.ts for a local branch, an
+   * in-memory one in a test: nothing below reaches Azure DevOps any other way.
+   */
+  host: ReviewHost;
   runner: ModelRunner;
   compareTo: number;
-  /**
-   * Where the ReviewContext comes from. Defaults to the Azure DevOps intake; git/intake.ts
-   * is the other adapter at this seam. A parameter rather than a hard-wired import so the
-   * contract in libs/context.ts is something a provider can be held to — including in a
-   * test — instead of being whatever ado/intake.ts happens to return.
-   */
-  intake?: IntakeProvider;
-  /**
-   * Where the reviewed repository's own convention documents come from, at a commit, for a
-   * change touching `changedPaths` (the scoped ones apply only to some files). Defaults to
-   * ADO; a local review reads them out of the repository's own history.
-   */
-  conventions?: (commit: string, changedPaths: readonly string[]) => Promise<ConventionDoc[]>;
-  /** Where the acceptance criteria come from. Defaults to the PR's linked work items. */
-  workItems?: () => Promise<LinkedRequirements>;
-  /**
-   * The finding fingerprints already on the pull request, whose findings skip the skeptic.
-   * Defaults to reading the PR's threads; a local review has none.
-   */
-  posted?: () => Promise<ReadonlySet<string>>;
   /** The run lease loop.ts took for this review, which publish() checks before writing. */
   lease?: LeaseHandle;
   /**
@@ -167,14 +150,15 @@ export function exitCodeFor(result: Pick<ReviewRunResult, "agg" | "req" | "incom
  * thing), and unlike the thread writes it is not something ADO was refusing anyway.
  */
 async function skipTerminalPr(
-  ref: PrRef,
+  host: ReviewHost,
   ctx: ReviewContext,
   reason: string,
   started: number,
 ): Promise<ReviewRunResult> {
   log(`${reason} — no review will be posted, so none is computed`);
+  const { ref } = host;
   const run = createSkipDir(ref);
-  const harvest = await harvestClosedThreads(ref).catch((e): { dismissals: number; outcomes: number } => {
+  const harvest = await harvestClosedThreads(host).catch((e): { dismissals: number; outcomes: number } => {
     // Best effort by design: a tick that could not read a merged PR has still correctly done
     // nothing, and turning that into a failure would redden a cron over a list of PRs that
     // are all finished.
@@ -208,6 +192,8 @@ async function skipTerminalPr(
 
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {
   const started = Date.now();
+  const { host } = opts;
+  const { ref } = host;
   // Wall time per stage, in ms, for result.json. Stages that run side by side overlap, so
   // these do not sum to the run's duration; each says how long its own stage held the run up
   // at most, which is the question when a review is slow.
@@ -222,8 +208,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   };
 
   banner("Step 1/4: fetch PR changes");
-  const intake = opts.intake ?? buildReviewContext;
-  const ctx = await timed("intake", intake(opts.ref, opts.compareTo));
+  const ctx = await timed("intake", host.intake(opts.compareTo));
 
   // A merged pull request refuses every write, so a review of one buys nothing and costs
   // everything: the README's cron loop kept paying for the finders, the skeptic and triage on
@@ -238,13 +223,13 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // The honest cost note: intake has already fetched the PR, its iterations and two blobs
   // per changed file by the time we get here. What this saves is the model budget, which is
   // the part that is measured in money. Skipping before the REST spend would need a status
-  // probe of its own alongside the intake seam, and is a different change.
-  const terminal = terminalPrStatus(ctx.pr.status);
+  // probe of its own on the host, and is a different change.
+  const terminal = host.terminal(ctx.pr);
   if (terminal && !isDryRun()) {
-    return skipTerminalPr(opts.ref, ctx, terminal, started);
+    return skipTerminalPr(host, ctx, terminal, started);
   }
 
-  const run = createRunDir(opts.ref, ctx.iteration.id);
+  const run = createRunDir(ref, ctx.iteration.id);
   log(`artifacts: ${run.dir}`);
 
   // Saved first, before any stage can fail: a run in runs/ is only diagnosable a week later
@@ -261,7 +246,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const tier = runTier(ctx.files);
 
   run.saveJson("context.json", {
-    ref: opts.ref,
+    ref,
     pr: ctx.pr,
     iteration: ctx.iteration,
     compareTo: ctx.compareTo,
@@ -288,8 +273,8 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // against it on an incremental run; the code axis asks it which lines this push left alone
   // an earlier push of the same PR wrote. Blobs are content-addressed and cached, so the read
   // fetches only the files this push did not touch.
-  let wholePrRead: ReturnType<typeof intake> | undefined;
-  const wholePr = () => (wholePrRead ??= intake(opts.ref, 0, { text: true }));
+  let wholePrRead: Promise<ReviewContext> | undefined;
+  const wholePr = () => (wholePrRead ??= host.intake(0, { text: true }));
 
   // The two axes run concurrently and blind to each other: neither model sees the other's
   // output, so "the code is clean" can't excuse a missing requirement, or vice versa.
@@ -306,7 +291,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // judged against that, a criterion delivered two pushes ago came back "missing", the
   // dispute pass saw the same partial diff and could not refute it, and the status failed
   // the PR for work it already contained. So an incremental run reads the PR a second time,
-  // whole, through the same intake seam. Blobs are content-addressed and cached, so the
+  // whole, through the host's intake again. Blobs are content-addressed and cached, so the
   // second read fetches only the files this push left alone.
   //
   // Whole, and not only its code: a criterion met in a config file or a document is not
@@ -324,7 +309,6 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           },
         })
       : runRequirementGate({
-          ref: opts.ref,
           pr: ctx.pr,
           diff: async () => {
             const whole = await wholePr();
@@ -332,7 +316,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             return { files, fileIndex: new FileIndex(files) };
           },
           runner: opts.runner,
-          ...(opts.workItems ? { workItems: opts.workItems } : {}),
+          requirements: () => host.requirements(),
         })
   ).catch((e): Awaited<ReturnType<typeof runRequirementGate>> => {
     const msg = e instanceof Error ? e.message : String(e);
@@ -348,7 +332,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // and a failed fetch costs the finder its context bonus, not the run.
   const conventionDocs =
     ctx.iteration.targetRefCommit && !noCode
-      ? await timed("conventions", (opts.conventions ?? ((commit: string, paths: readonly string[]) => fetchRepoConventions(opts.ref, commit, paths)))(
+      ? await timed("conventions", host.conventions(
           ctx.iteration.targetRefCommit,
           ctx.files.map((f) => f.path),
         )).catch((e): ConventionDoc[] => {
@@ -373,7 +357,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // an earlier run posted skips the skeptic: publish() will not post it again, and verifying
   // it again was paid for on every re-review of a PR whose threads were already known.
   // Failing to read them costs only that saving: everything is verified, as before.
-  const postedRead = (opts.posted ?? (() => postedFingerprintsOnPr(opts.ref)))().catch((e): ReadonlySet<string> => {
+  const postedRead = postedFingerprintsOnPr(host).catch((e): ReadonlySet<string> => {
     log(`[WARN] could not read which findings are already posted, so all of them are verified: ${e instanceof Error ? e.message : String(e)}`);
     return new Set();
   });
@@ -405,7 +389,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     // list would accumulate every day.
     try {
       if (WORKTREE_REPO) {
-        const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, opts.ref.prId).catch(
+        const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, ref.prId).catch(
           (e): { error: string } => ({ error: `worktree preparation failed: ${e instanceof Error ? e.message : String(e)}` }),
         );
         if (isWorktreeFailure(prepared)) {
@@ -416,7 +400,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
         if (STATIC_BASELINE) {
           const mergeBase = ctx.iteration.commonRefCommit;
           const base = mergeBase
-            ? await prepareWorktree(WORKTREE_REPO, mergeBase, opts.ref.prId).catch(
+            ? await prepareWorktree(WORKTREE_REPO, mergeBase, ref.prId).catch(
                 (e): { error: string } => ({ error: `${e instanceof Error ? e.message : String(e)}` }),
               )
             : { error: "the iteration names no merge base" };
@@ -495,7 +479,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // Learnings: findings a human already dismissed (on this PR or a previous one) skip the
   // skeptic — no verification budget is spent re-litigating a closed decision — and are
   // suppressed by finalize below. Loaded once; also feeds the config hints in the summary.
-  const storedDismissals = LEARN_FROM_DISMISSALS ? loadDismissals(opts.ref) : [];
+  const storedDismissals = LEARN_FROM_DISMISSALS ? loadDismissals(ref) : [];
   const dismissedFps = new Set(storedDismissals.map((d) => d.fingerprint));
   // And findings an earlier run already posted, which it verified then: publish() will not
   // post them again, so another verdict would change nothing but the bill.
@@ -689,7 +673,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
 
   const publishResult = await timed("publish", publish(
-    opts.ref,
+    host,
     { requirement: reqFindings, code: agg.inline },
     {
       ctx,

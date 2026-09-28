@@ -13,7 +13,7 @@
 // One function, so there is no second opinion to drift. Both callers derive from its result
 // rather than re-deciding: orchestrator.exitCodeFor returns `.exitCode`, publish() posts
 // `.state` and `.description`.
-import type { StatusState } from "../ado/statuses";
+import type { StatusState } from "../libs/host";
 
 export interface ReviewOutcome {
   /** 0 clean · 2 blocking findings · 3 the review did not fully run. */

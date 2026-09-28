@@ -8,7 +8,7 @@ import { openRunDir } from "../libs/artifacts";
 import { renderFindingComment, renderSummary } from "../publish/format";
 import { renderReviewHtml } from "../publish/reviewhtml";
 import type { AnchoredFinding, FileDiff, RequirementResult } from "../libs/types";
-import type { ReviewContext } from "../ado/intake";
+import type { ReviewContext } from "../libs/context";
 
 function mkFile(path: string, rightLines: string[], changed: number[], language: string): FileDiff {
   const leftLines = rightLines.filter((_, i) => !changed.includes(i + 1));

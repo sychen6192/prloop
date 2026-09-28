@@ -70,12 +70,3 @@ export interface IntakeOptions {
   /** Also diff the changed non-code text files into `textFiles`. Costs their blob reads. */
   text?: boolean;
 }
-
-/**
- * What the orchestrator needs from an intake: a PrRef and a compare base in, a ReviewContext
- * out. compareTo 0 is the whole pull request.
- *
- * Two adapters satisfy it — ado/intake.ts against the REST API, git/intake.ts against a
- * working tree — which is what makes this a real seam rather than a hypothetical one.
- */
-export type IntakeProvider = (ref: PrRef, compareTo: number, opts?: IntakeOptions) => Promise<ReviewContext>;

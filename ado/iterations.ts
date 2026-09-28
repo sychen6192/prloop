@@ -25,10 +25,9 @@ interface RawPr {
  * would be a guess wearing a fact's clothes; add it in its own commit once a rejected POST on
  * one has been seen, and paste the message into this docstring the way client.ts does.
  *
- * Lives beside getPrInfo rather than in the orchestrator because scripts/doctor.ts needs it
- * too, and doctor deliberately imports no gate, no publisher and no orchestrator: it is what
- * you run at 3am when something is broken, and a module-load failure anywhere in the pipeline
- * must not take the diagnostic down with it.
+ * Lives beside getPrInfo rather than in the orchestrator because the vocabulary is ADO's:
+ * ado/host.ts answers ReviewHost.terminal with it, and a host whose pull requests say
+ * "merged" answers with its own.
  */
 export function terminalPrStatus(status: string): string | undefined {
   return status.toLowerCase() === "completed" ? "the pull request is completed" : undefined;

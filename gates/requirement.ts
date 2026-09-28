@@ -5,10 +5,10 @@
 // because Boards hygiene is imperfect gets switched off.
 import { createHash } from "node:crypto";
 import { MAX_EXTRAS, MAX_INLINE_REQ_COMMENTS, REQ_MODEL, SKEPTIC_MODELS } from "../config";
-import { getLinkedRequirements, type LinkedRequirements } from "../ado/workitems";
 import { anchorFinding } from "../anchoring/locate";
 import { extractCriteria, type CriterionRef } from "../libs/criteria";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
+import type { LinkedRequirements } from "../libs/host";
 import { parseJsonObject } from "../libs/json";
 import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
@@ -22,7 +22,6 @@ import type {
   FileDiff,
   ModelRunner,
   PrInfo,
-  PrRef,
   RawFinding,
   ReqVerdict,
   RequirementResult,
@@ -132,7 +131,6 @@ export interface RequirementDiff {
 }
 
 export interface RequirementGateInput {
-  ref: PrRef;
   pr: PrInfo;
   /**
    * The WHOLE pull request, never one push of it, code and non-code text alike: criteria are
@@ -145,8 +143,8 @@ export interface RequirementGateInput {
    */
   diff: () => Promise<RequirementDiff>;
   runner: ModelRunner;
-  /** Where the criteria come from. Defaults to the PR's linked work items in ADO. */
-  workItems?: () => Promise<LinkedRequirements>;
+  /** Where the criteria come from: the host's (ReviewHost.requirements). */
+  requirements: () => Promise<LinkedRequirements>;
 }
 
 export async function runRequirementGate(
@@ -154,7 +152,7 @@ export async function runRequirementGate(
 ): Promise<{ result: RequirementResult; prompt?: string; raw?: string }> {
   let linked;
   try {
-    linked = await (input.workItems ?? (() => getLinkedRequirements(input.ref)))();
+    linked = await input.requirements();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[WARN] Failed to fetch work items: ${msg}`);
