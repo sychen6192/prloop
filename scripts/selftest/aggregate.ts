@@ -26,6 +26,8 @@ import * as path from "node:path";
 import { MAX_INLINE_COMMENTS } from "../../config";
 import { buildHunks, diffLines } from "../../libs/diff";
 import { suppressionMarker } from "../../libs/suppression";
+import { describeTier, riskTier, type TierSettings } from "../../libs/tier";
+import { markEarlierPushes } from "../../gates/aggregate";
 import type { FileDiff } from "../../libs/types";
 import { check, eq, section } from "./harness";
 import { mkFile, mkFinding } from "./fixtures";
@@ -510,4 +512,70 @@ section("lanes: lines the change did not touch, and a check the author silenced"
   const merged = mergeToolFindings([model], [tool]);
   eq("an agreeing tool merges in", merged.length, 1);
   eq("...and lifts the marker's silence", merged[0]?.silencedBy, undefined);
+}
+
+section("risk tiers: how much review a change gets, from its size and what it touches");
+{
+  const change = (lines: number, files: number, path = "src/a.ts"): FileDiff[] =>
+    Array.from({ length: files }, (_, i) => ({
+      ...mkFile(i === 0 ? path : `src/f${i}.ts`, ["x"], []),
+      changedRightLines: new Set(Array.from({ length: i === 0 ? lines - (files - 1) : 1 }, (_, n) => n + 1)),
+    }));
+  const on: TierSettings = {
+    enabled: true, sensitive: [], finders: ["a", "b", "c"], skepticModels: ["s1", "s2", "s3"],
+    skepticRounds: 3, minSeverity: "medium", requireCorroboration: true,
+  };
+  const off = riskTier(change(5, 1), { ...on, enabled: false });
+  eq("off, every change gets everything configured", [off.name, off.finders, off.skepticRounds, off.minSeverity], ["full", ["a", "b", "c"], 3, "medium"]);
+
+  const trivial = riskTier(change(5, 1), on);
+  eq("a five-line change is trivial", trivial.name, "trivial");
+  eq("...one finder, one verifier round", [trivial.finders, trivial.skepticRounds], [["a"], 1]);
+  eq("...and comments one severity stricter", trivial.minSeverity, "high");
+  eq("...said in one line", describeTier(trivial), "trivial (5 changed lines in 1 file): 1 finder, 1 verifier round, inline comments at high and above");
+  eq("with no skeptic to corroborate one finder, two are kept", riskTier(change(5, 1), { ...on, skepticModels: [] }).finders, ["a", "b"]);
+  eq("...unless corroboration is not required", riskTier(change(5, 1), { ...on, skepticModels: [], requireCorroboration: false }).finders, ["a"]);
+  eq("a bar of high stays high", riskTier(change(5, 1), { ...on, minSeverity: "high" }).minSeverity, "high");
+  eq("...critical stays critical", riskTier(change(5, 1), { ...on, minSeverity: "critical" }).minSeverity, "critical");
+  eq("...and low becomes medium", riskTier(change(5, 1), { ...on, minSeverity: "low" }).minSeverity, "medium");
+
+  const lite = riskTier(change(21, 1), on);
+  eq("one line past trivial is lite: two finders, rounds and bar as configured", [lite.name, lite.finders, lite.skepticRounds, lite.minSeverity], ["lite", ["a", "b"], 3, "medium"]);
+  eq("four files is past trivial whatever their size", riskTier(change(4, 4), on).name, "lite");
+  eq("past two hundred lines is the full review", riskTier(change(201, 2), on).name, "full");
+  eq("...and past fifteen files", riskTier(change(16, 16), on).name, "full");
+
+  const auth = riskTier(change(2, 1, "src/auth/login.ts"), { ...on, sensitive: ["**/auth/**"] });
+  eq("a sensitive path gets the full review however small the change", [auth.name, auth.finders.length], ["full", 3]);
+  check("...and says which path did it", auth.reason.includes("src/auth/login.ts matches PRR_SENSITIVE_PATHS"), auth.reason);
+  eq("a glob with no slash matches a file name at any depth", riskTier(change(2, 1, "db/migrations/001.sql"), { ...on, sensitive: ["*.sql"] }).name, "full");
+
+  // The bar a tier sets is the bar finalize applies.
+  const f = (severity: AnchoredFinding["severity"]): AnchoredFinding => ({
+    category: "correctness", severity, confidence: 0.8, file: "src/a.ts", quote: "x();", claim: severity,
+    sources: ["m1", "m2"], fingerprint: `fp-${severity}`, anchor: { side: "right", startLine: 1, endLine: 1, startOffset: 1, endOffset: 5 },
+  });
+  const empty = { merged: [], degraded: [], rawCount: 0, byFailure: {}, excluded: 0 };
+  const strict = finalize(empty, [f("high"), f("medium")], new Set(), 0, "high");
+  eq("a stricter bar keeps a medium finding off the lines", [strict.inline.map((x) => x.claim), strict.belowBar.map((x) => x.suppressedBy)], [["high"], ["severity"]]);
+}
+
+section("convergence: on a later push, code an earlier push wrote is not code from before the PR");
+{
+  // The whole PR added lines 1-10; this push changed line 12 alone.
+  const whole: FileDiff = { ...mkFile("src/a.ts", Array.from({ length: 20 }, (_, i) => `l${i + 1}`), []), changedRightLines: new Set(Array.from({ length: 10 }, (_, i) => i + 1)) };
+  const at = (line: number, over: Partial<AnchoredFinding> = {}): AnchoredFinding => ({
+    category: "correctness", severity: "high", confidence: 0.8, file: "src/a.ts", quote: `l${line}`, claim: `at ${line}`,
+    sources: ["m1"], fingerprint: `fp${line}`, suppressedBy: "pre-existing", untouched: true,
+    anchor: { side: "right", startLine: line, endLine: line, startOffset: 1, endOffset: 3 }, ...over,
+  });
+  const missed = at(5);
+  const older = at(15);
+  const left = at(6, { anchor: { side: "left", startLine: 6, endLine: 6, startOffset: 1, endOffset: 3 } });
+  const posted = at(7, { suppressedBy: "cap" });
+  markEarlierPushes([missed, older, left, posted], new FileIndex([whole]));
+  eq("a line an earlier push wrote is the PR's own", missed.earlierPush, true);
+  eq("...one no push wrote predates the PR", older.earlierPush, false);
+  eq("...an old-side line is left unsplit", left.earlierPush, undefined);
+  eq("...and only pre-existing findings are split", posted.earlierPush, undefined);
 }

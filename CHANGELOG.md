@@ -11,6 +11,18 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **`PRR_RISK_TIERS=1`: review depth from the change itself, Cloudflare's trivial / lite /
+  full.** Every finder and verifier call carries the same system prompt, rules and repository
+  conventions, so on a three-line change the fixed part of the prompt is nearly all of the
+  cost. With the knob on, a change of at most 20 changed lines in 3 files gets one finder, one
+  verifier round and inline comments one severity stricter than `PRR_MIN_INLINE_SEVERITY`
+  (never past `high`); one of at most 200 lines in 15 files gets two finders; anything larger
+  gets everything configured. `PRR_SENSITIVE_PATHS` lists globs whose changes always get the
+  full review. A second finder is kept whenever there is no skeptic to corroborate one — a
+  single finder would then post nothing. On `--since auto` the tier is the push's, so a small
+  follow-up push gets the light review. The tier and why are in the log, `context.json` and
+  the summary's run notes, and a replay applies the same bar. Off by default: fewer finders
+  find less, and `scripts/bench.ts compare` is how to decide it is worth it.
 - **The instruction files teams already write for Copilot, Cursor and coding agents are read,
   each in its own scope.** Six fixed root files used to be the whole list. Now also
   `.github/copilot-instructions.md` and `.cursorrules` for the whole repository; Copilot's
@@ -267,6 +279,12 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- **On a `--since auto` run, a finding on lines the push left alone says who wrote them.**
+  The whole pull request's diff — read once and shared with the requirement axis — splits
+  them: code an earlier push of the PR wrote is listed as *Previously missed*, the finding its
+  review should have made; code from before the PR as *Pre-existing issues*. A finding an
+  earlier run already commented on is not called missed. If the whole PR cannot be read the
+  list stays as one, *On lines this push did not touch*.
 - **Two kinds of finding no longer become new comments: one on lines the change did not touch,
   and one on a line whose author silenced a check.** A finding whose quoted lines hold nothing
   the change added or removed — or, for a removal, the line on either side of it — is listed

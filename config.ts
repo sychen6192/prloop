@@ -85,6 +85,8 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_FINDER_PROMPT_SUFFIX_BY_MODEL", kind: "json", section: S_FINDER, description: "JSON model -> stance text for that finder's prompt" },
   { name: "PRR_FINDER_SEED", kind: "number", section: S_FINDER, description: "file-order shuffle seed; unset = fresh per run" },
   { name: "PRR_RULES_DIR", kind: "string", section: S_FINDER, description: "team rules added to the shipped rules; same name replaces" },
+  { name: "PRR_RISK_TIERS", kind: "bool", section: S_FINDER, description: "1 = fewer finders and rounds for a small change" },
+  { name: "PRR_SENSITIVE_PATHS", kind: "csv", section: S_FINDER, description: "globs whose changes always get the full review" },
 
   { name: "PRR_MAX_DIFF_CHARS", kind: "number", section: S_BUDGET, description: "ceiling on the diff sent to a finder" },
   { name: "PRR_CONTEXT_TOKENS", kind: "number", section: S_BUDGET, description: "model context window; 0 = char ceiling only" },
@@ -840,6 +842,16 @@ export const SKEPTIC_MODELS = strEnv("PRR_SKEPTIC_MODELS", "")
 // only over 3 DISTINCT models: the gate caps the rounds at the number of configured skeptics,
 // because two samples of one model at temperature 0.2 are one opinion counted twice.
 export const SKEPTIC_ROUNDS = numEnv("PRR_SKEPTIC_ROUNDS", 1);
+// How much review a change gets from its size and what it touches (libs/tier.ts). Off by
+// default: fewer finders are fewer chances to find something, and whether a tier's saving is
+// worth what it misses is for scripts/bench.ts compare to say on a team's own pull requests.
+export const RISK_TIERS = flagEnv("PRR_RISK_TIERS");
+// Paths whose changes always get the full review, whatever their size: a one-line change to
+// an auth check is not trivial. Globs; one with no `/` matches a file name at any depth.
+export const SENSITIVE_PATHS = strEnv("PRR_SENSITIVE_PATHS", "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 // Source lines shown around the finding, on top of the whole hunk it sits in (the window
 // shows one side; a claim about a deleted line was uncheckable from it). Small on purpose:
 // models degrade with unlimited context, and a skeptic that needs the whole file is guessing

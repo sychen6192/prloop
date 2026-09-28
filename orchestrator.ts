@@ -10,12 +10,14 @@ import {
   SAVE_REPLAY,
   SKIP_REQUIREMENT,
   SKIP_STATIC,
+  RISK_TIERS,
   STATIC_BASELINE,
   STRICT_COVERAGE,
   WORKTREE_REPO,
   excludedCategories,
   isDryRun,
 } from "./config";
+import { describeTier, runTier } from "./libs/tier";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
 import type { IntakeProvider } from "./libs/context";
 import { FileIndex } from "./libs/fileindex";
@@ -23,7 +25,7 @@ import { terminalPrStatus } from "./ado/iterations";
 import { fetchRepoConventions, type ConventionDoc } from "./ado/conventions";
 import type { LinkedRequirements } from "./ado/workitems";
 import { renderConventions } from "./libs/rules";
-import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
+import { anchorAndDedupe, finalize, markEarlierPushes, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
 import { checkClaims, contradictionOutcome } from "./gates/claims";
 import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
@@ -231,11 +233,16 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // used which prompts.
   run.saveJson("stamp.json", await runStamp());
 
+  // How much review this change gets (PRR_RISK_TIERS): the finders, the verifier rounds and
+  // the inline bar, from its size and the paths it touches. Everything configured when off.
+  const tier = runTier(ctx.files);
+
   run.saveJson("context.json", {
     ref: opts.ref,
     pr: ctx.pr,
     iteration: ctx.iteration,
     compareTo: ctx.compareTo,
+    tier,
     files: ctx.files.map((f) => ({
       path: f.path,
       changeType: f.changeType,
@@ -252,6 +259,14 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // the requirement axis does not depend on code at all. Only the code axis stands down.
   const noCode = ctx.files.length === 0;
   if (noCode) log("No code in this change — the code axis has nothing to review");
+  else if (RISK_TIERS) log(`risk tier: ${describeTier(tier)}`);
+
+  // The whole pull request, read at most once and shared. The requirement axis judges
+  // against it on an incremental run; the code axis asks it which lines this push left alone
+  // an earlier push of the same PR wrote. Blobs are content-addressed and cached, so the read
+  // fetches only the files this push did not touch.
+  let wholePrRead: ReturnType<typeof intake> | undefined;
+  const wholePr = () => (wholePrRead ??= intake(opts.ref, 0, { text: true }));
 
   // The two axes run concurrently and blind to each other: neither model sees the other's
   // output, so "the code is clean" can't excuse a missing requirement, or vice versa.
@@ -289,7 +304,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           ref: opts.ref,
           pr: ctx.pr,
           diff: async () => {
-            const whole = await intake(opts.ref, 0, { text: true });
+            const whole = await wholePr();
             const files = [...whole.files, ...(whole.textFiles ?? [])];
             return { files, fileIndex: new FileIndex(files) };
           },
@@ -408,7 +423,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           iterationId: ctx.iteration.id,
           compareTo: ctx.compareTo,
           conventions,
-        })
+        }, tier.finders)
     ).catch((e): Awaited<ReturnType<typeof runFinders>> => {
       const why = `finder stage (${e instanceof Error ? e.message : String(e)})`;
       stageFailures.push(why);
@@ -465,7 +480,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const settled = new Set(contradictions.map((c) => c.finding));
   const toVerify = freshCandidates.filter((f) => !settled.has(f));
   const outcomes = [
-    ...(await runSkeptic(opts.runner, toVerify, ctx.fileIndex, { lookup }).catch(
+    ...(await runSkeptic(opts.runner, toVerify, ctx.fileIndex, { lookup, rounds: tier.skepticRounds }).catch(
       (e): import("./gates/skeptic").SkepticOutcome[] => {
         const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
         stageFailures.push(why);
@@ -528,7 +543,19 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings),
     dismissedFps,
     outcomes.filter((o) => o.killed).length,
+    tier.minSeverity,
   );
+  // On an incremental run, "lines this push did not touch" are two different things: code an
+  // earlier push of this PR wrote — reviewed then, so a finding there now is one that review
+  // missed — and code from before the PR. The whole PR's diff tells them apart; a read that
+  // fails leaves them undivided, as they were.
+  if (ctx.compareTo > 0 && agg.belowBar.some((f) => f.suppressedBy === "pre-existing")) {
+    const whole = await wholePr().catch((e) => {
+      log(`[WARN] could not read the whole pull request to tell missed findings from pre-existing ones: ${e instanceof Error ? e.message : String(e)}`);
+      return undefined;
+    });
+    if (whole) markEarlierPushes(agg.belowBar, new FileIndex(whole.files));
+  }
 
   // Collect the requirement axis now — everything that could run without it has run.
   const reqOut = await reqPromise;
@@ -608,6 +635,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       omittedFiles: omitted,
       appliedRules: rules,
       conventionDocs: conventionDocs.map((d) => d.path),
+      ...(RISK_TIERS ? { tier } : {}),
       staticResult,
       dismissalHints: dismissedCategoryHints(storedDismissals, excludedCategories()),
       durationSec,

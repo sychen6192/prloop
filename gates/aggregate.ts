@@ -9,6 +9,7 @@ import {
   REQUIRE_CORROBORATION,
   excludedCategories,
   severityRank,
+  type Severity,
 } from "../config";
 import { anchorFinding } from "../anchoring/locate";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
@@ -343,6 +344,20 @@ export function mergeToolFindings(survivors: AnchoredFinding[], tools: AnchoredF
 }
 
 /**
+ * On an incremental run, splits the findings filed as pre-existing — on lines this push did
+ * not touch — by who wrote those lines: an earlier push of this pull request, when the whole
+ * PR's diff (`whole`) changed them, or nobody in this PR. New side only: an incremental diff's
+ * old side is the previous push, and its line numbers mean nothing in the whole PR's diff.
+ */
+export function markEarlierPushes(findings: readonly AnchoredFinding[], whole: FileIndex): void {
+  for (const f of findings) {
+    if (f.suppressedBy !== "pre-existing" || f.anchor?.side !== "right") continue;
+    const fd = whole.exact(f.file);
+    f.earlierPush = fd !== undefined && touchesChange(fd, f.anchor);
+  }
+}
+
+/**
  * The lane a finding that earned a comment goes to instead, if any. A suppression marker is
  * the author's decision about the line, and Anthropic's review plugin counts findings the code
  * explicitly silences among its false positives; a finding on lines the change did not touch
@@ -378,6 +393,8 @@ export function finalize(
   dismissed: Set<string> = new Set(),
   // How many findings the skeptic majority refuted (the orchestrator owns the outcomes).
   refuted = 0,
+  // The inline bar: PRR_MIN_INLINE_SEVERITY, unless the run's risk tier set a stricter one.
+  minSeverity: Severity = MIN_INLINE_SEVERITY,
 ): AggregateResult {
   // Re-rank before the cap. The sort in anchorAndDedupe is stale by now: the skeptic may
   // have downgraded severities after it ran, and tool findings are appended at the tail
@@ -417,7 +434,7 @@ export function finalize(
     }
   }
 
-  const minRank = severityRank(MIN_INLINE_SEVERITY);
+  const minRank = severityRank(minSeverity);
   const eligible = corroborated.filter((f) => severityRank(f.severity) <= minRank);
   const belowSeverity = corroborated.filter((f) => severityRank(f.severity) > minRank);
   for (const f of belowSeverity) f.suppressedBy = "severity";

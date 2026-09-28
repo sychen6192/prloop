@@ -11,6 +11,7 @@ import type { ThreadTally, WatermarkDecision } from "./lifecycle";
 import type { ReviewContext } from "../ado/intake";
 import type { StaticResult } from "../gates/static";
 import { sanitizeToolMessage } from "../prompts/untrusted";
+import { describeTier, type RiskTier } from "../libs/tier";
 
 const SEVERITY_LABEL: Record<string, string> = {
   critical: "🔴 Critical",
@@ -40,10 +41,12 @@ const SUPPRESSED_LABEL: Record<string, string> = {
   dismissed: "matches a finding a reviewer previously dismissed (wontFix/byDesign)",
 };
 
-function whyNotCommented(f: AnchoredFinding): string {
+function whyNotCommented(f: AnchoredFinding, bar: string): string {
   if (f.suppressedBy === "silenced") {
     return `the line carries \`${f.silencedBy ?? "a suppression marker"}\`, a check its author already silenced there`;
   }
+  // The run's bar, which a risk tier may have made stricter than PRR_MIN_INLINE_SEVERITY.
+  if (f.suppressedBy === "severity") return `below the ${bar} comment threshold`;
   return SUPPRESSED_LABEL[f.suppressedBy ?? ""] ?? "below the reporting threshold";
 }
 
@@ -145,6 +148,8 @@ export interface SummaryInput {
   appliedRules: string[];
   /** The repository's own instruction documents the finders were given (libs/conventions.ts). */
   conventionDocs?: string[];
+  /** The review depth PRR_RISK_TIERS chose; absent when the setting is off. */
+  tier?: RiskTier;
   staticResult?: StaticResult;
   // "The team keeps dismissing category X" — surfaced as a config suggestion, never applied.
   dismissalHints?: CategoryHint[];
@@ -377,17 +382,31 @@ export function renderSummary(input: SummaryInput): string {
 
   // Findings that earned a comment, on lines the change did not touch: most often code that
   // was there before it, worth knowing about and not the author's to answer for in this PR. On
-  // an incremental run "the change" is the push, so the lines may be an earlier push's.
-  if (preExisting.length > 0) {
-    lines.push(
-      detailsOpen(
-        ctx.compareTo > 0
-          ? `On lines this push did not touch (${preExisting.length}) - earlier code, no new comments`
-          : `Pre-existing issues (${preExisting.length}) - on lines this change did not touch, no new comments`,
-      ),
-      "",
-    );
-    for (const f of preExisting) {
+  // an incremental run "the change" is the push, and the lines it left alone are split by who
+  // wrote them (markEarlierPushes): an earlier push of this PR, whose review missed what is
+  // found there now, or nobody in this PR. One an earlier run already commented on was not
+  // missed, whoever wrote the line.
+  const incremental = ctx.compareTo > 0;
+  const lanes: Array<[string, AnchoredFinding[]]> = [
+    [
+      "Previously missed (N) - in code an earlier push of this pull request wrote, found only now; no new comments",
+      preExisting.filter((f) => incremental && f.earlierPush === true && !already.has(f.fingerprint)),
+    ],
+    [
+      incremental
+        ? "Pre-existing issues (N) - on lines this pull request did not touch, no new comments"
+        : "Pre-existing issues (N) - on lines this change did not touch, no new comments",
+      preExisting.filter((f) => !incremental || f.earlierPush === false),
+    ],
+    [
+      "On lines this push did not touch (N) - no new comments",
+      preExisting.filter((f) => incremental && (f.earlierPush === undefined || (f.earlierPush && already.has(f.fingerprint)))),
+    ],
+  ];
+  for (const [title, group] of lanes) {
+    if (group.length === 0) continue;
+    lines.push(detailsOpen(title.replace("(N)", `(${group.length})`)), "");
+    for (const f of group) {
       const loc = f.anchor ? `${f.file}:${f.anchor.startLine}` : f.file;
       lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}${earlier(f)}`);
     }
@@ -401,7 +420,7 @@ export function renderSummary(input: SummaryInput): string {
       const overlap = f.overlapping?.length
         ? `; ${f.overlapping.join(", ")} flagged the same lines with a different claim`
         : "";
-      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}${earlier(f)}`, `  <sub>${whyNotCommented(f)}${overlap}</sub>`);
+      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}${earlier(f)}`, `  <sub>${whyNotCommented(f, input.tier?.minSeverity ?? MIN_INLINE_SEVERITY)}${overlap}</sub>`);
     }
     lines.push("", "</details>", "");
   }
@@ -453,6 +472,7 @@ export function renderSummary(input: SummaryInput): string {
   if (otherSkips > 0) {
     notes.push(`The code check skipped ${otherSkips} files that are not code, generated, deleted or binary`);
   }
+  if (input.tier) notes.push(`Review depth (PRR_RISK_TIERS): ${describeTier(input.tier)}`);
   if (input.appliedRules.length > 0) {
     notes.push(`Review rules applied: ${input.appliedRules.join(", ")}`);
   }

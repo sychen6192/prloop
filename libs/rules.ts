@@ -46,6 +46,20 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${out}$`);
 }
 
+/**
+ * Whether any of `paths` matches any of `globs`. A glob with no `/` in it matches a file's
+ * name at any depth, as `.gitignore` and `.editorconfig` read it: `*.sql` means the SQL files,
+ * not only the ones at the root. For globs a team wrote for another tool, or as a setting;
+ * the rules' own `applyTo` keeps its stricter reading (selectRules).
+ */
+export function anyPathMatches(globs: readonly string[], paths: readonly string[]): boolean {
+  return globs.some((g) => {
+    const glob = g.replace(/^\.?\//, "");
+    const re = globToRegExp(glob);
+    return paths.some((p) => re.test(p) || (!glob.includes("/") && re.test(p.slice(p.lastIndexOf("/") + 1))));
+  });
+}
+
 // A front-matter glob list: `a, b`, `"a", "b"` or `[a, b]`. Split on comma FIRST, which means
 // `{a,b}` alternation is unusable here even though globToRegExp supports it —
 // `"**/*.{ts,js}"` parses as two broken halves. Write the alternatives as separate entries.

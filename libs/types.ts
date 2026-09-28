@@ -254,6 +254,10 @@ export interface AnchoredFinding extends RawFinding {
   // change added or removed: finalize files the finding as pre-existing rather than posting it
   // on a line the author did not write.
   untouched?: boolean;
+  // Incremental runs only, for a finding filed as pre-existing: true when an earlier push of
+  // this pull request wrote those lines (a finding the earlier review missed), false when they
+  // predate the pull request, absent when the whole PR's diff could not be read.
+  earlierPush?: boolean;
   // Model findings only: the suppression marker on or just above the anchored lines, by name
   // (`# noqa`, `eslint-disable`, libs/suppression.ts) — a check the author already silenced.
   silencedBy?: string;

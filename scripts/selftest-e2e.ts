@@ -105,6 +105,8 @@ interface Defect {
   always?: boolean;
   /** A claim a search of the code can settle (gates/claims.ts). */
   checkable?: { kind: string; subject: string };
+  /** Seen only in a prompt this matches: a finding one review makes and an earlier one missed. */
+  when?: (prompt: string) => boolean;
 }
 
 const PAY = "src/pay.ts";
@@ -118,6 +120,8 @@ const DEFECTS: Defect[] = [
   // The retry loop three lines down uses it: the claim checker settles this before any skeptic.
   { by: ["finder-a"], file: PAY, quote: "export const MAX_RETRIES = 3;", category: "correctness", severity: "medium", claim: "MAX_RETRIES is never used", checkable: { kind: "unused", subject: "MAX_RETRIES" } },
   { by: ["finder-a", "finder-b"], file: INVOICE, quote: "public decimal Total => Lines.Sum(l => l.Price);", category: "correctness", severity: "high", claim: "Total ignores each line's quantity" },
+  // Push 1's code, noticed only once push 2 is under review: the earlier review missed it.
+  { by: ["finder-a", "finder-b"], file: PAY, quote: "return false;", category: "reliability", severity: "medium", claim: "charge() returns the same false for a declined card and an unreachable gateway", when: (p) => p.includes("splitEvenly") },
 ];
 
 /** The line that implements each acceptance criterion, and the file it lives in. */
@@ -132,7 +136,7 @@ const EVIDENCE: Record<string, { file: string; quote: string }> = {
 };
 
 function finderAnswer(model: string, prompt: string): unknown {
-  const findings = DEFECTS.filter((d) => d.by.includes(model) && (d.always || shows(prompt, d.quote))).map((d) => ({
+  const findings = DEFECTS.filter((d) => d.by.includes(model) && (d.always || shows(prompt, d.quote)) && (d.when?.(prompt) ?? true)).map((d) => ({
     category: d.category,
     severity: d.severity,
     confidence: 0.8,
@@ -444,6 +448,12 @@ try {
     // Line 5 is push 1's code and push 2 left it alone: a new finding there would have been
     // listed rather than commented, and this one, commented by push 1, is said to be.
     eq("...filed as on lines this push did not touch", result.agg.belowBar.find((f) => f.claim.includes("ends the retry loop"))?.suppressedBy, "pre-existing");
+    // Line 7 is push 1's code too, found only now: the review of push 1 missed it.
+    check(
+      "a finding in code an earlier push wrote, not commented before, is previously missed",
+      /Previously missed \(1\)[^<]*<\/summary>\s*- \*\*medium\*\* `src\/pay\.ts:7` — charge\(\) returns the same false/.test(summaryOf()),
+      summaryOf(),
+    );
     check(
       "...and listed so, with the comment an earlier run left",
       /On lines this push did not touch \(1\)[\s\S]*ends the retry loop[^\n]*_\(commented by an earlier run\)_/.test(summaryOf()),
@@ -638,6 +648,25 @@ try {
       eq("nothing was sent to Azure DevOps at all", ado.requests.length, 0);
       const review = fs.readdirSync(localRuns, { recursive: true }).map(String).find((p) => p.endsWith("review.html"));
       check("the run directory holds the review", review !== undefined);
+
+      // The same branch under PRR_RISK_TIERS: six changed lines in one file is a trivial change.
+      models.reset();
+      models.answerBy(reviewer);
+      const tieredRuns = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-local-tiered-"));
+      try {
+        const tiered = await script("local-review.ts", ["review", repo, "main", "feature"], {
+          PRR_RUNS_DIR: tieredRuns,
+          PRR_DRY_RUN: "",
+          PRR_RISK_TIERS: "1",
+        });
+        eq("under risk tiers a small branch is read by one finder", stageCalls("findings").map((c) => c.body["model"]), ["finder-a"]);
+        check("...and its medium finding is held to the trivial tier's bar of high", tiered.code === 0 && tiered.out.includes("Reviewed 1 files: 0 comments"), tiered.out.slice(-800));
+        const contextFile = fs.readdirSync(tieredRuns, { recursive: true }).map(String).find((p) => p.endsWith("context.json"));
+        const recorded = contextFile ? (JSON.parse(fs.readFileSync(path.join(tieredRuns, contextFile), "utf8")) as { tier?: { name?: string; reason?: string } }).tier : undefined;
+        eq("...the tier and why recorded with the run", [recorded?.name, recorded?.reason], ["trivial", "6 changed lines in 1 file"]);
+      } finally {
+        fs.rmSync(tieredRuns, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(localRuns, { recursive: true, force: true });
       fs.rmSync(repo, { recursive: true, force: true });

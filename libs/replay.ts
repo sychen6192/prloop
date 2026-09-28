@@ -13,6 +13,7 @@ import type { FinderOutput } from "../gates/finder";
 import { applyVerdicts, type SkepticOutcome, type Verdict } from "../gates/skeptic";
 import { FileIndex } from "./fileindex";
 import type { AnchoredFinding, FileDiff, RawFinding } from "./types";
+import { runTier } from "./tier";
 
 export const REPLAY_VERSION = 1;
 
@@ -97,6 +98,8 @@ export function replay(bundle: ReplayBundle): ReplayResult {
     mergeToolFindings([...survivors, ...knownDismissed], bundle.tools),
     dismissed,
     outcomes.filter((o) => o.killed).length,
+    // The bar a live run over these files would use now, risk tier included.
+    runTier(files).minSeverity,
   );
   return { agg, unverified };
 }

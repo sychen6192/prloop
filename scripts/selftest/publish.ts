@@ -227,7 +227,36 @@ section("the lanes in the summary: pre-existing issues, and lines a marker silen
   check("the headline does not say nothing was found", full.includes("No issues on the changed lines above the reporting threshold."), full);
   check("the silenced finding names its marker", full.includes("the line carries `# noqa`, a check its author already silenced there"), full);
   const incremental = summaryOf(1);
-  check("an incremental review says the lines are earlier code, not pre-existing", incremental.includes("On lines this push did not touch (1) - earlier code, no new comments") && !incremental.includes("Pre-existing issues"), incremental);
+  check("an incremental review that could not split them names the push, not the PR", incremental.includes("On lines this push did not touch (1) - no new comments") && !incremental.includes("Pre-existing issues"), incremental);
+
+  // Split by who wrote the lines (gates/aggregate.ts markEarlierPushes).
+  const split = renderSummary({
+    ctx: ctxOf(1),
+    agg: {
+      inline: [],
+      belowBar: [
+        mk({ claim: "Missed last time.", suppressedBy: "pre-existing", untouched: true, earlierPush: true }),
+        mk({ claim: "Older than the PR.", suppressedBy: "pre-existing", untouched: true, earlierPush: false }),
+        mk({ claim: "Commented last time.", suppressedBy: "pre-existing", untouched: true, earlierPush: true }),
+        mk({ claim: "Just medium.", severity: "medium", suppressedBy: "severity" }),
+      ],
+      degraded: [],
+      stats: { raw: 4, afterDedupe: 4, anchored: 4, survived: 4, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
+    },
+    finderErrors: [], omittedFiles: [], appliedRules: [], durationSec: 1, runDir: "",
+    posted: [], alreadyPosted: [mk({ claim: "Commented last time." })], failed: [],
+    tier: { name: "trivial", reason: "4 changed lines in 1 file", finders: ["a"], skepticRounds: 1, minSeverity: "high" },
+  });
+  const sectionOf = (title: string) => split.slice(split.indexOf(title), split.indexOf("</details>", split.indexOf(title)));
+  check("code an earlier push wrote is previously missed", sectionOf("Previously missed (1)").includes("Missed last time."), split);
+  check("code from before the PR is pre-existing", sectionOf("Pre-existing issues (1) - on lines this pull request did not touch").includes("Older than the PR."), split);
+  check(
+    "one an earlier run commented on was not missed",
+    sectionOf("On lines this push did not touch (1)").includes("Commented last time. _(commented by an earlier run)_") && !sectionOf("Previously missed").includes("Commented last time."),
+    split,
+  );
+  check("the run's tier is named", split.includes("Review depth (PRR_RISK_TIERS): trivial (4 changed lines in 1 file): 1 finder, 1 verifier round, inline comments at high and above"), split);
+  check("...and its bar is the one a finding is said to be below", split.includes("below the high comment threshold"), split);
 
   // Only a critical finding is posted from a lane, and its comment says why it sits there.
   const posted = renderFindingComment(mk({ severity: "critical", untouched: true }));

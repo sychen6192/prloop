@@ -398,9 +398,11 @@ no model endpoint at all.
   so it is flattened, capped and redacted on the way into the store, and it reaches no prompt:
   nothing under `prompts/` can read that store at all, and the selftest pins it.
 - **Old code gets a list, not comments.** Findings on lines the change did not touch go in the
-  summary's *Pre-existing issues* section (*On lines this push did not touch* on an incremental
-  run), never inline unless critical, and do not fail the status; one an earlier run already
-  commented on is marked as such.
+  summary's *Pre-existing issues* section, never inline unless critical, and do not fail the
+  status. On a `--since auto` run the lines the push left alone are split by who wrote them:
+  an earlier push of the same PR — listed as *Previously missed*, since that push's review
+  should have caught it — or nobody in the PR. One an earlier run already commented on is
+  marked as such rather than listed as missed.
 - **Clean PR → one quiet line.** Style and formatting never get a comment; that's the linter's job.
 
 Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the settings the run
@@ -449,6 +451,8 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_FINDER_MODELS` | `qwen3-coder` | comma-separated; different families is the point |
 | `PRR_SKEPTIC_MODELS` | — | empty = no verification runs |
 | `PRR_SKEPTIC_ROUNDS` | `1` | 3 gives a majority vote worth the name; capped at the number of distinct `PRR_SKEPTIC_MODELS` |
+| `PRR_RISK_TIERS` | — | `1` = review depth from the change: at most 20 changed lines in 3 files is *trivial* (one finder, one verifier round, comments one severity stricter than `PRR_MIN_INLINE_SEVERITY`, never past `high`), at most 200 lines in 15 files is *lite* (two finders), anything else *full* (everything configured). A second finder is kept whenever no skeptic could corroborate one. The summary names the tier |
+| `PRR_SENSITIVE_PATHS` | — | globs whose changes always get the full review, e.g. `**/auth/**,**/migrations/**,*.sql`; a glob with no `/` matches a file name at any depth |
 | `PRR_MAX_SKEPTIC_FINDINGS` | `30` | fan-out ceiling; worst findings verified first, overflow logged |
 | `PRR_SKEPTIC_MAX_TOKENS` | `4096` | output budget per verdict; a truncated verdict fails open and costs the finding its corroboration |
 | `PRR_ADO_CONCURRENCY` | `6` | parallel blob fetches during intake |

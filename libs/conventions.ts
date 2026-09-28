@@ -11,7 +11,7 @@
 // it — as the Anthropic review plugin scopes `CLAUDE.md`. A file whose scope matches nothing
 // the change touched is not read into the prompt at all.
 import { normalizePath } from "./fileindex";
-import { globToRegExp, parseGlobList } from "./rules";
+import { anyPathMatches as matchesAny, parseGlobList } from "./rules";
 
 /** Documents that apply to the whole repository, read in this order. */
 export const CONVENTION_PATHS = [
@@ -71,19 +71,6 @@ export function frontMatter(raw: string): { fields: Record<string, string>; body
     fields[listKey] = kv[2]!.trim();
   }
   return { fields, body: raw.slice(m[0].length) };
-}
-
-/**
- * Whether any changed path matches one of `globs`. A glob with no `/` in it matches a file's
- * name at any depth, as `.gitignore` and `.editorconfig` read it: `*.py` in a Cursor rule means
- * the Python files, not only the ones at the root.
- */
-function matchesAny(globs: readonly string[], paths: readonly string[]): boolean {
-  return globs.some((g) => {
-    const glob = g.replace(/^\.?\//, "");
-    const re = globToRegExp(glob);
-    return paths.some((p) => re.test(p) || (!glob.includes("/") && re.test(p.slice(p.lastIndexOf("/") + 1))));
-  });
 }
 
 /** A scoped instruction file, read the way its own tool reads it; undefined when it does not apply. */
