@@ -16,7 +16,8 @@
 //
 // The bytes are a wire format already sitting on live PRs. Order and spacing are fixed:
 // changing them orphans every thread a previous run left behind.
-import { FINDING_CATEGORIES, type FindingCategory } from "../config";
+import { createHash } from "node:crypto";
+import { FINDING_CATEGORIES, type FindingCategory } from "../libs/taxonomy";
 
 /** Identifies authorship. On every comment prloop writes, first thing in the body. */
 export const BOT_MARKER = "<!-- prloop -->";
@@ -28,6 +29,8 @@ export const SUMMARY_MARKER = "<!-- prloop:summary -->";
 // conservative answer at every call site.
 const FP_RE = /<!-- prloop:fp=([^\s>]+) -->/g;
 const CAT_RE = /<!-- prloop:cat=([^\s>]+) -->/;
+const SPAN_RE = /<!-- prloop:span=(\d+)\.([0-9a-f]{12}) -->/;
+const TOOL_RE = /<!-- prloop:tool=([A-Za-z0-9._@/-]{1,64}) -->/;
 const ITERATION_RE = /<!-- prloop:iteration=(\d+) -->/;
 // One source, two compilations: the strip below has to match the read above byte for byte,
 // and two hand-written copies of a marker pattern is the exact drift this module was
@@ -43,9 +46,44 @@ const FP_SHAPE = /^[0-9a-f]{6,64}$/;
 
 const CATEGORIES: ReadonlySet<string> = new Set(FINDING_CATEGORIES);
 
-/** Markers for an inline finding comment: authorship, issue identity, category. */
-export function findingMarkers(f: { fingerprint: string; category: string }): string {
-  return `${BOT_MARKER}<!-- prloop:fp=${f.fingerprint} --><!-- prloop:cat=${f.category} -->`;
+/**
+ * The code a comment was about: how many lines, and a hash of their text. What lets a later
+ * run find that code again by CONTENT, wherever it has moved, instead of trusting the line
+ * number the thread was posted on.
+ *
+ * Positions alone were wrong both ways. Lines inserted above a comment moved its code down,
+ * and the old position then "covered" whatever new code landed there, suppressing a real
+ * finding; lines deleted above it could put the old position past the end of the file,
+ * which read as "the code is gone" and closed a live thread as fixed. ADO can track a
+ * thread's position to a later iteration, but what it returns for code that was deleted is
+ * undocumented, and this does not need it.
+ */
+export interface SpanMark {
+  lines: number;
+  hash: string;
+}
+
+/**
+ * The span mark of some lines. Whitespace inside a line is collapsed and each line trimmed,
+ * so a re-indent or a reformat is the same code, while any change to a token is not.
+ */
+export function spanMark(lines: readonly string[]): SpanMark {
+  const text = lines.map((l) => l.replace(/\s+/g, " ").trim()).join("\n");
+  return { lines: lines.length, hash: createHash("sha1").update(text).digest("hex").slice(0, 12) };
+}
+
+/**
+ * Markers for an inline finding comment: authorship, issue identity, category, the code —
+ * and, for a static-analysis finding, the tool that reported it. A tool comment closes on the
+ * tool's evidence, not on where its code went (publish/lifecycle.ts), so the thread has to
+ * say which tool that is. Written last, so a model finding's bytes are what they always were.
+ */
+export function findingMarkers(f: { fingerprint: string; category: string; tool?: string }, span?: SpanMark): string {
+  return (
+    `${BOT_MARKER}<!-- prloop:fp=${f.fingerprint} --><!-- prloop:cat=${f.category} -->` +
+    (span ? `<!-- prloop:span=${span.lines}.${span.hash} -->` : "") +
+    (f.tool && TOOL_RE.test(`<!-- prloop:tool=${f.tool} -->`) ? `<!-- prloop:tool=${f.tool} -->` : "")
+  );
 }
 
 /** Markers for the sticky summary comment. */
@@ -87,6 +125,25 @@ export function setRunMarker(body: string, marker: string): string {
   return body.replace(RUN_RE_ALL, "") + marker;
 }
 
+/**
+ * Makes every HTML comment opener in `text` inert, for text prloop did not write on its way
+ * into a comment body: acceptance criteria, the model's claims and notes, a gateway's error.
+ *
+ * Two failures, one cause. A quoted `<!-- prloop:… -->` is this protocol's own syntax inside a
+ * comment prloop signs, and the readers above can only be as careful as the bytes they are
+ * given. And any HTML comment in quoted text hides its own content from the humans reading
+ * the PR, while a bare opener at the start of a line — a claim or a note — begins an HTML
+ * block that nothing closes, which a browser reads as a comment running to the end of the
+ * body: everything prloop wrote after it disappears from view.
+ *
+ * Broken rather than removed: the text stays readable, which matters when the criterion is
+ * about HTML. A zero-width space rather than an entity: `&lt;` renders as `<` in prose but
+ * literally inside a code span, and quoted paths and code sit in both.
+ */
+export function defuseHtmlComments(text: string): string {
+  return text.replaceAll("<!--", "<!\u200B--");
+}
+
 /** Everything the protocol carries, read out of one comment body. */
 export interface CommentMarkers {
   /** Written by prloop. Threads without this are somebody else's and are never touched. */
@@ -99,6 +156,10 @@ export interface CommentMarkers {
   fingerprints: string[];
   /** Absent when the marker is missing OR names a category this build does not know. */
   category?: FindingCategory;
+  /** The code the comment was about; absent on comments written before the marker. */
+  span?: SpanMark;
+  /** The static-analysis tool whose finding this is; absent on model findings. */
+  tool?: string;
   /** The iteration recorded by the run that wrote this comment. */
   iteration?: number;
   /** A run that had this PR in hand when it wrote this comment (publish/lease.ts). */
@@ -107,7 +168,6 @@ export interface CommentMarkers {
 
 const NONE: CommentMarkers = { ours: false, summary: false, fingerprints: [] };
 
-/** Reads the protocol out of a comment body. Undefined and empty bodies read as "not ours". */
 /**
  * The run of markers at the very start of the body — the only place identity, fingerprint
  * and category are ever written (findingMarkers and summaryMarkers both emit them first,
@@ -123,6 +183,23 @@ const NONE: CommentMarkers = { ours: false, summary: false, fingerprints: [] };
  */
 const LEADING_MARKERS = /^(?:\s*<!-- prloop(?::[^>]*)? -->)+/;
 
+/**
+ * The run of markers at the very end of the body — where publish() has always appended the
+ * iteration marker and the lease appends its own, and the only place either is read from.
+ *
+ * Both used to be read from anywhere in the body, on the argument that their readers' guards
+ * (written by prloop, and the summary) made position irrelevant. They did not, because the
+ * summary is prloop's own comment and it quotes text prloop did not write: acceptance
+ * criteria, the model's notes and claims. libs/html.ts decodes entities after stripping tags,
+ * so a work item whose criterion read `&lt;!-- prloop:iteration=5 --&gt;` arrived as a live
+ * marker inside a comment that passes both guards, ahead of the real one — and a forged
+ * "already reviewed" iteration is a push `--since auto` never reviews. The end of the body is
+ * out of quoted text's reach: every summary closes on prloop's own footer line, and the
+ * markers come after it.
+ */
+const TRAILING_MARKERS = /(?:<!-- prloop(?::[^>]*)? -->\s*)+$/;
+
+/** Reads the protocol out of a comment body. Undefined and empty bodies read as "not ours". */
 export function readMarkers(body: string | undefined): CommentMarkers {
   if (!body) return NONE;
   const head = LEADING_MARKERS.exec(body)?.[0] ?? "";
@@ -133,24 +210,19 @@ export function readMarkers(body: string | undefined): CommentMarkers {
     if (fp && FP_SHAPE.test(fp)) fingerprints.push(fp);
   }
   const cat = CAT_RE.exec(head)?.[1];
-  // Read from the WHOLE body, unlike everything above it: publish() appends the iteration
-  // marker after the rendered summary, and those bytes are already on live pull requests —
-  // markers.ts's own rule is that changing where they sit orphans every thread a previous
-  // run left behind. The guard against a forged or model-echoed iteration is not position
-  // but the pair of conditions its only reader applies: the comment must be OURS and the
-  // SUMMARY, both decided from the leading run above (publish/lifecycle.ts).
-  const iter = ITERATION_RE.exec(body)?.[1];
-  // Same whole-body read, and for the same reason: the lease marker is appended after the
-  // rendered summary, so that a claim never has to re-render a body it did not write. Its
-  // reader applies the identical pair of guards (ours, and the summary), plus the identity
-  // check — a forged lease is a review that silently never happens.
-  const run = RUN_RE.exec(body);
+  const span = SPAN_RE.exec(head);
+  const tool = TOOL_RE.exec(head)?.[1];
+  const tail = TRAILING_MARKERS.exec(body)?.[0] ?? "";
+  const iter = ITERATION_RE.exec(tail)?.[1];
+  const run = RUN_RE.exec(tail);
   return {
     ours: true,
     summary: head.includes(SUMMARY_MARKER),
     ...(fingerprints[0] === undefined ? {} : { fingerprint: fingerprints[0] }),
     fingerprints,
     ...(cat !== undefined && CATEGORIES.has(cat) ? { category: cat as FindingCategory } : {}),
+    ...(span?.[1] === undefined || span[2] === undefined || Number(span[1]) < 1 ? {} : { span: { lines: Number(span[1]), hash: span[2] } }),
+    ...(tool === undefined ? {} : { tool }),
     ...(iter === undefined ? {} : { iteration: Number(iter) }),
     ...(run?.[1] === undefined || run[2] === undefined ? {} : { run: { startedAt: Number(run[1]), id: run[2] } }),
   };

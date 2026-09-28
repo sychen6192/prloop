@@ -15,7 +15,8 @@
 //    than its middle. So the category list, the severity chain and the headings of the
 //    loaded rules are restated compactly after the diff, right where the model starts
 //    writing — and the rule headings double as the citations the validator accepts.
-import { FINDER_CATEGORIES, FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL } from "../config";
+import { FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL, WHOLE_FILE_MAX_LINES } from "../config";
+import { FINDER_CATEGORIES } from "../libs/taxonomy";
 import { buildDiffPayloads } from "../libs/payload";
 import type { FileDiff, PrInfo } from "../libs/types";
 import { neutralizeLine, renderPrDescription, renderRepositoryConventions } from "./untrusted";
@@ -37,7 +38,9 @@ Output rules (violations cause the finding to be discarded by the system):
    prefixed \`+\` or unprefixed in the diff. Use "left" ONLY when your quote is a line this
    change DELETED (prefixed \`-\`). If in doubt, use "right".
 5. Only raise issues about this change (code that appears in the diff). Do not raise
-   pre-existing issues unrelated to this change.
+   pre-existing issues unrelated to this change. When this change makes an existing line
+   wrong, quote the changed line that does it: a finding whose quote covers only lines this
+   change did not touch is listed as possibly pre-existing, not commented on the line.
 6. "claim" states the defect in one sentence; "evidence" explains why it is a real problem
    (how it breaks, under what conditions).
 7. "suggested_fix" is the corrected code, ready to paste in place of the quote — it is
@@ -51,6 +54,12 @@ Output rules (violations cause the finding to be discarded by the system):
    and demoted to the summary. For behavioral findings (correctness, concurrency, security,
    reliability, data-integrity, performance), the quote and evidence are the basis — set
    cites to null.
+9. "claim_kind" and "claim_subject": when the whole claim is a fact that a search of the
+   repository can settle — "unused" (a symbol is never used), "undefined" (a symbol is used
+   but never defined or imported), "missing-file" (a referenced file does not exist),
+   "duplicate" (a symbol is defined twice) — name the kind and the symbol or path. The
+   system checks it against the whole repository, which you cannot see, and discards the
+   finding if the repository says otherwise. Null for every other finding.
 
 Review coverage (coverage mode):
 - Report every issue you observe, including ones you are unsure about. Use "confidence"
@@ -188,6 +197,8 @@ export interface FinderPromptSet {
   chunks: string[];
   /** Files no chunk carried — the coverage gap, meaning exactly what it always did. */
   omitted: string[];
+  /** Files some chunk showed whole (PRR_WHOLE_FILE_MAX_LINES). */
+  wholeFiles: string[];
   bound?: "chars" | "tokens";
 }
 
@@ -261,6 +272,10 @@ export function buildFinderPrompts(input: FinderPromptInput, maxChunks: number =
   // here shares one context window with the payload — and until this was counted, only the
   // diff's characters were, which is how a "safely" sized diff still arrived at the model
   // truncated (config.ts, PRR_CONTEXT_TOKENS, says what that costs).
+  //
+  // The part notice goes after the rules, as late as it can while still preceding the diff:
+  // everything before it is the same in every part of a split review, and a server with a
+  // prefix cache (vLLM's) reuses a shared start instead of reading the rules again per part.
   const headFor = (note: string) => `## Pull Request info
 
 - Title: ${neutralizeLine(input.pr.title)}
@@ -273,13 +288,15 @@ ${renderPrDescription(input.pr.description)}
 ## Review scope
 
 ${scope}
-${input.files.length} file(s) changed.${note}
-${rulesBlock}
+${input.files.length} file(s) changed.
+${rulesBlock}${note ? `${note}\n` : ""}
 ## The change (unified diff)
 
 In the diff, the numbers in \`@@ -leftStart,leftCount +rightStart,rightCount @@\` are real
-file line numbers, given so you can orient yourself. Do not include any line number in your
-output — just copy the quote verbatim.
+file line numbers, given so you can orient yourself. Text after the closing \`@@\` names the
+function, method or class the hunk sits in, when it lies above the lines shown. A file whose
+heading says "whole file" is shown in full, its changes marked, so what is not in it is not in
+the file. Do not include any line number in your output — just copy the quote verbatim.
 
 `;
   const head = headFor("");
@@ -305,6 +322,7 @@ above (with the diff's +/- prefix stripped).`;
       fixed: `${input.system ?? ""}\n${input.schemaText ?? ""}\n${maxChunks > 1 ? headFor(chunkScope(0, maxChunks)) : head}${tail}`,
     },
     maxChunks,
+    WHOLE_FILE_MAX_LINES,
   );
 
   const first = payloads[0]!;
@@ -314,6 +332,7 @@ above (with the diff's +/- prefix stripped).`;
     ),
     // Identical on every chunk (libs/payload.ts), so reading it off the first is not a choice.
     omitted: first.omittedFiles,
+    wholeFiles: payloads.flatMap((p) => p.wholeFiles),
     ...(first.bound === undefined ? {} : { bound: first.bound }),
   };
 }

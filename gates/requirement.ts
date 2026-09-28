@@ -5,12 +5,12 @@
 // because Boards hygiene is imperfect gets switched off.
 import { createHash } from "node:crypto";
 import { MAX_EXTRAS, MAX_INLINE_REQ_COMMENTS, REQ_MODEL, SKEPTIC_MODELS } from "../config";
-import { getLinkedRequirements } from "../ado/workitems";
 import { anchorFinding } from "../anchoring/locate";
 import { extractCriteria, type CriterionRef } from "../libs/criteria";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
+import type { LinkedRequirements } from "../libs/host";
 import { parseJsonObject } from "../libs/json";
-import { buildDiffPayload } from "../libs/payload";
+import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
 import { parseVerdict, type Verdict } from "./skeptic";
 import { REQ_DISPUTE_SCHEMA } from "../models/schemas";
@@ -22,7 +22,6 @@ import type {
   FileDiff,
   ModelRunner,
   PrInfo,
-  PrRef,
   RawFinding,
   ReqVerdict,
   RequirementResult,
@@ -32,6 +31,10 @@ import { REQUIREMENT_SCHEMA } from "../models/schemas";
 import { REQUIREMENT_SYSTEM, buildRequirementPrompt } from "../prompts/requirement";
 
 const VALID_VERDICT = new Set<string>(REQ_VERDICTS);
+
+// Stands in for the diff while measuring everything around it, so the real one can be packed
+// against what is left of the model's context window.
+const NO_DIFF: DiffPayload = { text: "", includedFiles: [], omittedFiles: [], wholeFiles: [] };
 
 /**
  * How damning each verdict is, harshest first. Used only to settle a model that answered
@@ -120,13 +123,28 @@ function validateExtra(v: unknown): ExtraChange | undefined {
   return { claim, file, quote: typeof o["quote"] === "string" ? o["quote"] : undefined };
 }
 
-export interface RequirementGateInput {
-  ref: PrRef;
-  pr: PrInfo;
+/** What the requirement axis judges: every changed file a criterion could be met in. */
+export interface RequirementDiff {
   files: FileDiff[];
   // Anchors the evidence quote behind every "satisfied" verdict (verifySatisfiedEvidence).
   fileIndex: FileIndex;
+}
+
+export interface RequirementGateInput {
+  pr: PrInfo;
+  /**
+   * The WHOLE pull request, never one push of it, code and non-code text alike: criteria are
+   * met by the PR, a criterion delivered two pushes ago is not missing because this push
+   * left it alone, and one delivered in a config file is not missing because it is not code.
+   *
+   * Asked for, not handed over, because reading it costs blob fetches (the non-code files
+   * are read for this axis alone) and most of the time the answer is not needed: a PR with
+   * no linked work item, or none with criteria, never asks.
+   */
+  diff: () => Promise<RequirementDiff>;
   runner: ModelRunner;
+  /** Where the criteria come from: the host's (ReviewHost.requirements). */
+  requirements: () => Promise<LinkedRequirements>;
 }
 
 export async function runRequirementGate(
@@ -134,7 +152,7 @@ export async function runRequirementGate(
 ): Promise<{ result: RequirementResult; prompt?: string; raw?: string }> {
   let linked;
   try {
-    linked = await getLinkedRequirements(input.ref);
+    linked = await input.requirements();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[WARN] Failed to fetch work items: ${msg}`);
@@ -163,13 +181,23 @@ export async function runRequirementGate(
 
   log(`requirement axis: checking ${withSpec.length} work items (${withSpec.map((w) => `#${w.id}`).join(", ")})`);
 
+  const { files, fileIndex } = await input.diff();
+  if (files.length === 0) {
+    // Judged against an empty diff, every criterion comes back "missing" and the status fails
+    // a PR that — deleting files, say — may well have done what was asked.
+    log("requirement axis: no changed text to judge the criteria against; skipping");
+    return {
+      result: { workItems: withSpec, criteria: [], extras: [], skipped: "no changed text in this PR to judge the criteria against" },
+    };
+  }
+
   // The unit of judgment is fixed HERE, before any model runs: same work items → same
   // criterion list → same denominator every run (see libs/criteria.ts for why).
   const refs = withSpec.flatMap(extractCriteria);
-  const prompt = buildRequirementPrompt({
+  const promptInput = {
     pr: input.pr,
     workItems: withSpec,
-    files: input.files,
+    files,
     criteria: refs,
     maxExtras: MAX_EXTRAS,
     // A parent's criteria arrive here whole (ado/workitems.ts walks up one level when the
@@ -178,7 +206,16 @@ export async function runRequirementGate(
     // which work item is the parent and which one the PR is actually linked to.
     inheritedFrom: linked.inheritedFrom,
     linkedIds: linked.items.map((w) => w.id),
+  };
+  // Budgeted in the requirement model's tokens, like a finder's diff, and not in characters
+  // alone: this axis reads the whole pull request on every run, so it is the one request
+  // most likely to outgrow a context window — and a backend that truncates a prompt silently
+  // turns "shown the implementation" into "the implementation is missing".
+  const payload = buildDiffPayload(files, undefined, undefined, {
+    model: REQ_MODEL,
+    fixed: `${REQUIREMENT_SYSTEM}\n${JSON.stringify(REQUIREMENT_SCHEMA)}\n${buildRequirementPrompt({ ...promptInput, payload: NO_DIFF })}`,
   });
+  const prompt = buildRequirementPrompt({ ...promptInput, payload });
   const res = await input.runner.chat({
     model: REQ_MODEL,
     system: REQUIREMENT_SYSTEM,
@@ -235,8 +272,15 @@ export async function runRequirementGate(
     // most significant first, so slicing keeps the ranked head.
     .slice(0, MAX_EXTRAS);
 
-  await disputeAccusations(input, criteria);
-  const demoted = verifySatisfiedEvidence(criteria, input.fileIndex);
+  const unseen = demoteUnseenMissing(criteria, payload.omittedFiles);
+  if (unseen > 0) {
+    log(
+      `requirement axis: ${unseen} missing verdicts demoted → not-verifiable ` +
+        `(${payload.omittedFiles.length} changed files were too large to show the model)`,
+    );
+  }
+  await disputeAccusations(input.runner, files, criteria);
+  const demoted = verifySatisfiedEvidence(criteria, fileIndex);
   if (demoted > 0) {
     log(`requirement axis: ${demoted} satisfied verdicts demoted → not-verifiable (evidence quote not found in the diff)`);
   }
@@ -270,7 +314,7 @@ export async function runRequirementGate(
  * not-verifiable with the refuter's evidence in the note, taking the accusation out of
  * the unmet count while keeping the disagreement visible in the summary.
  */
-async function disputeAccusations(input: RequirementGateInput, criteria: CriterionCheck[]): Promise<void> {
+async function disputeAccusations(runner: ModelRunner, files: FileDiff[], criteria: CriterionCheck[]): Promise<void> {
   const model = SKEPTIC_MODELS[0];
   if (!model) return; // no skeptic configured = no verification runs, same as the code axis
   const accused = criteria.filter(
@@ -278,14 +322,16 @@ async function disputeAccusations(input: RequirementGateInput, criteria: Criteri
   );
   if (accused.length === 0) return;
 
-  const payload = buildDiffPayload(input.files).text;
-  const res = await input.runner.chat({
+  const challenges = accused.map((c, i) => ({ id: disputeId(c, i), criterion: c.criterion, verdict: c.verdict, note: c.note }));
+  // Budgeted for the model that reads it, which is not the model that made the accusations.
+  const payload = buildDiffPayload(files, undefined, undefined, {
+    model,
+    fixed: `${REQ_SKEPTIC_SYSTEM}\n${JSON.stringify(REQ_DISPUTE_SCHEMA)}\n${buildReqDisputePrompt(challenges, "")}`,
+  }).text;
+  const res = await runner.chat({
     model,
     system: REQ_SKEPTIC_SYSTEM,
-    user: buildReqDisputePrompt(
-      accused.map((c, i) => ({ id: disputeId(c, i), criterion: c.criterion, verdict: c.verdict, note: c.note })),
-      payload,
-    ),
+    user: buildReqDisputePrompt(challenges, payload),
     schema: REQ_DISPUTE_SCHEMA,
     schemaName: "req_dispute",
     temperature: 0,
@@ -379,6 +425,30 @@ export function applyReqSkepticVerdicts(accused: CriterionCheck[], verdicts: Ver
     disputed++;
   }
   return disputed;
+}
+
+/**
+ * Takes "missing" back when the model was not shown the whole diff, in place. Returns how
+ * many. Exported for the selftest.
+ *
+ * "missing" is the claim that nothing in the pull request implements a criterion, and it is
+ * only a finding about a diff the model has read in full. With files left out for size the
+ * implementation may be sitting in one of them, and the accusation — which fails the status
+ * and the exit code — would rest on code nobody looked at. Demoted rather than dropped, the
+ * same way the dispute pass takes an accusation back: out of the unmet count, still visible.
+ * "partial" and "misunderstood" stand, because both point at code the model was shown.
+ */
+export function demoteUnseenMissing(criteria: CriterionCheck[], omitted: readonly string[]): number {
+  if (omitted.length === 0) return 0;
+  const names = omitted.slice(0, 5).join(", ") + (omitted.length > 5 ? ` and ${omitted.length - 5} more` : "");
+  let demoted = 0;
+  for (const c of criteria) {
+    if (c.verdict !== "missing") continue;
+    c.verdict = "not-verifiable";
+    c.note = `not judged against the whole change: ${omitted.length} changed files were too large to show (${names})${c.note ? ` — original note: ${c.note}` : ""}`;
+    demoted++;
+  }
+  return demoted;
 }
 
 export const UNVERIFIED_SATISFIED_NOTE = "claimed satisfied, but the evidence quote was not found in the diff";

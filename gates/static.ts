@@ -14,15 +14,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   MAX_TRIAGE_ITEMS,
-  SEVERITIES,
   STATIC_TIMEOUT_MS,
   TRIAGE_CONTEXT_LINES,
   TRIAGE_MODEL,
   WORKDIR,
   excludedCategories,
-  severityRank,
-  type Severity,
 } from "../config";
+import { SEVERITIES, severityRank, type Severity } from "../libs/taxonomy";
 import { splitLines } from "../libs/text";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { arrayField, parseJsonObject } from "../libs/json";
@@ -53,6 +51,51 @@ export interface StaticResult {
   // apart from the diff filter's `dropped`: "outside the changed region" and "path did not
   // resolve" are different facts, and only the second points at a coordinate problem.
   unresolved: number;
+  // What the tools established, for closing their own comments (publish/lifecycle.ts): the
+  // changed files each tool analysed after running cleanly, and the fingerprint of every
+  // finding it reported on them, on any line — before the changed-line filter, because a
+  // comment an earlier push left is usually on a line this push did not touch.
+  evidence?: { analysed: Record<string, string[]>; reported: string[] };
+  // PRR_STATIC_BASELINE: fact-tier findings that are new at the head and NOT on a changed
+  // line — in a file the change did not touch, or on an untouched line of one it did. The
+  // caller the change broke. Working-directory paths; reported in the summary, never inline.
+  broke?: ToolFinding[];
+  // What the merge-base comparison covered, when it ran.
+  baseline?: { tools: string[]; preExisting: number; skipped: Array<{ tool: string; reason: string }> };
+}
+
+/**
+ * What identifies "the same finding" across the head and the merge base: Semgrep's diff-scan
+ * key. The line's text rather than its number, because every line below an insertion moves;
+ * the path as the head names it, so a renamed file is still the same file.
+ */
+export function baselineKey(tool: string, ruleId: string, file: string, lineText: string): string {
+  return `${tool}\u0000${ruleId}\u0000${normalizePath(file)}\u0000${lineText.replace(/\s+/g, " ").trim()}`;
+}
+
+/**
+ * The head's findings that the merge base does not also have, duplicates counted: two copies
+ * of an error at the base cancel two at the head, not every one. A pure function over keys,
+ * for the selftest.
+ */
+export function newAtHead<T extends { key: string }>(head: readonly T[], base: readonly { key: string }[]): { fresh: T[]; existing: T[] } {
+  const left = new Map<string, number>();
+  for (const b of base) left.set(b.key, (left.get(b.key) ?? 0) + 1);
+  const fresh: T[] = [];
+  const existing: T[] = [];
+  for (const h of head) {
+    const n = left.get(h.key) ?? 0;
+    if (n > 0) {
+      left.set(h.key, n - 1);
+      existing.push(h);
+    } else fresh.push(h);
+  }
+  return { fresh, existing };
+}
+
+/** A tool finding's identity: the tool, the rule, the file and the line's own text — never the message. */
+export function toolFingerprint(tool: string, ruleId: string, file: string, lineText: string): string {
+  return createHash("sha1").update(`tool ${tool} ${ruleId} ${file} ${lineText.trim()}`).digest("hex").slice(0, 12);
 }
 
 // Findings per triage call. Not a knob: the number that matters to an operator is the
@@ -285,15 +328,19 @@ export function environmentFailure(
   );
 }
 
-async function runTool(
+/**
+ * One tool invocation, parsed, with the toolchain checked and ignored rules removed — paths
+ * still in the tool's own coordinate system (relative to `cwd`). Shared by the run under
+ * review and the merge-base run, which has no FileIndex to re-key onto.
+ */
+async function execTool(
   spec: ToolSpec,
   profile: Profile,
   files: string[],
   workdir: string,
   // Where the tool runs. Its own output is relative to this, not to the workdir.
   cwd: string,
-  index: FileIndex,
-): Promise<{ findings: ToolFinding[]; skipped?: string; unresolved: number }> {
+): Promise<{ parsed: ToolFinding[]; skipped?: string }> {
   // Tool arguments and tool output both live in the project's coordinate system.
   const args = spec.args(files.map((f) => slash(path.relative(cwd, path.resolve(workdir, f)))));
   logVerbose(`static: ${spec.name} (in ${slash(path.relative(workdir, cwd)) || "."}) ${args.slice(0, 6).join(" ")}…`);
@@ -308,7 +355,7 @@ async function runTool(
 
   // Linters conventionally exit non-zero when they find something; that's not a failure.
   if (res.code !== 0 && !spec.allowNonZeroExit) {
-    return { findings: [], skipped: `exit code ${res.code}: ${res.stderr.slice(0, 200)}`, unresolved: 0 };
+    return { parsed: [], skipped: `exit code ${res.code}: ${res.stderr.slice(0, 200)}` };
   }
 
   let raw: string;
@@ -317,11 +364,10 @@ async function runTool(
       // Not "no findings": the tool was asked to write a report and did not. Saying so beats
       // an empty result that reads exactly like a clean build.
       return {
-        findings: [],
+        parsed: [],
         skipped:
           `produced no ${spec.outputFile} in ${slash(path.relative(workdir, cwd)) || "."} ` +
           `(exit ${res.code})${res.stderr.trim() ? `: ${res.stderr.trim().slice(0, 160)}` : ""}`,
-        unresolved: 0,
       };
     }
     raw = fs.readFileSync(reportPath, "utf8");
@@ -333,13 +379,40 @@ async function runTool(
   const parsed = parseToolOutput(raw, spec, cwd);
 
   const broken = environmentFailure(spec, parsed, slash(path.relative(workdir, cwd)) || ".");
-  if (broken) return { findings: [], skipped: broken, unresolved: 0 };
+  if (broken) return { parsed: [], skipped: broken };
 
   // Ignored rules go first: a finding the profile suppresses must not be able to inflate
   // the unresolved count below — that count points readers at a coordinate problem, and
   // config-suppressed output is not one.
   const ignored = new Set(profile.ignoreRules ?? []);
-  const relevant = parsed.filter((f) => !ignored.has(f.ruleId));
+  return { parsed: parsed.filter((f) => !ignored.has(f.ruleId)) };
+}
+
+/** A finding's path relative to the working directory, from the tool's own coordinates. */
+function workdirPath(f: ToolFinding, workdir: string, cwd: string): string | undefined {
+  const p = normalizePath(slash(path.relative(workdir, path.resolve(cwd, f.file))));
+  return p && !p.startsWith("../") ? p : undefined;
+}
+
+interface ToolRun {
+  spec: ToolSpec;
+  files: string[];
+  findings: ToolFinding[];
+  skipped?: string;
+  unresolved: number;
+  outside: ToolFinding[];
+}
+
+async function runTool(
+  spec: ToolSpec,
+  profile: Profile,
+  files: string[],
+  workdir: string,
+  cwd: string,
+  index: FileIndex,
+): Promise<{ findings: ToolFinding[]; skipped?: string; unresolved: number; outside: ToolFinding[] }> {
+  const { parsed: relevant, skipped } = await execTool(spec, profile, files, workdir, cwd);
+  if (skipped !== undefined) return { findings: [], skipped, unresolved: 0, outside: [] };
 
   const prefix = slash(path.relative(workdir, cwd));
   const { kept, misses } = rekeyToolFindings(relevant, prefix, index);
@@ -349,7 +422,188 @@ async function runTool(
         `(e.g. ${misses[0]!.file})`,
     );
   }
-  return { findings: kept, unresolved: misses.length };
+  // Findings in files the change did not touch, kept with working-directory paths: the
+  // merge-base comparison (PRR_STATIC_BASELINE) is what can tell the ones this change caused.
+  const outside = misses.flatMap((f) => {
+    const p = workdirPath(f, workdir, cwd);
+    return p ? [{ ...f, file: p }] : [];
+  });
+  return { findings: kept, unresolved: misses.length, outside };
+}
+
+/**
+ * The fact-tier tools that ran at the head, run again in a worktree at the merge base, keyed
+ * as baselineKey keys them. A tool that could not run there is reported and left out: its
+ * head findings are then treated exactly as they are without a baseline.
+ */
+async function factsAtBase(
+  profiles: Profile[],
+  ranAtHead: ReadonlySet<string>,
+  files: readonly FileDiff[],
+  baseWorkdir: string,
+): Promise<{ byTool: Map<string, Array<{ key: string }>>; skipped: Array<{ tool: string; reason: string }> }> {
+  // Base path → the path the head calls it, so an error in a renamed file matches itself.
+  const renames = new Map(
+    files.filter((f) => f.originalPath && f.originalPath !== f.path).map((f) => [normalizePath(f.originalPath!), f.path]),
+  );
+  const targets = files
+    .filter((f) => f.changeType !== "add")
+    .map((f) => normalizePath(f.originalPath ?? f.path))
+    .filter((p) => fs.existsSync(path.join(baseWorkdir, p)));
+  const cache = new Map<string, string[]>();
+  const lineAt = (p: string, n: number) => {
+    let lines = cache.get(p);
+    if (!lines) {
+      lines = readLinesOrUndefined(path.join(baseWorkdir, p)) ?? [];
+      cache.set(p, lines);
+    }
+    return lines[n - 1] ?? "";
+  };
+  const byTool = new Map<string, Array<{ key: string }>>();
+  const skipped: Array<{ tool: string; reason: string }> = [];
+  for (const profile of profiles) {
+    const own = filesForProfile(profile, targets);
+    if (own.length === 0) continue;
+    for (const name of new Set(profile.tools.filter((t) => t.tier === "fact").map((t) => t.name))) {
+      if (!ranAtHead.has(name) || byTool.has(name)) continue;
+      // The same variant the head ran: the first one installed, in declaration order.
+      let spec: ToolSpec | undefined;
+      for (const t of profile.tools) {
+        if (t.name === name && (await commandExists(t.bin))) {
+          spec = t;
+          break;
+        }
+      }
+      if (!spec) continue;
+      const found: Array<{ key: string }> = [];
+      let failed: string | undefined;
+      for (const p of projectDirsFor(spec, own, baseWorkdir)) {
+        const r = await execTool(spec, profile, p.files, baseWorkdir, p.dir);
+        if (r.skipped !== undefined) {
+          failed = r.skipped;
+          break;
+        }
+        for (const f of r.parsed) {
+          const wp = workdirPath(f, baseWorkdir, p.dir);
+          if (wp) found.push({ key: baselineKey(f.tool, f.ruleId, renames.get(wp) ?? wp, lineAt(wp, f.line)) });
+        }
+      }
+      if (failed !== undefined) skipped.push({ tool: name, reason: `at the merge base: ${failed}` });
+      else byTool.set(name, found);
+    }
+  }
+  return { byTool, skipped };
+}
+
+export interface FixCheck {
+  finding: AnchoredFinding;
+  /** The fact-tier tool that checked it. */
+  tool: string;
+  /** What the fix broke, when it broke something, worded for the log. Absent = it typechecks. */
+  broke?: string;
+}
+
+// Marks a diagnostic inside the edited lines: their text is the fix's after the edit and the
+// original's before, so keying on it would call an error the original already had "new".
+const EDITED = "\u0000edited";
+
+/**
+ * Whether each finding's suggested fix typechecks — arXiv 2607.21997's strongest predictor that
+ * a comment is acted on is a fix that can be applied, and a fix that does not compile is worse
+ * than none. The fix replaces the anchored lines in prloop's worktree, the fact-tier tool of
+ * the file's language runs over its project, and whatever it reports that it did not report
+ * before the edit is what the fix broke. The file is restored after every check. At most `max`
+ * checks: each is a whole-project tsc or mypy run. A finding no tool can check — no fact-tier
+ * tool for its language, a worktree that does not hold the reviewed bytes, a toolchain that
+ * cannot run — is not in the result.
+ */
+export async function checkFixes(
+  findings: readonly AnchoredFinding[],
+  index: FileIndex,
+  workdir: string,
+  max: number,
+): Promise<FixCheck[]> {
+  const out: FixCheck[] = [];
+  // Per tool and project, what the tool reports with no fix applied. Raw, not keyed: which
+  // lines count as edited differs per finding.
+  const baselines = new Map<string, ToolFinding[]>();
+  const candidates = findings.filter((f) => f.tier === undefined && f.suggested_fix?.trim() && f.anchor?.side === "right").slice(0, max);
+  for (const f of candidates) {
+    const fd = index.exact(f.file);
+    const anchor = f.anchor!;
+    if (!fd) continue;
+    const abs = path.join(workdir, fd.path);
+    const original = readLinesOrUndefined(abs);
+    // An edit to other bytes than the ones reviewed checks nothing about this fix.
+    if (!original || classifyWorkdirContent(original, fd.rightLines) !== "match") continue;
+    const profile = selectProfiles([fd.path])[0];
+    if (!profile) continue;
+    let spec: ToolSpec | undefined;
+    for (const t of profile.tools) {
+      if (t.tier === "fact" && (await commandExists(t.bin))) {
+        spec = t;
+        break;
+      }
+    }
+    const project = spec ? projectDirsFor(spec, [fd.path], workdir)[0] : undefined;
+    if (!spec || !project) continue;
+
+    const fixLines = f.suggested_fix!.replace(/^(?:[ \t]*\r?\n)+/, "").replace(/\s+$/, "").split(/\r?\n/);
+    // Keyed as baselineKey keys them, except inside the edited lines (EDITED).
+    const keyed = (parsed: ToolFinding[], edited: [number, number]) => {
+      const cache = new Map<string, string[]>();
+      return parsed.flatMap((t) => {
+        const wp = workdirPath(t, workdir, project.dir);
+        if (!wp) return [];
+        let lines = cache.get(wp);
+        if (!lines) cache.set(wp, (lines = readLinesOrUndefined(path.join(workdir, wp)) ?? []));
+        const inEdit = wp === normalizePath(fd.path) && t.line >= edited[0] && t.line <= edited[1];
+        return [{ key: baselineKey(t.tool, t.ruleId, wp, inEdit ? EDITED : (lines[t.line - 1] ?? "")), t, wp }];
+      });
+    };
+    const runOnce = async () => {
+      const r = await execTool(spec!, profile, project.files, workdir, project.dir);
+      if (r.skipped !== undefined) throw new Error(r.skipped);
+      return r.parsed;
+    };
+    try {
+      const cacheKey = `${spec.name}\u0000${project.dir}`;
+      let unfixed = baselines.get(cacheKey);
+      if (!unfixed) {
+        unfixed = await runOnce();
+        baselines.set(cacheKey, unfixed);
+      }
+      // Keyed now, with the file as reviewed on disk.
+      const before = keyed(unfixed, [anchor.startLine, anchor.endLine]);
+      const raw = fs.readFileSync(abs, "utf8");
+      const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+      // splitLines keeps a CRLF file's `\r` on each line; the join puts the file's own ending back.
+      const bare = original.map((l) => l.replace(/\r$/, ""));
+      const edited = [...bare.slice(0, anchor.startLine - 1), ...fixLines, ...bare.slice(anchor.endLine)];
+      fs.writeFileSync(abs, edited.join(eol) + (/\r?\n$/.test(raw) ? eol : ""));
+      let after: ReturnType<typeof keyed>;
+      try {
+        // Keyed before the file is put back: the line text of the edit is what it reported on.
+        after = keyed(await runOnce(), [anchor.startLine, anchor.startLine + fixLines.length - 1]);
+      } finally {
+        fs.writeFileSync(abs, raw);
+      }
+      const fresh = newAtHead(after, before).fresh;
+      const first = fresh[0];
+      out.push({
+        finding: f,
+        tool: spec.name,
+        ...(first ? { broke: `${first.t.ruleId || spec.name} at ${first.wp}:${first.t.line}: ${sanitizeToolMessage(first.t.message, 160)}` } : {}),
+      });
+    } catch (e) {
+      logVerbose(`static: could not check the fix for ${f.file}:${anchor.startLine} with ${spec.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (out.length > 0) {
+    const broke = out.filter((c) => c.broke).length;
+    log(`static: ${out.length} suggested fix${out.length === 1 ? "" : "es"} typechecked, ${broke} dropped for breaking the build`);
+  }
+  return out;
 }
 
 export async function runStaticGate(
@@ -369,6 +623,9 @@ export async function runStaticGate(
   // from — the two sources need different skip messages, and only the caller knows which
   // one it tried.
   workdir: string = WORKDIR,
+  // PRR_STATIC_BASELINE: a checkout of the merge base, where the fact-tier tools run again
+  // so that only what is new at the head counts. Absent = no comparison, as before.
+  baseWorkdir?: string,
 ): Promise<StaticResult> {
   if (!workdir) {
     return {
@@ -391,6 +648,9 @@ export async function runStaticGate(
   }
 
   const all: ToolFinding[] = [];
+  // Fact-tier findings in files the change did not touch, for the merge-base comparison.
+  const outsideFacts: ToolFinding[] = [];
+  const analysed: Record<string, string[]> = {};
   const ranTools: string[] = [];
   const skipped: Array<{ tool: string; reason: string }> = [];
   let unresolved = 0;
@@ -456,11 +716,13 @@ export async function runStaticGate(
         if (i < 0) {
           const variants = profile.tools.filter((t) => t.name === name);
           return [
-            Promise.resolve({
+            Promise.resolve<ToolRun>({
               spec: variants[0]!,
-              findings: [] as ToolFinding[],
+              files: [],
+              findings: [],
               skipped: `${[...new Set(variants.map((v) => v.bin))].join(" or ")} not found on PATH`,
               unresolved: 0,
+              outside: [],
             }),
           ];
         }
@@ -468,18 +730,23 @@ export async function runStaticGate(
         const projects = projectDirsFor(spec, targets, workdir);
         if (projects.length === 0) {
           return [
-            Promise.resolve({
+            Promise.resolve<ToolRun>({
               spec,
-              findings: [] as ToolFinding[],
+              files: [],
+              findings: [],
               skipped: `no ${spec.requires} found above any changed file`,
               unresolved: 0,
+              outside: [],
             }),
           ];
         }
-        return projects.map(async (p) => ({
-          spec,
-          ...(await runTool(spec, profile, p.files, workdir, p.dir, index)),
-        }));
+        return projects.map(
+          async (p): Promise<ToolRun> => ({
+            spec,
+            files: p.files,
+            ...(await runTool(spec, profile, p.files, workdir, p.dir, index)),
+          }),
+        );
       }),
     );
     for (const r of results) {
@@ -489,7 +756,9 @@ export async function runStaticGate(
       }
       ranTools.push(r.spec.name);
       all.push(...r.findings);
+      outsideFacts.push(...r.outside.filter((f) => f.tier === "fact"));
       unresolved += r.unresolved;
+      analysed[r.spec.name] = [...new Set([...(analysed[r.spec.name] ?? []), ...r.files.map(normalizePath)])];
     }
   }
 
@@ -519,7 +788,51 @@ export async function runStaticGate(
   }
 
   const { kept, dropped } = filterToChangedLines(all, index);
-  const facts = kept.filter((f) => f.tier === "fact");
+  let facts = kept.filter((f) => f.tier === "fact");
+
+  let broke: ToolFinding[] | undefined;
+  let baseline: StaticResult["baseline"];
+  if (baseWorkdir) {
+    const base = await factsAtBase(profiles, new Set(ranTools), files, baseWorkdir);
+    const headCache = new Map<string, string[]>();
+    const headLine = (f: ToolFinding) => {
+      const fd = index.exact(f.file);
+      if (fd) return fd.rightLines[f.line - 1] ?? "";
+      let lines = headCache.get(f.file);
+      if (!lines) {
+        lines = readLinesOrUndefined(path.join(workdir, f.file)) ?? [];
+        headCache.set(f.file, lines);
+      }
+      return lines[f.line - 1] ?? "";
+    };
+    const onChanged = new Set(facts);
+    const stale = new Set<ToolFinding>();
+    broke = [];
+    let preExisting = 0;
+    for (const [tool, baseKeys] of base.byTool) {
+      const head = [...all.filter((f) => f.tier === "fact" && f.tool === tool), ...outsideFacts.filter((f) => f.tool === tool)].map(
+        (f) => ({ f, key: baselineKey(f.tool, f.ruleId, f.file, headLine(f)) }),
+      );
+      const { fresh, existing } = newAtHead(head, baseKeys);
+      for (const x of existing) {
+        if (onChanged.has(x.f)) {
+          stale.add(x.f);
+          preExisting++;
+        }
+      }
+      for (const x of fresh) if (!onChanged.has(x.f)) broke.push(x.f);
+    }
+    // An error the merge base already had is not this change's, even on a line it touched.
+    facts = facts.filter((f) => !stale.has(f));
+    broke.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+    baseline = { tools: [...base.byTool.keys()], preExisting, skipped: base.skipped };
+    log(
+      `static baseline: ${baseline.tools.join(", ") || "no fact tool"} also ran at the merge base — ` +
+        `${preExisting} finding(s) on changed lines already existed there and are not posted; ` +
+        `${broke.length} new outside the changed lines, named in the summary` +
+        (base.skipped.length > 0 ? `; not compared: ${base.skipped.map((s) => `${s.tool} (${s.reason.slice(0, 120)})`).join("; ")}` : ""),
+    );
+  }
   const needsTriage = kept.filter((f) => f.tier === "triage");
   const suppressedCount = kept.filter((f) => f.tier === "suppress").length;
 
@@ -557,7 +870,22 @@ export async function runStaticGate(
     );
   }
 
-  return { facts, needsTriage, suppressedCount, ranTools, skipped, staleFiles: stale, unresolved };
+  const reported = all.flatMap((f) => {
+    const fd = index.exact(f.file);
+    return fd ? [toolFingerprint(f.tool, f.ruleId, f.file, fd.rightLines[f.line - 1] ?? "")] : [];
+  });
+  return {
+    facts,
+    needsTriage,
+    suppressedCount,
+    ranTools,
+    skipped,
+    staleFiles: stale,
+    unresolved,
+    evidence: { analysed, reported: [...new Set(reported)] },
+    ...(broke === undefined ? {} : { broke }),
+    ...(baseline === undefined ? {} : { baseline }),
+  };
 }
 
 export interface TriageVerdict {
@@ -772,12 +1100,10 @@ export async function triageAndConvert(
       // A deterministic tool is its own corroboration: it doesn't guess, so it doesn't
       // need a second model to agree before we believe the location exists.
       sources: [f.tool],
+      rule: f.ruleId ? `${f.tool}:${f.ruleId}` : f.tool,
       skepticVerdicts: 1,
       skepticRefuted: 0,
-      fingerprint: createHash("sha1")
-        .update(`tool ${f.tool} ${f.ruleId} ${f.file} ${lineText.trim()}`)
-        .digest("hex")
-        .slice(0, 12),
+      fingerprint: toolFingerprint(f.tool, f.ruleId, f.file, lineText),
       anchor: {
         side: "right",
         startLine: f.line,
@@ -800,15 +1126,48 @@ export async function triageAndConvert(
   };
 }
 
-// Maps a tool rule to a review category so tool findings sit in the same taxonomy as
-// model findings and dedupe against them.
-function categoryForRule(f: ToolFinding): string {
-  const id = f.ruleId.toUpperCase();
+// What each tool's own taxonomy says, where it says anything. Read before the message
+// heuristics below, and only from fields the tool defines — a rule id's first letter is not
+// one of them.
+const PMD_RULESETS: Record<string, string> = {
+  Security: "security",
+  Multithreading: "concurrency",
+  Performance: "performance",
+};
+const SPOTBUGS_CATEGORIES: Record<string, string> = {
+  SECURITY: "security",
+  MALICIOUS_CODE: "security",
+  MT_CORRECTNESS: "concurrency",
+  PERFORMANCE: "performance",
+  CORRECTNESS: "correctness",
+};
+const TOOL_CATEGORY: Record<string, (f: ToolFinding) => string | undefined> = {
+  bandit: () => "security",
+  mypy: () => "correctness",
+  tsc: () => "correctness",
+  // flake8-bandit's rules are S followed by digits (S105, S608).
+  ruff: (f) => (/^S\d/.test(f.ruleId) ? "security" : undefined),
+  // Security plugins namespace their rules; eslint's core rules have no such prefix.
+  eslint: (f) => (/^(security|security-node|no-unsanitized|@microsoft\/sdl)\//.test(f.ruleId) ? "security" : undefined),
+  pmd: (f) => PMD_RULESETS[f.group ?? ""],
+  spotbugs: (f) => SPOTBUGS_CATEGORIES[f.group ?? ""],
+};
+
+/**
+ * Maps a tool rule to a review category so tool findings sit in the same taxonomy as model
+ * findings and dedupe against them. Exported for the selftest.
+ *
+ * Per tool, from the tool's own classification, and only then from the message. It used to
+ * file every rule whose upper-cased id started with "S" under security, for every tool —
+ * meant for ruff's flake8-bandit rules, it also caught ruff's flake8-simplify (SIM102),
+ * eslint's `semi` and `strict`, PMD's SimplifyBooleanReturns and SpotBugs' SE_BAD_FIELD:
+ * style advice labelled as the category a reviewer is taught to treat as blocking.
+ */
+export function categoryForRule(f: ToolFinding): string {
+  const own = TOOL_CATEGORY[f.tool]?.(f);
+  if (own) return own;
   const msg = f.message.toLowerCase();
-  if (f.tool === "bandit" || id.startsWith("S") || /injection|xss|csrf|secret|password|crypto/.test(msg)) {
-    return "security";
-  }
-  if (f.tool === "mypy" || f.tool === "tsc") return "correctness";
+  if (/injection|xss|csrf|secret|password|crypto/.test(msg)) return "security";
   if (/thread|concurren|synchroniz|atomic|race/.test(msg)) return "concurrency";
   if (/close|leak|resource|stream/.test(msg)) return "reliability";
   if (/performance|inefficient|complexity/.test(msg)) return "performance";

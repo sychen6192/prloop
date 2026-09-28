@@ -17,47 +17,11 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fakeAdo, type FakeAdoState, type FakeThread } from "./fakes/ado";
+import { fakeAdo, type FakeAdoState, type FakeComment, type FakeThread } from "./fakes/ado";
 import type { AnchoredFinding, FileDiff } from "../libs/types";
-import type { ReviewContext } from "../ado/intake";
+import type { ReviewContext } from "../libs/context";
 import type { SummaryInput } from "../publish/format";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
-
-/** publish() logs its way through; keep that out of the assertion stream, but keep it. */
-async function capture<T>(fn: () => Promise<T>): Promise<{ value: T; lines: string[] }> {
-  const lines: string[] = [];
-  const real = console.log;
-  console.log = (...a: unknown[]) => {
-    lines.push(a.map(String).join(" "));
-  };
-  try {
-    return { value: await fn(), lines };
-  } finally {
-    console.log = real;
-  }
-}
+import { capture, check, eq, report, section } from "./selftest/harness";
 
 let runsDir = "";
 const ado = await fakeAdo();
@@ -82,13 +46,16 @@ try {
   const { BOT_MARKER, SUMMARY_MARKER, findingMarkers, summaryMarkers, iterationMarker, readMarkers } =
     await import("../publish/markers");
   const { watermarkFor, lastReviewedIteration, collectDismissals } = await import("../publish/lifecycle");
-  const { selfIdentityId, isSelfIdentity, resetIdentityCache } = await import("../ado/identity");
+  const { selfIdentityId, resetIdentityCache } = await import("../ado/identity");
+  const { isSelfIdentity } = await import("../libs/host");
+  const { adoHost } = await import("../ado/host");
   const { exitCodeFor } = await import("../orchestrator");
-  const { FINDING_CATEGORIES } = await import("../config");
+  const { FINDING_CATEGORIES } = await import("../libs/taxonomy");
   const { fingerprint } = await import("../gates/aggregate");
   const { FileIndex } = await import("../libs/fileindex");
 
   const ref = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4821");
+  const host = adoHost(ref);
 
   const mkFile = (path: string, lines: number): FileDiff => ({
     path,
@@ -111,6 +78,7 @@ try {
     iteration: { id: 3, sourceRefCommit: "src3", targetRefCommit: "tgt3", commonRefCommit: "base3", createdDate: "" },
     compareTo: 0,
     files,
+    textFiles: [],
     skipped: [],
     changeTrackingIds: new Map<string, number>([["src/app.ts", 11], ["src/pay.ts", 12]]),
     fileIndex: new FileIndex(files),
@@ -182,7 +150,7 @@ try {
       comments: [{ id: 77, content: `${BOT_MARKER}${SUMMARY_MARKER}\n## previous run\n<!-- prloop:iteration=2 -->` }],
     };
     setState({ threads: [existing] });
-    const { value: result } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput()));
+    const { value: result } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput()));
 
     eq("the existing summary comment is PATCHed", commentPatches().length, 1);
     eq("...and no new thread is created for it", threadPosts().length, 0);
@@ -194,7 +162,7 @@ try {
     // First run on a PR: there is nothing to edit, so one thread is created — closed, so it
     // never trips a "comment resolution required" policy.
     setState({ threads: [] });
-    const { value: fresh } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput()));
+    const { value: fresh } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput()));
     eq("with no prior summary, exactly one thread is posted", threadPosts().length, 1);
     eq("...as a closed thread, not an active one", threadPosts()[0]?.body?.["status"], "closed");
     check("...and the id comes back for the caller", typeof fresh.summaryThreadId === "number");
@@ -217,13 +185,48 @@ try {
       ],
     });
     const { value: result } = await capture(() =>
-      publish(ref, { requirement: [], code: [seen] }, summaryInput({ agg: summaryInput().agg })),
+      publish(host, { requirement: [], code: [seen] }, summaryInput({ agg: summaryInput().agg })),
     );
     eq("the finding is reported as already posted", result.alreadyPosted.map((f) => f.fingerprint), ["aaaa1111"]);
     eq("...and nothing new is posted for it", result.posted.length, 0);
     // The only POST is the summary — the finding cost zero writes.
     eq("...so the only thread POST is the summary itself", threadPosts().length, 1);
     check("...and that one is the summary", contentOf(threadPosts()[0]!).includes(SUMMARY_MARKER));
+  }
+
+  section("a lane holds back new comments, never the ones already on the PR");
+  {
+    // Filed as pre-existing, so not posted. The one an earlier run commented on — in the push
+    // that wrote the line, typically — is still reported as commented, not as never commented.
+    const carried = finding({ fingerprint: "dddd4444", claim: "Retry loop swallows the error.", suppressedBy: "pre-existing", untouched: true });
+    const fresh = finding({
+      fingerprint: "eeee5555",
+      claim: "Old helper leaks a handle.",
+      suppressedBy: "pre-existing",
+      untouched: true,
+      anchor: { side: "right", startLine: 20, endLine: 20, startOffset: 1, endOffset: 8 },
+    });
+    setState({
+      threads: [
+        {
+          id: 4300,
+          status: "active",
+          comments: [ourComment(95, "Retry loop swallows the error.", "dddd4444", "correctness")],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 11 }, rightFileEnd: { line: 11 } },
+        },
+      ],
+    });
+    const agg = { ...summaryInput().agg, belowBar: [carried, fresh] };
+    const { value: result } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput({ agg })));
+    eq("the laned finding an earlier run commented on is reported as already commented", result.alreadyPosted.map((f) => f.fingerprint), ["dddd4444"]);
+    eq("...and nothing is posted for either", result.posted.length, 0);
+    eq("...so the only thread POST is the summary", threadPosts().length, 1);
+    const summary = contentOf(threadPosts()[0]!);
+    check("the summary lists both as pre-existing", summary.includes("Pre-existing issues (2) - on lines this change did not touch, no new comments"), summary);
+    check("...the one with a comment says so", summary.includes("Retry loop swallows the error. _(commented by an earlier run)_"), summary);
+    check("...the other does not", summary.includes("Old helper leaks a handle.\n"), summary);
+    // Code that was there before the change is not the change's to block on.
+    eq("a high finding on untouched lines does not fail the PR", statusOf(statusPosts()[0]), "succeeded");
   }
 
   section("position dedupe is scoped to one axis: the two axes must not delete each other");
@@ -248,7 +251,7 @@ try {
 
     setState({ threads: [priorCodeThread] });
     const { value: result } = await capture(() =>
-      publish(ref, { requirement: [requirementHere], code: [codeAgain] }, summaryInput()),
+      publish(host, { requirement: [requirementHere], code: [codeAgain] }, summaryInput()),
     );
     eq("a same-axis finding on covered lines is suppressed", result.alreadyPosted.map((f) => f.fingerprint), ["bbbb2222"]);
     eq("...while the OTHER axis still gets its comment", result.posted.map((f) => f.fingerprint), ["cccc3333"]);
@@ -286,7 +289,7 @@ try {
       },
     });
     const { value: result, lines } = await capture(() =>
-      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } })),
+      publish(host, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } })),
     );
     eq("the rejected finding lands in failed[]", result.failed.map((x) => x.finding.fingerprint), ["dddd4444"]);
     eq("...and not in posted[]", result.posted.length, 0);
@@ -379,11 +382,68 @@ try {
         },
       ],
     });
-    const { value: result } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput()));
+    const { value: result } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput()));
     eq("the stale thread is resolved", result.resolved, 1);
     const patched = ado.matching("PATCH", /\/threads\/4300$/);
     eq("...by one PATCH on the thread", patched.length, 1);
     eq("...setting it to fixed, not deleting it", patched[0]?.body?.["status"], "fixed");
+  }
+
+  section("a comment's code is found by what it says, not by the line it was posted on");
+  {
+    // Written out literally, like every fixture here: sha1 of the flagged lines, each with
+    // its whitespace collapsed and trimmed, joined by newlines — the wire format, not the
+    // writer's opinion of it.
+    const { createHash } = await import("node:crypto");
+    const hashOf = (...lines: string[]) =>
+      createHash("sha1").update(lines.map((l) => l.replace(/\s+/g, " ").trim()).join("\n")).digest("hex").slice(0, 12);
+    eq(
+      "the span marker's bytes",
+      findingMarkers({ fingerprint: "c848ab6f5911", category: "correctness" }, { lines: 1, hash: hashOf("  charge(total);") }),
+      `<!-- prloop --><!-- prloop:fp=c848ab6f5911 --><!-- prloop:cat=correctness --><!-- prloop:span=1.${hashOf("  charge(total);")} -->`,
+    );
+    eq("...read back", readMarkers(`${BOT_MARKER}<!-- prloop:fp=c848ab6f5911 --><!-- prloop:span=2.${hashOf("a", "b")} -->\nx`).span, { lines: 2, hash: hashOf("a", "b") });
+    eq("...never from quoted text", readMarkers(`${BOT_MARKER}<!-- prloop:fp=c848ab6f5911 -->\nThe claim.\n<!-- prloop:span=2.${hashOf("a", "b")} -->`).span, undefined);
+
+    // The file as it is now: three lines were inserted at the top, and the rest moved.
+    const now = [
+      "import { charge, refund } from './pay';", // 1
+      "// one",                                    // 2
+      "// two",                                    // 3
+      "// three",                                  // 4
+      "function pay(total) {",                     // 5
+      "  charge(total);",                          // 6  (was line 3)
+      "  audit(total);",                           // 7
+      "  refund(total);",                          // 8  (was line 60 of a longer file)
+      "}",                                         // 9
+      "export { pay };",                           // 10
+    ];
+    const payNow: FileDiff = { ...mkFile("src/pay.ts", now.length), rightLines: now };
+    const movedCtx = { ...ctx, files: [payNow], fileIndex: new FileIndex([payNow]) } as ReviewContext;
+    const spanned = (id: number, line: number, fp: string, ...code: string[]): FakeThread => ({
+      id,
+      status: "active",
+      comments: [{ id: id + 1, content: `${BOT_MARKER}<!-- prloop:fp=${fp} --><!-- prloop:cat=correctness --><!-- prloop:span=${code.length}.${hashOf(...code)} -->\nclaim` }],
+      threadContext: { filePath: "/src/pay.ts", rightFileStart: { line }, rightFileEnd: { line: line + code.length - 1 } },
+    });
+    setState({
+      threads: [
+        spanned(4400, 3, "aaaa11110001", "  charge(total);"), // moved down: 3 → 6
+        spanned(4410, 60, "aaaa11110002", "  refund(total);"), // moved up, past the old end of file
+        spanned(4420, 7, "aaaa11110003", "  retry(forever);"), // fixed: gone from the file
+      ],
+    });
+    // A new finding on line 3 — code that now sits where the first thread was posted.
+    const onLine3 = finding({ fingerprint: "bbbb22220001", file: "src/pay.ts", quote: "// two", claim: "A stale comment.", anchor: { side: "right", startLine: 3, endLine: 3, startOffset: 1, endOffset: 7 } });
+    const { value: result } = await capture(() => publish(host, { requirement: [], code: [onLine3] }, summaryInput({ ctx: movedCtx })));
+
+    eq("a finding where a moved comment used to be is posted, not taken for that comment", result.posted.map((f) => f.fingerprint), ["bbbb22220001"]);
+    const closed = ado.matching("PATCH", /\/threads\/44\d0$/).map((r) => r.path.split("/").pop());
+    check("a comment whose code moved above the old end of the file stays open", !closed.includes("4410"), closed.join(","));
+    check("...and so does the one whose code moved down", !closed.includes("4400"), closed.join(","));
+    eq("the one whose code is gone is closed, wherever the file ends", closed, ["4420"]);
+    const posted = contentOf(threadPosts().find((r) => r.body?.["threadContext"] !== undefined) ?? {});
+    check("a new comment records the code it is about", posted.includes(`<!-- prloop:span=1.${hashOf("// two")} -->`), posted.slice(0, 200));
   }
 
   section("PR status: either axis can fail the check, and the reason says which");
@@ -393,7 +453,7 @@ try {
     const risky = finding({ fingerprint: "ffff6666", severity: "critical" });
     setState({ threads: [] });
     await capture(() =>
-      publish(ref, { requirement: [], code: [risky] }, summaryInput({ agg: { ...summaryInput().agg, inline: [risky] } })),
+      publish(host, { requirement: [], code: [risky] }, summaryInput({ agg: { ...summaryInput().agg, inline: [risky] } })),
     );
     const status = ado.matching("POST", /\/statuses$/);
     eq("a status is posted", status.length, 1);
@@ -401,7 +461,7 @@ try {
     check("...naming the high-risk code issues", String(status[0]?.body?.["description"]).includes("high-risk code issues"));
 
     setState({ threads: [] });
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput()));
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput()));
     const clean = ado.matching("POST", /\/statuses$/);
     eq("a clean run reports succeeded", clean[0]?.body?.["state"], "succeeded");
   }
@@ -502,9 +562,79 @@ try {
       readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\n## body\n${iterationMarker(12)}`).iteration,
       12,
     );
+    // ...and from there alone. The summary is prloop's own comment, so it passes both of the
+    // resume point's guards — and it quotes acceptance criteria and model notes verbatim.
+    // Hand-written bytes, as everywhere in this section: the writer defuses quoted markers
+    // now, and a fixture built from it would pass whatever the reader did.
+    const quotedMidBody = `${BOT_MARKER}${SUMMARY_MARKER}\n| ✅ | Export works <!-- prloop:iteration=5 --> | done |\n<sub>prloop</sub>\n`;
+    eq("a marker quoted mid-summary is not the resume point", readMarkers(`${quotedMidBody}${iterationMarker(3)}`).iteration, 3);
+    eq("...even when no real one follows it", readMarkers(quotedMidBody).iteration, undefined);
+    eq(
+      "a quoted lease is no lease either",
+      readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\nnote <!-- prloop:run=1700000000000.deadbeef -->\n<sub>prloop</sub>\n`).run,
+      undefined,
+    );
+    eq(
+      "...while the one the lease appends is read",
+      readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\n<sub>prloop</sub>\n${iterationMarker(3)}<!-- prloop:run=1700000000000.deadbeef -->`).run,
+      { startedAt: 1700000000000, id: "deadbeef" },
+    );
+    eq(
+      "...and trailing whitespace ADO may add does not hide either",
+      readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\n<sub>prloop</sub>\n${iterationMarker(3)}\r\n`).iteration,
+      3,
+    );
 
     setState({ threads: [] });
     resetIdentityCache();
+  }
+
+  section("text prloop quotes cannot forge its state or hide the comment around it");
+  {
+    const { htmlToText } = await import("../libs/html");
+    const { renderFindingComment } = await import("../publish/format");
+    // The reproduction, end to end. A work item's criterion typed with escaped brackets:
+    // htmlToText strips tags and THEN decodes entities, so the marker arrives live.
+    const criterion = htmlToText("<ul><li>Export works &lt;!-- prloop:iteration=5 --&gt;</li></ul>").replace(/^- /, "");
+    check("the criterion does arrive carrying a live marker", criterion.includes("<!-- prloop:iteration=5 -->"), criterion);
+    const req = {
+      workItems: [{ id: 42, title: "Export", type: "User Story", state: "Active", description: "", acceptanceCriteria: criterion, specSource: "acceptance-criteria", url: "" }],
+      criteria: [{ workItemId: 42, criterion, verdict: "satisfied", note: "see <!-- prloop:run=1700000000000.deadbeef -->" }],
+      extras: [],
+    } as unknown as NonNullable<SummaryInput["req"]>;
+
+    setState({ threads: [] });
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput({ req })));
+    const body = contentOf(threadPosts()[0] ?? {});
+    eq("the resume point read back is this run's iteration, not the criterion's", readMarkers(body).iteration, 3);
+    eq("...and a lease quoted in a note is not a lease", readMarkers(body).run, undefined);
+    const ownMarkers = (body.match(/<!--/g) ?? []).length;
+    eq("the only live comment openers are prloop's own three", ownMarkers, 3);
+    check("...while the author's words are still there to read", body.includes("Export works <!\u200B-- prloop:iteration=5 -->"), body);
+
+    // The worst case before the fix: a push nothing reviewed holds the resume point, and with
+    // no earlier one on the PR, no marker is written at all — so the forged one was the only
+    // one in the body, and the next run resumed from it.
+    setState({ threads: [] });
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput({ req }), known(["every finder failed"])));
+    eq("a held resume point with nothing recorded reads as none, not as the forged one", readMarkers(contentOf(threadPosts()[0] ?? {})).iteration, undefined);
+
+    // An opener nobody closes, at the start of a line, begins an HTML block that runs to the
+    // end of the body: in a claim, everything prloop wrote after it vanished from view.
+    const claimed = renderFindingComment(finding({ fingerprint: "c0ffee000001", claim: "<!-- the rest of this comment vanished", evidence: "the evidence" }));
+    eq("a comment opener in a claim is defused", (claimed.match(/<!--/g) ?? []).length, 3);
+    check("...and the text after it is still there", claimed.includes("the evidence"));
+
+    // A fix is code: pasted as it stands, so it is not defused — which only holds if nothing
+    // inside can end the fence and turn the rest into markdown.
+    const fix = "const doc = `\n```html\n<!-- keep -->\n```\n`;";
+    const fenced = renderFindingComment(finding({ fingerprint: "c0ffee000002", suggested_fix: fix }));
+    check("a fix carrying its own ``` gets a longer fence", fenced.includes(`\n\`\`\`\`typescript\n${fix}\n\`\`\`\`\n`), fenced);
+    check("...and reaches the PR byte for byte", fenced.includes(fix));
+    const plain = renderFindingComment(finding({ fingerprint: "c0ffee000003", suggested_fix: "retry(3)" }));
+    check("an ordinary fix keeps the ordinary fence", plain.includes("\n```typescript\nretry(3)\n```\n"), plain);
+
+    setState({ threads: [] });
   }
 
   section("a merged PR: harvest what humans did, spend nothing on a review nobody can see");
@@ -525,13 +655,14 @@ try {
     // way back except --dry-run. Adding it on the assumption it behaves like `completed`
     // would be a guess wearing a fact's clothes.
     eq("...and neither is abandoned, which nothing here has ever seen refuse a write", terminalPrStatus("abandoned"), undefined);
+    eq("the ADO host answers with it", host.terminal({ ...ctx.pr, status: "completed" }), "the pull request is completed");
 
     const BOT = "cccccccc-dddd-eeee-ffff-000000000000";
     const mergedCtx = { ...ctx, pr: { ...ctx.pr, status: "completed" } } as ReviewContext;
-    // Driven through the intake seam rather than by setting env vars before a dynamic
+    // Driven through the host's intake rather than by setting env vars before a dynamic
     // import: config's consts are read once at module load, and this file imported ../config
-    // pages ago.
-    const intake = async () => mergedCtx;
+    // pages ago. The rest of the host is the ADO one, against the fake.
+    const merged = { ...host, intake: async () => mergedCtx };
     // Counted rather than thrown: a throw would be caught by the finder stage and degrade
     // into a stage failure, which proves nothing about whether the call was made.
     let modelCalls = 0;
@@ -558,11 +689,24 @@ try {
           comments: [{ id: 92, content: `${BOT_MARKER}<!-- prloop:fp=bbbb9999 --><!-- prloop:cat=correctness -->\ny`, author: { id: BOT } }],
           threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 9 }, rightFileEnd: { line: 9 } },
         },
+        // Still open at the merge: nobody acted on it and nobody said no — liked, though.
+        {
+          id: 6102,
+          status: "active",
+          comments: [{ id: 93, content: `${BOT_MARKER}<!-- prloop:fp=cccc9999 --><!-- prloop:cat=maintainability -->\nz`, author: { id: BOT }, usersLiked: [{ id: "someone" }] } as FakeComment],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 12 }, rightFileEnd: { line: 12 } },
+        },
+        {
+          id: 6103,
+          status: "closed",
+          comments: [{ id: 94, content: `${BOT_MARKER}<!-- prloop:fp=dddd9999 --><!-- prloop:cat=performance -->\nw`, author: { id: BOT } }],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 14 }, rightFileEnd: { line: 14 } },
+        },
       ],
     });
     resetIdentityCache();
     const { value: skipped, lines: skipLines } = await capture(() =>
-      runReview({ ref, runner, compareTo: 0, intake }),
+      runReview({ host: merged, runner, compareTo: 0 }),
     );
 
     eq("not one model call is made", modelCalls, 0);
@@ -576,6 +720,12 @@ try {
     // was refusing anyway.
     eq("a dismissal clicked after the merge is still recorded", loadDismissals(ref, runsDir).some((d) => d.fingerprint === "aaaa9999"), true);
     eq("...and so is a fix", loadOutcomes(ref, runsDir).some((o) => o.fingerprint === "bbbb9999"), true);
+    // The denominator the addressed rate needs: what became of the comments nobody acted on.
+    const final = new Map(loadOutcomes(ref, runsDir).map((o) => [o.fingerprint, o]));
+    eq("a comment still open at the merge is recorded as ignored", final.get("cccc9999")?.outcome, "ignored");
+    eq("...with its likes", final.get("cccc9999")?.likes, 1);
+    eq("one a human closed without a verdict is recorded as closed", final.get("dddd9999")?.outcome, "closed");
+    eq("...and the fix is not overwritten as ignored", final.get("bbbb9999")?.outcome, "fixed");
 
     // One fixed directory per PR, not an iter- one: a daily cron over a merged PR would
     // otherwise evict the last REAL review inside PRR_RUNS_KEEP ticks and orphan every
@@ -593,7 +743,7 @@ try {
     try {
       let reached = false;
       const probe = { chat: async () => { reached = true; throw new Error("stop here"); } } as unknown as Parameters<typeof runReview>[0]["runner"];
-      await capture(() => runReview({ ref, runner: probe, compareTo: 0, intake })).catch(() => undefined);
+      await capture(() => runReview({ host: merged, runner: probe, compareTo: 0 })).catch(() => undefined);
       check("a dry run still reviews a merged PR", reached, "the skip fired even under --dry-run");
     } finally {
       delete process.env["PRR_DRY_RUN"];
@@ -614,7 +764,7 @@ try {
     const f = finding({ fingerprint: "eeee7777", severity: "medium" });
     setState({ rejectThreadList: 500 });
     const { value: r, lines } = await capture(() =>
-      publish(ref, { requirement: [], code: [f] }, summaryInput({ agg: { ...summaryInput().agg, inline: [f] } }), known()),
+      publish(host, { requirement: [], code: [f] }, summaryInput({ agg: { ...summaryInput().agg, inline: [f] } }), known()),
     );
     eq("publish resolves rather than throwing", typeof r, "object");
     eq("nothing is posted", threadPosts().length, 0);
@@ -639,7 +789,7 @@ try {
     const risky = finding({ fingerprint: "eeee8888", severity: "critical" });
     setState({ rejectThreadList: 500 });
     await capture(() =>
-      publish(ref, { requirement: [], code: [risky] }, summaryInput({ agg: { ...summaryInput().agg, inline: [risky] } }), known()),
+      publish(host, { requirement: [], code: [risky] }, summaryInput({ agg: { ...summaryInput().agg, inline: [risky] } }), known()),
     );
     eq("an unpostable high-risk finding fails the gate rather than erroring it", statusOf(statusPosts()[0]), "failed");
     check(
@@ -655,7 +805,7 @@ try {
     setState({ rejectThreadList: 503 });
     let threw = "";
     try {
-      await resolveLastReviewedIteration(ref);
+      await resolveLastReviewedIteration(host);
     } catch (e) {
       threw = e instanceof Error ? e.message : String(e);
     }
@@ -665,7 +815,7 @@ try {
     // And the meaning `undefined` has to keep: read fine, nothing recorded yet.
     setState({ threads: [] });
     resetIdentityCache();
-    eq("a PR that reads fine but carries no resume point still returns undefined", await resolveLastReviewedIteration(ref), undefined);
+    eq("a PR that reads fine but carries no resume point still returns undefined", await resolveLastReviewedIteration(host), undefined);
 
     setState({ threads: [] });
   }
@@ -701,7 +851,7 @@ try {
       ],
     });
     resetIdentityCache();
-    const { value: r } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const { value: r } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
 
     const byFp = new Map(r.outcomes.map((o) => [o.fingerprint, o.outcome]));
     eq("a human's `fixed` is recorded as the author acting on it", byFp.get("f1f1f1f1f1f1"), "fixed");
@@ -733,7 +883,7 @@ try {
       ],
     });
     resetIdentityCache();
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     const stored = new Map(loadOutcomes(ref, runsDir).map((o) => [o.fingerprint, o.outcome]));
     eq(
       "a thread prloop auto-closed is not re-filed as a human fix on the next run",
@@ -783,7 +933,7 @@ try {
       setState({ threads: [] });
       await capture(() =>
         publish(
-          ref,
+          host,
           { requirement: [], code: r.inline },
           summaryInput({ agg: { ...summaryInput().agg, inline: r.inline } }),
           known([], r.incomplete),
@@ -811,7 +961,7 @@ try {
     // on its own — so the count lives in the prefix, where truncation cannot reach it.
     setState({ threads: [] });
     await capture(() =>
-      publish(ref, { requirement: [], code: [] }, summaryInput(), known([], [`HTTP 500: ${"x".repeat(900)}`, "and another"])),
+      publish(host, { requirement: [], code: [] }, summaryInput(), known([], [`HTTP 500: ${"x".repeat(900)}`, "and another"])),
     );
     const longDesc = String(statusPosts()[0]?.body?.["description"] ?? "");
     check("a 900-char reason does not delete the reason count", longDesc.startsWith("Review incomplete (2 reasons):"), longDesc.slice(0, 60));
@@ -829,7 +979,7 @@ try {
     });
     const doomed = finding({ fingerprint: "cccc3333", severity: "medium" });
     const { value: refused } = await capture(() =>
-      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
+      publish(host, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
     );
     eq("a comment ADO refused is named once, by publish", refused.gaps, ["1 comments failed to post"]);
     eq("...and turns the gate red even with nothing blocking", refused.status, "error");
@@ -837,7 +987,7 @@ try {
     // The status POST itself failing is a named failure, not a log line: the gate on the PR
     // now shows whatever an earlier run left, and only the exit code can say otherwise.
     setState({ threads: [], rejectStatusPost: 503 });
-    const { value: noStatus } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const { value: noStatus } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     check(
       "a status that could not be posted is reported as incompleteness",
       noStatus.gaps.includes("PR status failed to post"),
@@ -855,7 +1005,7 @@ try {
     try {
       const f = finding({ fingerprint: "9999aaaa" });
       const { value: result } = await capture(() =>
-        publish(ref, { requirement: [], code: [f] }, summaryInput({ agg: { ...summaryInput().agg, inline: [f] } })),
+        publish(host, { requirement: [], code: [f] }, summaryInput({ agg: { ...summaryInput().agg, inline: [f] } })),
       );
       eq("no request of any kind reaches ADO", ado.requests.length, 0);
       eq("...and nothing is claimed as posted", result.posted.length, 0);
@@ -918,7 +1068,7 @@ try {
 
     setState({ threads: [summaryWith(2)] });
     const { value: held } = await capture(() =>
-      publish(ref, { requirement: [], code: [] }, summaryInput(), known(["finder stage (endpoint unreachable)"])),
+      publish(host, { requirement: [], code: [] }, summaryInput(), known(["finder stage (endpoint unreachable)"])),
     );
     const heldBody = String(commentPatches()[0]?.body?.["content"] ?? "");
     check("a held run leaves the old marker on the PR", heldBody.includes("<!-- prloop:iteration=2 -->"), heldBody.slice(-120));
@@ -931,7 +1081,7 @@ try {
     );
 
     setState({ threads: [summaryWith(2)] });
-    const { value: clean } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const { value: clean } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     check(
       "a complete run still carries the marker forward",
       String(commentPatches()[0]?.body?.["content"] ?? "").includes("<!-- prloop:iteration=3 -->"),
@@ -941,7 +1091,7 @@ try {
     // First run on the PR, and it died: no marker is written at all, so the next run sees
     // no resume point and reviews everything rather than starting after an unread push.
     setState({ threads: [] });
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known(["finder stage (endpoint unreachable)"])));
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known(["finder stage (endpoint unreachable)"])));
     const created = contentOf(threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER)) ?? {});
     check("a first run that died records no resume point", !/<!-- prloop:iteration=\d+ -->/.test(created), created.slice(-120));
     check("...and says the next run reviews the whole PR", created.includes("reviews the whole PR"), created.slice(0, 400));
@@ -956,7 +1106,7 @@ try {
     });
     const doomed = finding({ fingerprint: "aaaa5555" });
     const { value: refused } = await capture(() =>
-      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
+      publish(host, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
     );
     eq("a 5xx on a comment is kept with its status", refused.failed[0]?.status, 500);
     eq("...and holds the resume point, because the retry can succeed", refused.watermark?.held, true);
@@ -970,7 +1120,7 @@ try {
       },
     });
     const { value: rejected } = await capture(() =>
-      publish(ref, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
+      publish(host, { requirement: [], code: [doomed] }, summaryInput({ agg: { ...summaryInput().agg, inline: [doomed] } }), known()),
     );
     eq("a 4xx on a comment is kept with its status", rejected.failed[0]?.status, 400);
     eq("...and does not hold the resume point", rejected.watermark, { record: 3, held: false });
@@ -1010,7 +1160,7 @@ try {
       ],
     });
     resetIdentityCache();
-    const { value: r } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    const { value: r } = await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     const byFp = new Map(r.dismissals.map((d) => [d.fingerprint, d.reason]));
     eq("the reviewer's own words are kept", byFp.get("ee110001"), "It's a test fixture, the loop runs twice.");
     eq("...and a reviewer who said nothing gets no invented reason", byFp.get("ee110002"), undefined);
@@ -1030,7 +1180,7 @@ try {
       threads: [dismissed(8010, "ee110010", [{ id: 8110, content: "fine, we authenticate with sk-live-abcdefghijklmnop here" }])],
     });
     resetIdentityCache();
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     const raw = fs.readFileSync(path.join(runsDir, "contoso", "Shop", "shop-api", "dismissals.jsonl"), "utf8");
     check("a credential in a reviewer's reply never reaches the store", !raw.includes("sk-live-abcdefghijklmnop"), raw.slice(-200));
     check("...and what is stored still parses", raw.trim().split("\n").every((l) => JSON.parse(l).fingerprint), "");
@@ -1094,7 +1244,7 @@ try {
     });
     resetIdentityCache();
     const { value: result, lines: _l } = await capture(() =>
-      publish(ref, { requirement: [], code: [] }, summaryInput(), known()),
+      publish(host, { requirement: [], code: [] }, summaryInput(), known()),
     );
     void _l;
     eq("a thread whose code is gone is closed", result.resolved, 1);
@@ -1108,7 +1258,7 @@ try {
     // A first run has nothing to report, and a row of zeroes is worse than silence.
     setState({ selfIdentityId: BOT, threads: [] });
     resetIdentityCache();
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     const firstRun = contentOf(threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER)) ?? {});
     check("a first run says nothing about earlier comments", !firstRun.includes("Earlier comments"), firstRun.slice(0, 300));
 
@@ -1116,7 +1266,7 @@ try {
     // state of a PR under review, and it is already visible on the PR itself.
     setState({ selfIdentityId: BOT, threads: [ours(7101, "active", "bbbb1111", 5)] });
     resetIdentityCache();
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     const untouched = contentOf(threadPosts().find((r) => contentOf(r).includes(SUMMARY_MARKER)) ?? {});
     check("...nor does a PR where nothing has been settled", !untouched.includes("Earlier comments"), untouched.slice(0, 300));
 
@@ -1131,7 +1281,7 @@ try {
     // set and both post everything in it. A lock file cannot help — libs/learnings.ts states
     // that a laptop and a cron box do not share RUNS_DIR, and that is exactly the pair that
     // collides — so the lease is state on the PR, like the resume point beside it.
-    const { claimRunLease, releaseRunLease, leaseIsLive, resetLeaseState, runId } = await import("../publish/lease");
+    const { claimRunLease, releaseRunLease, leaseIsLive, runId } = await import("../publish/lease");
     const { runMarker, setRunMarker } = await import("../publish/markers");
     const { RUN_LEASE_MS } = await import("../config");
 
@@ -1147,7 +1297,6 @@ try {
     const fresh = (partial: Partial<FakeAdoState>) => {
       setState({ selfIdentityId: BOT, ...partial });
       resetIdentityCache();
-      resetLeaseState();
     };
 
     // The clock rule, before any wire. A marker from the future is far likelier to be a live
@@ -1161,12 +1310,12 @@ try {
     // Nothing to claim into. Creating the summary here to hold a lease would mean two first
     // runs leaving two summary threads, which is the wedge the lease exists to prevent.
     fresh({ threads: [] });
-    const none = await capture(() => claimRunLease(ref, NOW));
+    const none = await capture(() => claimRunLease(host, NOW));
     eq("a PR with no prloop summary is reviewed, not claimed", none.value.acquired, true);
     eq("...and nothing is written to it", commentPatches().length + threadPosts().length, 0);
 
     fresh({ threads: [withSummary()] });
-    const first = await capture(() => claimRunLease(ref, NOW));
+    const first = await capture(() => claimRunLease(host, NOW));
     eq("a free PR is acquired", first.value.acquired, true);
     eq("...by editing the summary once", commentPatches().length, 1);
     const claimed = summaryNow();
@@ -1178,7 +1327,7 @@ try {
 
     // The case that actually happens: the other run started minutes ago and is still going.
     fresh({ threads: [withSummary(setRunMarker(summaryBody, runMarker(NOW - 60_000, "deadbeef")))] });
-    const busy = await capture(() => claimRunLease(ref, NOW));
+    const busy = await capture(() => claimRunLease(host, NOW));
     eq("a PR another run is holding is not acquired", busy.value.acquired, false);
     check("...and the reason names the run and its age", (busy.value.reason ?? "").includes("deadbeef") && (busy.value.reason ?? "").includes("60s"), busy.value.reason);
     eq("...and nothing at all is written to the PR", commentPatches().length, 0);
@@ -1186,7 +1335,7 @@ try {
     // Expired: taken over, but never silently. A review that legitimately runs longer than
     // the window gets taken over mid-flight, and this line is the only warning there is.
     fresh({ threads: [withSummary(setRunMarker(summaryBody, runMarker(NOW - RUN_LEASE_MS - 1, "deadbeef")))] });
-    const stale = await capture(() => claimRunLease(ref, NOW));
+    const stale = await capture(() => claimRunLease(host, NOW));
     eq("an expired lease is taken over", stale.value.acquired, true);
     check("...loudly, and naming the knob that fixes it", stale.lines.some((l) => l.includes("never finished") && l.includes("PRR_RUN_LEASE_MS")), stale.lines.join(" | "));
     check("...leaving only this run's marker behind", summaryNow().includes(runMarker(NOW, runId())) && !summaryNow().includes("deadbeef"), summaryNow().slice(-140));
@@ -1201,7 +1350,7 @@ try {
         comments: [{ id: 95, content: setRunMarker(summaryBody, runMarker(NOW, "deadbeef")), author: { id: "99999999-8888-7777-6666-555555555555" } }],
       }],
     });
-    const forged = await capture(() => claimRunLease(ref, NOW));
+    const forged = await capture(() => claimRunLease(host, NOW));
     eq("a lease in a comment prloop did not write is not prloop's lease", forged.value.acquired, true);
 
     // The read-back. Two runs claiming in the same instant both write; ADO serialises them,
@@ -1214,7 +1363,7 @@ try {
         c.content = setRunMarker(c.content ?? "", runMarker(NOW, "deadbeef"));
       },
     });
-    const lost = await capture(() => claimRunLease(ref, NOW));
+    const lost = await capture(() => claimRunLease(host, NOW));
     eq("a run that lost the write race stands down", lost.value.acquired, false);
     check("...saying the other run claimed it at the same moment", (lost.value.reason ?? "").includes("same moment"), lost.value.reason);
 
@@ -1222,39 +1371,108 @@ try {
     // scratch and the new body carries no marker — so what this covers is every other way a
     // run ends: a merged PR, a crash, a stage that threw.
     fresh({ threads: [withSummary()] });
-    await capture(() => claimRunLease(ref, NOW));
-    await capture(() => releaseRunLease(ref));
+    const held = (await capture(() => claimRunLease(host, NOW))).value.lease;
+    eq("a claim that wrote its marker hands the run a lease to give back", held?.id, runId());
+    await capture(() => releaseRunLease(host, held));
     eq("releasing gives the PR back", readMarkers(summaryNow()).run, undefined);
     eq("...without touching the rest of the summary", summaryNow(), summaryBody);
+    ado.reset();
+    await capture(() => releaseRunLease(host, held));
+    eq("...once: a second release makes no request", ado.requests.length, 0);
 
     // Never steal: by the time this run finishes, an expired lease may already have been
     // taken over, and stripping that marker would hand the PR to a third run.
     fresh({ threads: [withSummary()] });
-    await capture(() => claimRunLease(ref, NOW));
+    const overtaken = (await capture(() => claimRunLease(host, NOW))).value.lease;
     const rival = setRunMarker(summaryBody, runMarker(NOW, "deadbeef"));
     ado.state.threads[0]!.comments![0]!.content = rival;
-    await capture(() => releaseRunLease(ref));
+    await capture(() => releaseRunLease(host, overtaken));
     eq("a lease another run has taken over is left alone", summaryNow(), rival);
 
     // And the release that costs nothing: a run that never held the lease makes no request
     // at all, which is what lets loop.ts call it unconditionally on every exit path.
     fresh({ threads: [withSummary()] });
-    await capture(() => releaseRunLease(ref));
+    await capture(() => releaseRunLease(host, undefined));
     eq("a run that never claimed makes no request to release", ado.requests.length, 0);
+    fresh({ threads: [] });
+    eq("...and a claim with no summary to write into holds nothing", (await capture(() => claimRunLease(host, NOW))).value.lease, undefined);
+
+    // Taken over mid-review: this run's lease ran out, another run claimed the PR, and this
+    // one is about to post. It must not — its comments would sit beside the other run's, and
+    // whichever summary lands second overwrites the other's resume point.
+    fresh({ threads: [withSummary()] });
+    const outlived = (await capture(() => claimRunLease(host, NOW))).value.lease;
+    ado.state.threads[0]!.comments![0]!.content = setRunMarker(summaryBody, runMarker(NOW + 1, "deadbeef"));
+    ado.reset();
+    const late = await capture(() =>
+      publish(host, { requirement: [], code: [finding({ fingerprint: "late0001" })] }, summaryInput(), { ...known(), ...(outlived ? { lease: outlived } : {}) }),
+    );
+    eq("a run taken over before it posted posts nothing", threadPosts().length + commentPatches().length, 0);
+    check("...and says who took over, as a reason the review is incomplete", late.value.gaps.some((g) => g.includes("deadbeef") && g.includes("took this pull request over")), JSON.stringify(late.value.gaps));
+    eq("...with its findings reported as not posted", late.value.failed.map((f) => f.finding.fingerprint), ["late0001"]);
 
     // The normal release, in the one place it actually happens.
     fresh({ threads: [withSummary()] });
-    await capture(() => claimRunLease(ref, NOW));
-    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput(), known()));
+    await capture(() => claimRunLease(host, NOW));
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput(), known()));
     eq("publishing the review is what gives the lease back", readMarkers(summaryNow()).run, undefined);
     check("...in the same request that posts the summary", summaryNow().includes("<!-- prloop:iteration=3 -->"), summaryNow().slice(-140));
 
     fresh({ threads: [] });
+  }
+
+  section("any host that keeps the contract will do: the same review against an in-memory one");
+  {
+    // Every other section drives publish() through the ADO host and a fake server, which pins
+    // the wire format. This one drives it through scripts/fakes/host.ts, which has no wire at
+    // all: if publishing, the resume point or the lease needed anything from Azure DevOps
+    // beyond libs/host.ts, it would fail here and nowhere else.
+    const { memoryHost } = await import("./fakes/host");
+    const { resolveLastReviewedIteration } = await import("../publish/lifecycle");
+    const { claimRunLease, releaseRunLease } = await import("../publish/lease");
+    const BOT = "99999999-8888-7777-6666-555555555555";
+    const { host: mem, pr } = memoryHost({ ctx, selfId: BOT });
+    const bug = finding({ fingerprint: "e0e00001" });
+    const input = summaryInput({ agg: { ...summaryInput().agg, inline: [bug] } });
+    const created = () => pr.writes.filter((w) => w.startsWith("create"));
+    const summaryText = () =>
+      String(pr.threads.flatMap((t) => t.comments ?? []).find((c) => readMarkers(c.content).summary)?.content ?? "");
+
+    const first = await capture(() => publish(mem, { requirement: [], code: [bug] }, input, known()));
+    eq("the first run posts the finding and a summary", created().length, 2);
+    eq("...reports the finding as posted", first.value.posted.map((f) => f.fingerprint), ["e0e00001"]);
+    const inline = pr.threads.find((t) => t.threadContext);
+    eq("...on its line", inline?.threadContext?.rightFileStart?.line, 11);
+    check("...carrying its fingerprint", readMarkers(inline?.comments?.[0]?.content).fingerprints.includes("e0e00001"));
+    eq("...and fails the status over it", pr.statuses.map((s) => s.state), ["failed"]);
+    eq("the resume point reads back off it", await capture(() => resolveLastReviewedIteration(mem)).then((r) => r.value), 3);
+
+    pr.writes.length = 0;
+    const second = await capture(() => publish(mem, { requirement: [], code: [bug] }, input, known()));
+    eq("a second run posts nothing new", created(), []);
+    eq("...knows the finding is already there", second.value.alreadyPosted.map((f) => f.fingerprint), ["e0e00001"]);
+    eq("...and edits the one summary in place", pr.writes.filter((w) => w.startsWith("update")).length, 1);
+
+    const before = summaryText();
+    const claim = (await capture(() => claimRunLease(mem))).value;
+    check("the lease is taken in the summary the review wrote", claim.acquired && claim.lease !== undefined, JSON.stringify(claim));
+    check("...as a run marker in it", readMarkers(summaryText()).run !== undefined, summaryText().slice(-160));
+    await capture(() => releaseRunLease(mem, claim.lease));
+    eq("...and given back, leaving the summary byte for byte as it was", summaryText(), before);
+
+    // The other host prloop ships: a local branch has nowhere to write, and says so rather
+    // than pretending a write landed.
+    const { localHost } = await import("../git/host");
+    const local = localHost({ repo: runsDir, base: "main", head: "feature" });
+    eq("a local review has no threads", await local.threads(), []);
+    eq("...no identity", await local.selfId(), undefined);
+    eq("...and nothing makes its branch terminal", local.terminal(ctx.pr), undefined);
+    const refused = await local.createThread({ content: "x" }).then(() => "written", (e: Error) => e.message);
+    eq("...and refuses a write", refused, "a local review has no pull request to write to");
   }
 } finally {
   await ado.close();
   if (runsDir) fs.rmSync(runsDir, { recursive: true, force: true });
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

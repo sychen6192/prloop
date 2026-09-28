@@ -2,9 +2,8 @@
 // merge — casting a -10 vote fights with reviewer policies and reads as hostile.
 import { adoPost, prBase } from "./client";
 import { STATUS_GENRE, STATUS_NAME } from "../config";
+import type { StatusState } from "../libs/host";
 import type { PrRef } from "../libs/types";
-
-export type StatusState = "notSet" | "pending" | "succeeded" | "failed" | "error" | "notApplicable";
 
 export async function postStatus(
   ref: PrRef,

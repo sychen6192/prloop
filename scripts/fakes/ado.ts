@@ -17,6 +17,7 @@ export interface FakeComment {
   content?: string;
   isDeleted?: boolean;
   author?: { displayName?: string; id?: string };
+  usersLiked?: Array<{ id?: string }>;
 }
 
 export interface FakeThread {
@@ -42,6 +43,12 @@ export interface FakeAdoState {
   pr: Record<string, unknown>;
   iterations: Array<Record<string, unknown>>;
   changePages: ChangePage[];
+  /**
+   * The pages for one iteration compared against another, when set — used instead of
+   * changePages. A PR with more than one push answers `$compareTo` differently per push, and
+   * an incremental review is exactly the question of which files that answer contains.
+   */
+  changesFor?: (iterationId: number, compareTo: number) => ChangePage[];
   threads: FakeThread[];
   /** Work item ids the PR links to (the dedicated /workitems endpoint, not the PR body). */
   workItemRefs: number[];
@@ -51,6 +58,11 @@ export interface FakeAdoState {
   items: Record<string, { status?: number; body: string; contentType?: string }>;
   /** Blob object id → its bytes. */
   blobs: Record<string, string>;
+  /**
+   * What GET …/pullrequests lists, for a project or one repository (ado/discover.ts). Paged by
+   * `$top` / `$skip`; `searchCriteria.status` is recorded but not applied — these are all active.
+   */
+  activePrs?: Array<{ pullRequestId: number; isDraft?: boolean; repository: { name: string; project?: { name: string } } }>;
   /**
    * Lets a test make one thread POST fail: return the status to reject it with, or
    * undefined to accept. A comment that cannot be posted is a first-class outcome
@@ -133,6 +145,15 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
     requests.push({ method, path, query, body });
 
     // --- pull request itself ---------------------------------------------------------
+    const listing = /\/_apis\/git\/(?:repositories\/([^/]+)\/)?pullrequests$/i.exec(path);
+    if (method === "GET" && listing) {
+      const repo = listing[1] === undefined ? undefined : decodeURIComponent(listing[1]);
+      const all = (state.activePrs ?? []).filter((p) => repo === undefined || p.repository.name === repo);
+      const skip = Number(query["$skip"] ?? 0);
+      const top = Number(query["$top"] ?? 100);
+      const value = all.slice(skip, skip + top);
+      return sendJson(res, 200, { count: value.length, value });
+    }
     if (method === "GET" && /\/pullRequests\/\d+$/.test(path)) {
       return sendJson(res, 200, state.pr);
     }
@@ -140,12 +161,14 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       return sendJson(res, 200, { count: state.iterations.length, value: state.iterations });
     }
     // --- iteration changes, paged ----------------------------------------------------
-    if (method === "GET" && /\/iterations\/\d+\/changes$/.test(path)) {
+    const changes = /\/iterations\/(\d+)\/changes$/.exec(path);
+    if (method === "GET" && changes) {
       const skip = Number(query["$skip"] ?? 0);
+      const pages = state.changesFor?.(Number(changes[1]), Number(query["$compareTo"] ?? 0)) ?? state.changePages;
       // Keyed by the skip each page declares, so a client that ignores nextSkip and asks
       // again from 0 gets page one forever instead of silently "passing".
       let cursor = 0;
-      for (const page of state.changePages) {
+      for (const page of pages) {
         if (cursor === skip) return sendJson(res, 200, page);
         if (page.nextSkip === undefined) break;
         cursor = page.nextSkip;
@@ -175,7 +198,13 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       const thread: FakeThread = {
         id: nextThreadId++,
         status: (body?.["status"] as string | undefined) ?? "active",
-        comments: incoming.map((c) => ({ id: nextCommentId++, content: c.content ?? "" })),
+        // Stamped with the identity the credential authenticates as, as ADO does: prloop's
+        // identity checks read it back off its own comments on the next run.
+        comments: incoming.map((c) => ({
+          id: nextCommentId++,
+          content: c.content ?? "",
+          ...(state.selfIdentityId === undefined ? {} : { author: { id: state.selfIdentityId, displayName: "prloop" } }),
+        })),
         threadContext: body?.["threadContext"] as FakeThread["threadContext"],
       };
       state.threads.push(thread);
@@ -221,6 +250,15 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       if (content === undefined) return sendJson(res, 404, { message: "blob not found" });
       res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": Buffer.byteLength(content) });
       return void res.end(content);
+    }
+    if (method === "GET" && /\/items$/.test(path) && query["scopePath"] !== undefined) {
+      // A directory listing: the files under it, or only its own with recursionLevel=OneLevel.
+      // An empty or absent directory answers 404, as ADO does for a path it does not have.
+      const prefix = `${(query["scopePath"] ?? "").replace(/\/$/, "")}/`;
+      const deep = query["recursionLevel"] === "Full";
+      const under = Object.keys(state.items).filter((p) => p.startsWith(prefix) && (deep || !p.slice(prefix.length).includes("/")));
+      if (under.length === 0) return sendJson(res, 404, { message: "TF401174: the item does not exist" });
+      return sendJson(res, 200, { count: under.length, value: under.map((p) => ({ path: p, isFolder: false, gitObjectType: "blob" })) });
     }
     if (method === "GET" && /\/items$/.test(path)) {
       const item = state.items[query["path"] ?? ""];

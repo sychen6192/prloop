@@ -4,20 +4,16 @@
 // heterogeneous fleet running in parallel — the only thing that changes is the fan-out,
 // not the parsing or validation.
 import {
-  FINDER_CATEGORIES,
   FINDER_MODELS,
   FINDER_PROMPT_SUFFIX_BY_MODEL,
   FINDER_SEED,
-  SEVERITIES,
-  severityRank,
-  type Severity,
 } from "../config";
+import { FINDER_CATEGORIES, SEVERITIES, severityRank, type Severity } from "../libs/taxonomy";
 import { arrayField, parseJsonObject, salvageArrayItems } from "../libs/json";
 import { log } from "../libs/log";
 import { newRunSeed, seedFor } from "../libs/prng";
 import { loadRules, renderRules, ruleHeadings, selectRules, type Rule } from "../libs/rules";
-import type { ModelRunner, RawFinding } from "../libs/types";
-import { isTruncation } from "../models/runner";
+import { CLAIM_KINDS, type ClaimKind, type ModelRunner, type RawFinding } from "../libs/types";
 import { FINDINGS_SCHEMA } from "../models/schemas";
 import { buildFinderPrompts, finderSystemFor, type FinderPromptInput, type RuleHeadingGroup } from "../prompts/finder";
 
@@ -156,6 +152,8 @@ export function checkFinding(v: unknown, knownCites: ReadonlySet<string> = DEFAU
     if (severityRank(severity) < severityRank(cap)) severity = cap;
   }
 
+  const checkable = claimOf(str("claim_kind"), str("claim_subject"));
+
   return {
     finding: {
       category,
@@ -170,8 +168,24 @@ export function checkFinding(v: unknown, knownCites: ReadonlySet<string> = DEFAU
       evidence: str("evidence"),
       suggested_fix: str("suggested_fix"),
       cites,
+      ...checkable,
     },
   };
+}
+
+/**
+ * A checkable claim, or nothing. The pair is a hint the pipeline acts on — a contradicted
+ * claim drops the finding — so a malformed one is dropped instead of guessed at: the
+ * finding stays, unchecked, exactly as it would without the fields.
+ */
+export function claimOf(kind: string | undefined, subject: string | undefined): { claim_kind?: ClaimKind; claim_subject?: string } {
+  const k = kind?.trim().toLowerCase() ?? "";
+  const s = subject?.trim().replace(/^`+|`+$/g, "") ?? "";
+  if (!(CLAIM_KINDS as readonly string[]).includes(k) || !s || s.length > 300 || /\s/.test(s)) return {};
+  if (k === "missing-file") return { claim_kind: k, claim_subject: s.replace(/^\.\//, "") };
+  // `Util.normalize`, `Foo::bar`, `bar()`: the name a lookup can search for is the last part.
+  const name = s.replace(/\(\)$/, "").split(/\.|::|#/).pop() ?? "";
+  return /^[A-Za-z_$][\w$]*$/.test(name) ? { claim_kind: k as ClaimKind, claim_subject: name } : {};
 }
 
 /** checkFinding without the reason: the finding, or undefined when it was dropped. */
@@ -271,7 +285,9 @@ async function runOne(
     log(`[FAIL] finder ${model} call failed: ${res.error}`);
     // The partial text is kept whatever the failure was: runs/ is where a failed call is
     // diagnosed, and an empty *-raw.txt says nothing about what the model was doing.
-    const salvaged = isTruncation(res.error)
+    // Only a completion cut at the token limit is worth reading: it usually holds a run of
+    // complete items before the cut (salvageArrayItems).
+    const salvaged = res.errorKind === "truncated"
       ? salvageFindings(model, res.text, "truncated", knownCites)
       : { findings: [], rejected: 0 };
     return { model, ...salvaged, error: res.error, raw: res.text, seed, prompt };
@@ -387,6 +403,9 @@ export async function runFinders(
     }
   }
   log(`finder file order: run seed ${runSeed}${models.length > 1 ? `, one permutation per finder` : ""}`);
+  if (first.wholeFiles.length > 0) {
+    log(`${first.wholeFiles.length} short file(s) shown whole, with room to spare (PRR_WHOLE_FILE_MAX_LINES): ${first.wholeFiles.join(", ")}`);
+  }
 
   // The cost, said before it is spent rather than found on a bill. Chunking is linear in
   // requests and the files it buys are the ones the budget was refusing, so the line names

@@ -18,6 +18,8 @@ export interface ExecResult {
    * from "it ran and exited 1", and callers that suggest an install need to tell them apart.
    */
   spawnFailed?: true;
+  /** The output line that matched RunExtras.killOn, when that is what ended the child. */
+  killedOn?: string;
 }
 
 /**
@@ -38,6 +40,18 @@ export interface RunExtras {
   onTimeout?: () => void;
   /** Grace between the SIGTERM that ends a timed-out tree and the SIGKILL that insists. */
   killEscalationMs?: number;
+  /**
+   * Variables set on top of the scrubbed environment. For configuration the child must see,
+   * never for credentials: those are exactly what the scrub exists to keep out.
+   */
+  env?: Record<string, string>;
+  /**
+   * A line of output that means the run must not go on — matched on stdout and stderr as each
+   * line arrives, and answered with an immediate SIGKILL of the whole tree, not a grace
+   * period: by the time a child announces it is doing the wrong thing, the next thing it does
+   * is the wrong thing.
+   */
+  killOn?: RegExp;
 }
 
 // Roughly what execFile's maxBuffer used to cap (that counted bytes, this counts decoded
@@ -111,7 +125,7 @@ export function run(
         cwd,
         // The static tools run inside a checkout of the PR's source branch and execute
         // its code (eslint configs, Maven plugins); they never get our credentials.
-        env: scrubbedEnv(),
+        env: { ...scrubbedEnv(), ...extras.env },
         // stdin is closed, not piped, unless the caller has something to write: a tool that
         // decides to prompt gets EOF immediately instead of blocking on a read nobody will
         // ever answer.
@@ -142,6 +156,7 @@ export function run(
     let stderr = "";
     let overflowed = false;
     let timedOut = false;
+    let killedOn: string | undefined;
     let spawnError: string | undefined;
     let exitCode: number | undefined;
     let exitSignal: NodeJS.Signals | null = null;
@@ -149,10 +164,18 @@ export function run(
     let outLineBuf = "";
     let errLineBuf = "";
 
-    const feedLines = (buf: string, chunk: string, sink: (line: string) => void): string => {
+    const watch = (line: string): void => {
+      if (killedOn !== undefined || !extras.killOn?.test(line)) return;
+      killedOn = line.trim();
+      killTree(child, "SIGKILL");
+    };
+    const feedLines = (buf: string, chunk: string, sink?: (line: string) => void): string => {
       const parts = (buf + chunk).split("\n");
       const rest = parts.pop() ?? "";
-      for (const line of parts) sink(line);
+      for (const line of parts) {
+        watch(line);
+        sink?.(line);
+      }
       return rest;
     };
 
@@ -162,15 +185,16 @@ export function run(
       return buf + chunk.slice(0, Math.max(0, MAX_OUTPUT_CHARS - buf.length));
     };
     child.stdout?.setEncoding("utf8");
+    const lines = extras.killOn !== undefined;
     child.stdout?.on("data", (c: string) => {
       stdout = cap(stdout, c);
-      if (extras.onStdoutLine) outLineBuf = feedLines(outLineBuf, c, extras.onStdoutLine);
+      if (extras.onStdoutLine || lines) outLineBuf = feedLines(outLineBuf, c, extras.onStdoutLine);
       if (overflowed) killTree(child, "SIGKILL");
     });
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (c: string) => {
       stderr = cap(stderr, c);
-      if (extras.onStderrLine) errLineBuf = feedLines(errLineBuf, c, extras.onStderrLine);
+      if (extras.onStderrLine || lines) errLineBuf = feedLines(errLineBuf, c, extras.onStderrLine);
       if (overflowed) killTree(child, "SIGKILL");
     });
 
@@ -202,8 +226,14 @@ export function run(
       if (drainTimer) clearTimeout(drainTimer);
 
       // Whatever arrived without a closing newline is still output the caller asked to see.
-      if (outLineBuf !== "" && extras.onStdoutLine) extras.onStdoutLine(outLineBuf);
-      if (errLineBuf !== "" && extras.onStderrLine) extras.onStderrLine(errLineBuf);
+      if (outLineBuf !== "") {
+        watch(outLineBuf);
+        extras.onStdoutLine?.(outLineBuf);
+      }
+      if (errLineBuf !== "") {
+        watch(errLineBuf);
+        extras.onStderrLine?.(errLineBuf);
+      }
 
       // Named failures first, so a caller that truncates stderr still shows the reason.
       const notes: string[] = [];
@@ -214,6 +244,7 @@ export function run(
           `${cmd} produced more than ${MAX_OUTPUT_CHARS} characters of output; it was truncated and killed`,
         );
       }
+      if (killedOn !== undefined) notes.push(`${cmd} was killed on the output line: ${killedOn}`);
       // Nothing useful can still arrive, and a survivor holding these pipes open would keep
       // this process's event loop alive long after the review finished.
       child.stdout?.destroy();
@@ -222,7 +253,7 @@ export function run(
 
       // execFile's contract, kept: a real exit status when there is one, 1 for every other
       // way of failing (killed by a signal, never started, killed by us).
-      const failed = spawnError !== undefined || timedOut || overflowed;
+      const failed = spawnError !== undefined || timedOut || overflowed || killedOn !== undefined;
       resolve({
         stdout,
         stderr: [...notes, stderr].filter((s) => s !== "").join("\n"),
@@ -230,6 +261,7 @@ export function run(
         signal: exitSignal,
         ...(timedOut ? { timedOut: true } : {}),
         ...(spawnError === undefined ? {} : { spawnFailed: true as const }),
+        ...(killedOn === undefined ? {} : { killedOn }),
       });
     }
 

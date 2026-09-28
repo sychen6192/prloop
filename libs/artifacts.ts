@@ -2,6 +2,7 @@
 // model context — that's what makes a run reproducible and auditable after the fact
 // (design principle: state in artifacts, not context).
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RUNS_DIR, RUNS_KEEP, RUNS_MAX_AGE_DAYS } from "../config";
@@ -26,6 +27,17 @@ export const PRLOOP_VERSION = (() => {
     return "0.0.0";
   }
 })();
+
+/**
+ * Creates `dir` and any missing parents readable by their owner only. Everything under
+ * runs/ is either the reviewed source — prompts, diffs, raw model output — or a record of
+ * what a team's reviewers rejected, and a default 0755 left all of it readable by every
+ * account on a shared build agent. Directories that already exist keep their mode: a
+ * deployment that shares runs/ on purpose has chosen that. Windows ignores the mode.
+ */
+export function mkdirPrivate(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
 
 function timestamp(): string {
   const d = new Date();
@@ -159,6 +171,8 @@ export interface ResultSummaryInput {
   counts: { raw: number; anchored: number; survived: number; inline: number; degraded: number };
   tokens: { calls: number; promptTokens: number; completionTokens: number };
   durationSec: number;
+  /** Wall time per stage, in ms. Stages that run side by side overlap, so they do not sum. */
+  timingsMs?: Record<string, number>;
   /**
    * Which pull request, which iteration, which settings. Without it the file could only be
    * identified by the directory path it happens to sit in, so any cross-run reporting — a
@@ -179,6 +193,8 @@ export interface ResultSummaryInput {
   fatal?: string;
   /** Why the run reviewed nothing, e.g. a pull request that has already merged. */
   skippedReason?: string;
+  /** What produced the run (libs/stamp.ts): commit, and hashes of prompts, rules, fleet, settings. */
+  stamp?: unknown;
 }
 
 /**
@@ -197,7 +213,9 @@ export function buildResultSummary(input: ResultSummaryInput): Record<string, un
     counts: { ...input.counts },
     tokens: { ...input.tokens },
     durationSec: input.durationSec,
+    ...(input.timingsMs === undefined ? {} : { timingsMs: { ...input.timingsMs } }),
     version: PRLOOP_VERSION,
+    ...(input.stamp === undefined ? {} : { stamp: input.stamp }),
   };
 }
 
@@ -210,7 +228,7 @@ export function buildResultSummary(input: ResultSummaryInput): Record<string, un
  * result.json at the end) must not re-open the log sink it already has.
  */
 export function openRunDir(dir: string, tee = false): RunDir {
-  fs.mkdirSync(dir, { recursive: true });
+  mkdirPrivate(dir);
   // Retention runs here, after the new directory exists, so the run being written is always
   // the newest thing in the PR's directory and can never be the one deleted.
   pruneIterations(path.dirname(dir), path.basename(dir));
@@ -349,4 +367,37 @@ export function createSkipDir(ref: PrRef): RunDir {
   const dir = openRunDir(path.join(prDir(ref), "skipped"), true);
   current = dir.dir;
   return dir;
+}
+
+/**
+ * Why the runs directory will not outlive this job, when it will not.
+ *
+ * Dismissal learning (dismissals.jsonl), the outcome ledger calibrate reads and every run's
+ * artifacts live under RUNS_DIR, and its default is inside prloop's own checkout — which in a
+ * pipeline is the agent's workspace. A hosted agent starts empty every job, a pool of
+ * self-hosted ones spreads jobs across machines, and a clean setting wipes it: every
+ * reviewer's "won't fix" is forgotten by the next run, silently, and the same comments come
+ * back. Said loudly because nothing else would ever say it.
+ */
+export function runsDirWarning(env: NodeJS.ProcessEnv = process.env, runsDir: string = RUNS_DIR): string | undefined {
+  const dir = path.resolve(runsDir);
+  // Set on purpose inside a workspace, it is taken to be restored and saved around the job, as
+  // examples/azure-pipelines/ does with the Cache task; the default is the case nobody chose.
+  const chosen = Boolean(env["PRR_RUNS_DIR"]);
+  const inside = (root: string | undefined) =>
+    root !== undefined && root !== "" && (dir === path.resolve(root) || dir.startsWith(path.resolve(root) + path.sep));
+  const ci = env["TF_BUILD"] ? "Azure Pipelines" : env["GITHUB_ACTIONS"] ? "GitHub Actions" : env["GITLAB_CI"] ? "GitLab CI" : undefined;
+  const workspaces = [
+    env["AGENT_BUILDDIRECTORY"], env["PIPELINE_WORKSPACE"], env["BUILD_SOURCESDIRECTORY"], env["AGENT_TEMPDIRECTORY"],
+    env["GITHUB_WORKSPACE"], env["RUNNER_TEMP"], env["CI_PROJECT_DIR"],
+  ];
+  const fix =
+    "the reviewers' dismissals (dismissals.jsonl), the outcome ledger and the run artifacts are lost with it, " +
+    "and dismissed comments come back. Point PRR_RUNS_DIR at persistent storage, or restore and save it " +
+    "around the job (examples/azure-pipelines/ caches it)";
+  if (ci && !chosen && workspaces.some(inside)) {
+    return `the runs directory (${dir}) defaults to prloop's own checkout, inside the ${ci} job's workspace, which does not outlive the job: ${fix}`;
+  }
+  if (inside(os.tmpdir())) return `PRR_RUNS_DIR (${dir}) is under the temporary directory: ${fix}`;
+  return undefined;
 }

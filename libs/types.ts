@@ -1,5 +1,5 @@
 // Shared types (SSOT: all other modules import from here).
-import type { Severity } from "../config";
+import type { Severity } from "./taxonomy";
 
 // --- Azure DevOps intake ---
 
@@ -175,7 +175,16 @@ export interface RawFinding {
   // invokes. Structural teeth for the rules' citation contract — a maintainability finding
   // that cites nothing is capped to low severity at validation (gates/finder.ts).
   cites?: string;
+  // A claim that code can settle, and what it is about: "X is never used" names X. Checked
+  // before the skeptic (gates/claims.ts); a lookup that contradicts it drops the finding.
+  claim_kind?: ClaimKind;
+  claim_subject?: string;
 }
+
+// The claims a lookup can settle — Kodus's claimKind. "X is never used" when a file the
+// model was not shown uses X is the commonest hallucination of a reviewer that sees a diff.
+export const CLAIM_KINDS = ["unused", "undefined", "missing-file", "duplicate"] as const;
+export type ClaimKind = (typeof CLAIM_KINDS)[number];
 
 // --- Adversarial verification ---
 
@@ -220,6 +229,10 @@ export interface AnchoredFinding extends RawFinding {
   // merge may raise a model finding's severity (mergeInto) — a triage-tier tool rating an
   // error-level lint rule "high" is a policy, not a measurement of impact.
   tier?: "fact" | "triage";
+  // Static-tool findings only: `tool:ruleId`. Structured so calibrate can report how often a
+  // rule's comments were acted on — "ruff:SIM102 is ignored everywhere" is only a finding if
+  // the rule is a field and not a phrase inside the evidence text.
+  rule?: string;
   anchor?: Anchor;
   anchorFailure?: AnchorFailure;
   // Stable identity across pushes, for dedup against already-posted threads.
@@ -237,8 +250,23 @@ export interface AnchoredFinding extends RawFinding {
   // open: refusing it would delete findings on a single-family deployment, which is most
   // of them), but the reader is told the check was weaker than it looks.
   skepticSameFamily?: boolean;
+  // Model findings only, set when they are anchored. The anchored lines touch nothing this
+  // change added or removed: finalize files the finding as pre-existing rather than posting it
+  // on a line the author did not write.
+  untouched?: boolean;
+  // Incremental runs only, for a finding filed as pre-existing: true when an earlier push of
+  // this pull request wrote those lines (a finding the earlier review missed), false when they
+  // predate the pull request, absent when the whole PR's diff could not be read.
+  earlierPush?: boolean;
+  // Model findings only: the suppression marker on or just above the anchored lines, by name
+  // (`# noqa`, `eslint-disable`, libs/suppression.ts) — a check the author already silenced.
+  silencedBy?: string;
+  // Set by the fix check (gates/static.ts checkFixes): the fact-tier tool its suggested fix
+  // typechecked with, or — the fix removed — what the fix broke.
+  fixCheckedBy?: string;
+  fixDropped?: string;
   // Why this finding did not reach an inline comment, when it didn't.
-  suppressedBy?: "severity" | "cap" | "no-corroboration" | "dismissed";
+  suppressedBy?: "severity" | "cap" | "no-corroboration" | "dismissed" | "pre-existing" | "silenced";
 }
 
 // --- Model runner (the interface that keeps the core free of SDK imports) ---
@@ -277,12 +305,52 @@ export interface ChatResponse {
   // mid-output (a truncated completion, a timed-out CLI run) keeps what arrived so the
   // artifacts show it — the pair is still a failure, never an answer to parse.
   error?: string;
+  // What kind of failure `error` is. Retries, streaming fallback and truncation salvage decide
+  // on this, never on the message's wording, which is written for people and changes.
+  errorKind?: ModelErrorKind;
+  // The HTTP status of an "http" failure.
+  status?: number;
   // What the endpoint's `Retry-After` asked for on a 429/503, in ms. The retry layer waits
   // at least this long: without it the backoff guesses, and usually retries straight back
   // into the window the endpoint just told us was closed.
   retryAfterMs?: number;
 }
 
+/**
+ * Why a model call failed. Four of them are the model's answer being unusable — the same
+ * question would get the same answer, so they are never retried: truncated (cut at the token
+ * limit), reasoning-only (the budget went on thinking), empty, and not-json (a body that is not
+ * JSON at all). "http" is retried unless it is a 4xx other than 408 and 429: those are the
+ * request being refused. Everything else — the connection, the deadline, a stream that went silent or
+ * was cut, an error the API reported in-band, a CLI that could not start or died — may well
+ * succeed on a second attempt.
+ */
+export type ModelErrorKind =
+  | "truncated"
+  | "reasoning-only"
+  | "empty"
+  | "not-json"
+  | "http"
+  | "api"
+  | "transport"
+  | "timeout"
+  | "stalled"
+  | "stream-cut"
+  | "process";
+
+/** What a runner's calls cost: one logical call each, every attempt's usage added up. */
+export interface TokenTotals {
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+}
+
 export interface ModelRunner {
   chat(req: ChatRequest): Promise<ChatResponse>;
+  /**
+   * Everything this runner's calls have cost so far. The runner a review is given is that
+   * review's, so these are the run's totals; a test double may leave it out, and counts as
+   * having spent nothing.
+   */
+  tokens?(): TokenTotals;
 }

@@ -20,6 +20,7 @@ import { DISMISSAL_HINT_THRESHOLD, RUNS_DIR } from "../config";
 import { logVerbose } from "./log";
 import { redactSecrets } from "./redact";
 import type { PrRef } from "./types";
+import { mkdirPrivate } from "./artifacts";
 
 export interface StoredDismissal {
   fingerprint: string;
@@ -83,7 +84,7 @@ export function recordDismissals(
   if (fresh.length === 0) return 0;
 
   const p = learningsPath(ref, root);
-  fs.mkdirSync(path.dirname(p), { recursive: true });
+  mkdirPrivate(path.dirname(p));
   const now = new Date().toISOString();
   const lines = fresh
     .map((r) => JSON.stringify({ ...r, prId: ref.prId, recordedAt: now } satisfies StoredDismissal))

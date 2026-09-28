@@ -65,10 +65,11 @@ export class FileIndex {
 
   /**
    * Resolve a foreign path. Tiers, tried in order, each accepting only a unique hit:
-   * exact → case-insensitive → suffix → basename → originalPath (renames are often cited
-   * by their old name). A tier with multiple hits falls through — a stricter tier's
-   * ambiguity must not shadow a looser tier's unique match — and if nothing ends up
-   * unique, the first ambiguity is what the failure reports.
+   * exact → exact without git's a/ or b/ side prefix → case-insensitive → suffix →
+   * basename → originalPath (renames are often cited by their old name). A tier with
+   * multiple hits falls through — a stricter tier's ambiguity must not shadow a looser
+   * tier's unique match — and if nothing ends up unique, the first ambiguity is what the
+   * failure reports.
    */
   resolve(rawPath: string): ResolveResult {
     const want = normalizePath(rawPath);
@@ -76,6 +77,14 @@ export class FileIndex {
 
     const exact = this.byExactPath.get(want);
     if (exact) return { fd: exact };
+
+    // A path copied from the diff header carries git's side prefix. Only ever tried when
+    // the path as written is not itself a changed file, so a real top-level a/ or b/
+    // directory still wins; without it such a path fell through to the basename tier, which
+    // fails on any PR where two changed files share a name.
+    const sided = /^[ab]\/(.+)$/.exec(want)?.[1];
+    const unsided = sided === undefined ? undefined : this.byExactPath.get(sided);
+    if (unsided) return { fd: unsided };
 
     let ambiguous: { tier: string; count: number } | undefined;
     const unique = (hits: Array<{ key: string; fd: FileDiff }>, tier: string): FileDiff | undefined => {

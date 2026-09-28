@@ -13,43 +13,27 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  BATCH_CHILD_ENV,
   FATAL_STREAK_LIMIT,
   batchExitCode,
   childCommand,
+  childEnv,
   describeResult,
   forwardedArgs,
+  overridesFor,
   parseBatchList,
+  parseRepoOverrides,
   readBatchList,
   renderBatchReport,
   runBatch,
 } from "../libs/batch";
+import { runsDirWarning } from "../libs/artifacts";
+import { KNOWN_KEYS } from "../config";
 import { parseArgs } from "../libs/cli";
 import { exitCodeFor } from "../orchestrator";
 import type { AnchoredFinding, CriterionCheck, ReqVerdict, RequirementResult } from "../libs/types";
 import type { AggregateResult } from "../gates/aggregate";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
+import { check, eq, report, section } from "./selftest/harness";
 
 const URL_ARG = "https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4821";
 
@@ -164,7 +148,6 @@ section("exit status: the only part of a run that CI reads");
     exitCodeFor({ agg: agg([]), req: { workItems: [], criteria: [], extras: [], skipped: "no linked work item" }, incomplete: [] }), 0);
 }
 
-
 section("--batch: review a list of pull requests and keep the exit codes");
 {
   // The README's own daily job is `while read -r url; do prloop "$url" || true; done`, and
@@ -275,5 +258,100 @@ section("--batch: review a list of pull requests and keep the exit codes");
   }
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+section("--active, per-repository settings and parallel batches: the unattended mode");
+{
+  const PROJECT = "https://dev.azure.com/contoso/Shop";
+  eq("--active takes a project or repository URL", parseArgs(["--active", PROJECT, "--since", "auto"]).active, PROJECT);
+  eq("...which is never mistaken for a pull request URL", parseArgs(["--active", PROJECT]).url, undefined);
+  check("...and must be given one", (parseArgs(["--active"]).error ?? "").includes("--active takes a project"), "");
+  check("...not beside a URL", (parseArgs([URL_ARG, "--active", PROJECT]).error ?? "").includes("do not also pass a URL or --batch"), "");
+  check("...nor beside --batch", (parseArgs(["--batch", "p.txt", "--active", PROJECT]).error ?? "").includes("do not also pass"), "");
+  eq("--active and its URL are not forwarded to the children", forwardedArgs(["--active", PROJECT, "--since", "auto", "--dry-run"]), ["--since", "auto", "--dry-run"]);
+
+  const known = new Set(KNOWN_KEYS.map((k) => k.name));
+  const overrides = parseRepoOverrides(
+    JSON.stringify({ "shop-api": { PRR_FINDER_MODELS: "a,b,c", PRR_MAX_INLINE_COMMENTS: 4 }, "Shop/Shop-Web": { PRR_RISK_TIERS: true } }),
+    known,
+  );
+  const ref = (repoId: string) => ({ baseUrl: "", org: "contoso", project: "Shop", repoId, prId: 1 });
+  eq("a repository's settings, numbers and booleans as the text a setting is", overridesFor(overrides, ref("shop-api")), { PRR_FINDER_MODELS: "a,b,c", PRR_MAX_INLINE_COMMENTS: "4" });
+  eq("...matched as project/repo, without case", overridesFor(overrides, ref("shop-web")), { PRR_RISK_TIERS: "true" });
+  eq("...and nothing for a repository not named", overridesFor(overrides, ref("billing")), {});
+  const refused = (json: string) => {
+    try {
+      parseRepoOverrides(json, known);
+      return "";
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  };
+  check("a misspelled setting is refused before anything runs", refused('{"a": {"PRR_FINDER_MODEL": "x"}}').includes("PRR_FINDER_MODEL is not a prloop setting"));
+  check("...every problem at once", refused('{"a": {"PRR_X": "1", "PRR_Y": "2"}}').includes("PRR_Y"));
+  check("the runs directory is not per repository: the batch reads each child's result there", refused('{"a": {"PRR_RUNS_DIR": "/x"}}').includes("cannot be set per repository"));
+  check("...and a file that is not an object of objects is refused", refused("[1]").includes("must be a JSON object") && refused('{"a": 1}').includes("expected an object"));
+
+  // Each child's share of the whole-process limits, never all of it.
+  const env = childEnv({ PATH: "/bin" }, { PRR_FINDER_MODELS: "a" }, 3, { llm: 8, ado: 6 });
+  eq("a child runs with its repository's settings", env["PRR_FINDER_MODELS"], "a");
+  eq("...and a third of each limit, three at a time", [env["PRR_LLM_CONCURRENCY"], env["PRR_ADO_CONCURRENCY"]], ["2", "2"]);
+  eq("...never less than one", childEnv({}, {}, 16, { llm: 8, ado: 6 })["PRR_LLM_CONCURRENCY"], "1");
+  eq("...a repository's own limit shared the same way", childEnv({}, { PRR_LLM_CONCURRENCY: "12" }, 3, { llm: 8, ado: 6 })["PRR_LLM_CONCURRENCY"], "4");
+  eq("...no cap stays no cap", childEnv({}, {}, 2, { llm: 0, ado: 6 })["PRR_LLM_CONCURRENCY"], undefined);
+  eq("...and alone, a child gets the whole limit", childEnv({}, {}, 1, { llm: 8, ado: 6 })["PRR_LLM_CONCURRENCY"], undefined);
+  eq("every child is marked as one", env[BATCH_CHILD_ENV], "1");
+
+  // Side by side, end to end, with a child that is not prloop: it writes down what it ran with.
+  const sh = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-parallel-"));
+  try {
+    const script = path.join(sh, "child.mjs");
+    const seen = path.join(sh, "seen");
+    fs.mkdirSync(seen);
+    fs.writeFileSync(
+      script,
+      `import * as fs from "node:fs";\n` +
+        `const id = process.argv[2].split("/").pop();\n` +
+        `const start = Date.now();\n` +
+        `console.log("reviewed " + id);\n` +
+        `setTimeout(() => {\n` +
+        `  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith("PRR_")));\n` +
+        `  fs.writeFileSync(${JSON.stringify(seen)} + "/" + id, JSON.stringify({ env, start, end: Date.now() }));\n` +
+        `  process.exit(0);\n` +
+        `}, 500);\n`,
+    );
+    const realArgv1 = process.argv[1] ?? "";
+    process.argv[1] = script;
+    try {
+      const base = "https://dev.azure.com/contoso/Shop/_git/";
+      const urls = [`${base}shop-api/pullrequest/1`, `${base}shop-web/pullrequest/2`, `${base}shop-api/pullrequest/3`, `${base}shop-web/pullrequest/4`];
+      const outcomes = await runBatch(urls, [], { parallel: 2, overrides, limits: { llm: 8, ado: 6 } });
+      eq("every pull request of a parallel batch is reviewed", outcomes.map((o) => o.exitCode), [0, 0, 0, 0]);
+      const ran = [1, 2, 3, 4].map(
+        (n) => JSON.parse(fs.readFileSync(path.join(seen, String(n)), "utf8")) as { env: Record<string, string>; start: number; end: number },
+      );
+      eq("...each child with half of the model limit", ran.map((r) => r.env["PRR_LLM_CONCURRENCY"]), ["4", "4", "4", "4"]);
+      eq("...and its own repository's settings", [ran[0]!.env["PRR_FINDER_MODELS"], ran[2]!.env["PRR_FINDER_MODELS"]], ["a,b,c", "a,b,c"]);
+      check("...never another repository's", ran[1]!.env["PRR_FINDER_MODELS"] !== "a,b,c" && ran[3]!.env["PRR_FINDER_MODELS"] !== "a,b,c");
+      check("...two at a time: the first two ran side by side", ran[0]!.start < ran[1]!.end && ran[1]!.start < ran[0]!.end, JSON.stringify(ran));
+    } finally {
+      process.argv[1] = realArgv1;
+    }
+  } finally {
+    fs.rmSync(sh, { recursive: true, force: true });
+  }
+
+  // Where the dismissals live, and whether it outlives the job.
+  const ws = process.platform === "win32" ? "C:\\agent\\_work\\1" : "/srv/agent/_work/1";
+  eq("a run on a laptop is not warned about", runsDirWarning({}, process.platform === "win32" ? "C:\\prloop\\runs" : "/srv/prloop/runs"), undefined);
+  check(
+    "in a pipeline, the default runs directory inside the workspace is warned about",
+    (runsDirWarning({ TF_BUILD: "True", AGENT_BUILDDIRECTORY: ws }, path.join(ws, "s", "prloop", "runs")) ?? "").includes("Azure Pipelines job's workspace"),
+  );
+  eq(
+    "...but not one set on purpose, which the job restores and saves",
+    runsDirWarning({ TF_BUILD: "True", AGENT_BUILDDIRECTORY: ws, PRR_RUNS_DIR: path.join(ws, "runs") }, path.join(ws, "runs")),
+    undefined,
+  );
+  check("the temporary directory is warned about anywhere", (runsDirWarning({ PRR_RUNS_DIR: "x" }, path.join(os.tmpdir(), "runs")) ?? "").includes("temporary directory"));
+}
+
+report();

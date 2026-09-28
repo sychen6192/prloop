@@ -7,44 +7,60 @@
 // answer selects the next action is not.
 import {
   LEARN_FROM_DISMISSALS,
+  SAVE_REPLAY,
   SKIP_REQUIREMENT,
   SKIP_STATIC,
+  FIX_CHECKS,
+  RISK_TIERS,
+  STATIC_BASELINE,
   STRICT_COVERAGE,
   WORKTREE_REPO,
   excludedCategories,
   isDryRun,
 } from "./config";
-import { buildReviewContext, type ReviewContext } from "./ado/intake";
-import { terminalPrStatus } from "./ado/iterations";
-import { fetchRepoConventions } from "./ado/conventions";
+import { describeTier, runTier } from "./libs/tier";
+import type { ReviewContext } from "./libs/context";
+import type { ConventionDoc } from "./libs/conventions";
+import { FileIndex } from "./libs/fileindex";
+import type { ReviewHost } from "./libs/host";
 import { renderConventions } from "./libs/rules";
-import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
+import { anchorAndDedupe, finalize, markEarlierPushes, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
+import { checkClaims, contradictionOutcome } from "./gates/claims";
 import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
-import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
+import { checkFixes, runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
 import { isWorktreeFailure, prepareWorktree, type PreparedWorktree } from "./git/worktree";
 import { createRunDir, createSkipDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
-import { tokenTotals } from "./models/runner";
+import { runStamp } from "./libs/stamp";
+import { toReplayBundle } from "./libs/replay";
+import { tokensOf } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
-import type { AnchoredFinding, ModelRunner, PrRef, RequirementResult } from "./libs/types";
-import { harvestClosedThreads, publish, type PublishResult } from "./publish/publish";
+import type { AnchoredFinding, ModelRunner, RequirementResult } from "./libs/types";
+import { harvestClosedThreads, postedFingerprintsOnPr, publish, type PublishResult } from "./publish/publish";
+import type { LeaseHandle } from "./publish/lease";
 import { renderReviewHtml } from "./publish/reviewhtml";
 import { reviewOutcome } from "./publish/status";
 
 export interface ReviewRunOptions {
-  ref: PrRef;
+  /**
+   * The pull request, and everything the review reads from or writes to the service hosting
+   * it (libs/host.ts). ado/host.ts for a pull request, git/host.ts for a local branch, an
+   * in-memory one in a test: nothing below reaches Azure DevOps any other way.
+   */
+  host: ReviewHost;
   runner: ModelRunner;
   compareTo: number;
+  /** The run lease loop.ts took for this review, which publish() checks before writing. */
+  lease?: LeaseHandle;
   /**
-   * Where the ReviewContext comes from. Defaults to the Azure DevOps intake; git/intake.ts
-   * is the other adapter at this seam. A parameter rather than a hard-wired import so the
-   * contract in libs/context.ts is something a provider can be held to — including in a
-   * test — instead of being whatever ado/intake.ts happens to return.
+   * A repository holding the commit under review, for a skeptic's second reading to
+   * `git grep` (gates/lookup.ts). Defaults to PRR_WORKTREE_REPO, which the static gate has
+   * already fetched the commit into; a local review passes its own repository.
    */
-  intake?: (ref: PrRef, compareTo: number) => Promise<ReviewContext>;
+  searchRepo?: string;
 }
 
 export interface ReviewRunResult {
@@ -68,6 +84,8 @@ export interface ReviewRunResult {
    * fetch, RequirementResult.skipped is a stage's reason string, StaticResult has both.
    */
   skippedReason?: string;
+  /** Wall time per stage, in ms (runReview's `timed`); stages that run side by side overlap. */
+  timings?: Record<string, number>;
 }
 
 /**
@@ -132,14 +150,15 @@ export function exitCodeFor(result: Pick<ReviewRunResult, "agg" | "req" | "incom
  * thing), and unlike the thread writes it is not something ADO was refusing anyway.
  */
 async function skipTerminalPr(
-  ref: PrRef,
+  host: ReviewHost,
   ctx: ReviewContext,
   reason: string,
   started: number,
 ): Promise<ReviewRunResult> {
   log(`${reason} — no review will be posted, so none is computed`);
+  const { ref } = host;
   const run = createSkipDir(ref);
-  const harvest = await harvestClosedThreads(ref).catch((e): { dismissals: number; outcomes: number } => {
+  const harvest = await harvestClosedThreads(host).catch((e): { dismissals: number; outcomes: number } => {
     // Best effort by design: a tick that could not read a merged PR has still correctly done
     // nothing, and turning that into a failure would redden a cron over a list of PRs that
     // are all finished.
@@ -173,9 +192,23 @@ async function skipTerminalPr(
 
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {
   const started = Date.now();
+  const { host } = opts;
+  const { ref } = host;
+  // Wall time per stage, in ms, for result.json. Stages that run side by side overlap, so
+  // these do not sum to the run's duration; each says how long its own stage held the run up
+  // at most, which is the question when a review is slow.
+  const timings: Record<string, number> = {};
+  const timed = async <T>(stage: string, work: Promise<T>): Promise<T> => {
+    const t0 = Date.now();
+    try {
+      return await work;
+    } finally {
+      timings[stage] = Date.now() - t0;
+    }
+  };
 
   banner("Step 1/4: fetch PR changes");
-  const ctx = await (opts.intake ?? buildReviewContext)(opts.ref, opts.compareTo);
+  const ctx = await timed("intake", host.intake(opts.compareTo));
 
   // A merged pull request refuses every write, so a review of one buys nothing and costs
   // everything: the README's cron loop kept paying for the finders, the skeptic and triage on
@@ -190,25 +223,34 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // The honest cost note: intake has already fetched the PR, its iterations and two blobs
   // per changed file by the time we get here. What this saves is the model budget, which is
   // the part that is measured in money. Skipping before the REST spend would need a status
-  // probe of its own alongside the intake seam, and is a different change.
-  const terminal = terminalPrStatus(ctx.pr.status);
+  // probe of its own on the host, and is a different change.
+  const terminal = host.terminal(ctx.pr);
   if (terminal && !isDryRun()) {
-    return skipTerminalPr(opts.ref, ctx, terminal, started);
+    return skipTerminalPr(host, ctx, terminal, started);
   }
 
-  const run = createRunDir(opts.ref, ctx.iteration.id);
+  const run = createRunDir(ref, ctx.iteration.id);
   log(`artifacts: ${run.dir}`);
 
   // Saved first, before any stage can fail: a run in runs/ is only diagnosable a week later
   // if it recorded the settings it actually ran with — which value won, and whether it came
   // from the shell or the file. Everything else in here records what the models did with it.
   run.saveJson("config.json", configSnapshot());
+  // Beside it, what produced the run in a form reports can group by: calibrate and evaluate
+  // cannot compare a prompt change against what came before it without knowing which runs
+  // used which prompts.
+  run.saveJson("stamp.json", await runStamp());
+
+  // How much review this change gets (PRR_RISK_TIERS): the finders, the verifier rounds and
+  // the inline bar, from its size and the paths it touches. Everything configured when off.
+  const tier = runTier(ctx.files);
 
   run.saveJson("context.json", {
-    ref: opts.ref,
+    ref,
     pr: ctx.pr,
     iteration: ctx.iteration,
     compareTo: ctx.compareTo,
+    tier,
     files: ctx.files.map((f) => ({
       path: f.path,
       changeType: f.changeType,
@@ -219,51 +261,20 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     skipped: ctx.skipped,
   });
 
-  if (ctx.files.length === 0) {
-    // Still publish: the sticky summary is what carries the iteration marker forward and
-    // what resolves stale threads. Skipping it wedged `--since auto` forever on a
-    // docs-only push, and left threads open whose code the push had deleted.
-    log("No reviewable code changes — publishing summary only");
-    const agg: AggregateResult = {
-      inline: [],
-      belowBar: [],
-      degraded: [],
-      stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
-    };
-    const durationSec = Math.round((Date.now() - started) / 1000);
-    // "No reviewable code changes" can also mean "the only changed file was too large to
-    // fetch" — that is not a clean PR, and the status must say so too, not just the exit
-    // code. Computed before publishing for the same reason as on the main path.
-    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
-    const publishResult = await publish(
-      opts.ref,
-      { requirement: [], code: [] },
-      {
-        ctx,
-        agg,
-        req: { workItems: [], criteria: [], extras: [], skipped: "no reviewable code changes" },
-        finderErrors: [],
-        omittedFiles: [],
-        appliedRules: [],
-        staticResult: {
-          facts: [],
-          needsTriage: [],
-          suppressedCount: 0,
-          ranTools: [],
-          skipped: [],
-          staleFiles: [],
-          unresolved: 0,
-          skippedReason: "no reviewable code changes",
-        },
-        dismissalHints: [],
-        durationSec,
-        runDir: run.dir,
-      },
-      { unreviewed: [], incomplete },
-    );
-    incomplete.push(...publishResult.gaps);
-    return { ctx, agg, reqFindings: [], publishResult, runDir: run.dir, durationSec, incomplete };
-  }
+  // A change with no code in it — docs and config, or only deleted files — still runs, and
+  // still publishes: the sticky summary carries the resume point forward and closes threads
+  // whose code the push deleted (skipping it wedged `--since auto` on a docs-only push), and
+  // the requirement axis does not depend on code at all. Only the code axis stands down.
+  const noCode = ctx.files.length === 0;
+  if (noCode) log("No code in this change — the code axis has nothing to review");
+  else if (RISK_TIERS) log(`risk tier: ${describeTier(tier)}`);
+
+  // The whole pull request, read at most once and shared. The requirement axis judges
+  // against it on an incremental run; the code axis asks it which lines this push left alone
+  // an earlier push of the same PR wrote. Blobs are content-addressed and cached, so the read
+  // fetches only the files this push did not touch.
+  let wholePrRead: Promise<ReviewContext> | undefined;
+  const wholePr = () => (wholePrRead ??= host.intake(0, { text: true }));
 
   // The two axes run concurrently and blind to each other: neither model sees the other's
   // output, so "the code is clean" can't excuse a missing requirement, or vice versa.
@@ -274,6 +285,19 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // pipeline is all cost and no benefit. On a real run its model call ran 300s past the
   // finders and step 3 sat idle the whole time; with a long timeout that idle window is the
   // full timeout. It runs in the background and is collected just before publishing.
+  //
+  // And it reads the whole pull request, never just this push. Criteria are met by the PR,
+  // and on `--since auto` the context above holds only what changed since the last review:
+  // judged against that, a criterion delivered two pushes ago came back "missing", the
+  // dispute pass saw the same partial diff and could not refute it, and the status failed
+  // the PR for work it already contained. So an incremental run reads the PR a second time,
+  // whole, through the host's intake again. Blobs are content-addressed and cached, so the
+  // second read fetches only the files this push left alone.
+  //
+  // Whole, and not only its code: a criterion met in a config file or a document is not
+  // missing because it is not code. So the read that feeds this axis includes the changed
+  // non-code text as well, and costs those files' blob reads — which is why the gate asks
+  // for it only once it knows there are criteria to judge.
   const reqPromise = (
     SKIP_REQUIREMENT
       ? Promise.resolve<Awaited<ReturnType<typeof runRequirementGate>>>({
@@ -284,7 +308,16 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             skipped: "requirement check skipped by config",
           },
         })
-      : runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: ctx.files, fileIndex: ctx.fileIndex, runner: opts.runner })
+      : runRequirementGate({
+          pr: ctx.pr,
+          diff: async () => {
+            const whole = await wholePr();
+            const files = [...whole.files, ...(whole.textFiles ?? [])];
+            return { files, fileIndex: new FileIndex(files) };
+          },
+          runner: opts.runner,
+          requirements: () => host.requirements(),
+        })
   ).catch((e): Awaited<ReturnType<typeof runRequirementGate>> => {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[FAIL] requirement axis threw: ${msg}`);
@@ -297,14 +330,18 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // not the source: the source branch is the author's, and a CLAUDE.md edited in the same
   // PR would otherwise steer the review of that very PR. Non-fatal: most repos have none,
   // and a failed fetch costs the finder its context bonus, not the run.
-  const conventions = renderConventions(
-    ctx.iteration.targetRefCommit
-      ? await fetchRepoConventions(opts.ref, ctx.iteration.targetRefCommit).catch((e) => {
+  const conventionDocs =
+    ctx.iteration.targetRefCommit && !noCode
+      ? await timed("conventions", host.conventions(
+          ctx.iteration.targetRefCommit,
+          ctx.files.map((f) => f.path),
+        )).catch((e): ConventionDoc[] => {
           log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
           return [];
         })
-      : [],
-  );
+      : [];
+  if (conventionDocs.length > 0) log(`repo conventions: ${conventionDocs.map((d) => d.path).join(", ")}`);
+  const conventions = renderConventions(conventionDocs);
 
   // Stages that threw outright (vs returning their own error fields); reported as
   // incomplete so the run exits 3 instead of pretending the stage passed.
@@ -316,59 +353,89 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // missing review.
   const unreviewed: string[] = [];
 
-  // The code on disk for the static gate. With PRR_WORKTREE_REPO set, prloop cuts its own
-  // worktree detached at this iteration's commit — which is the only way to be sure the
-  // files analysed are the files under review, since a branch checked out by name moves the
-  // moment the author pushes again. Failing to get one skips the gate with the reason
-  // named; it never fails the run, because a missing linter is not a missing review.
-  let worktree: PreparedWorktree | undefined;
-  let worktreeError: string | undefined;
-  if (WORKTREE_REPO && !SKIP_STATIC) {
-    const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, opts.ref.prId).catch(
-      (e): { error: string } => ({ error: `worktree preparation failed: ${e instanceof Error ? e.message : String(e)}` }),
-    );
-    if (isWorktreeFailure(prepared)) {
-      worktreeError = prepared.error;
-      log(`[WARN] static: ${prepared.error}`);
-    } else {
-      worktree = prepared;
+  // Which fingerprints are already on the pull request, read beside the finders. A finding
+  // an earlier run posted skips the skeptic: publish() will not post it again, and verifying
+  // it again was paid for on every re-review of a PR whose threads were already known.
+  // Failing to read them costs only that saving: everything is verified, as before.
+  const postedRead = postedFingerprintsOnPr(host).catch((e): ReadonlySet<string> => {
+    log(`[WARN] could not read which findings are already posted, so all of them are verified: ${e instanceof Error ? e.message : String(e)}`);
+    return new Set();
+  });
+
+  // The static branch, whole: the worktree it runs in and then the gate. With
+  // PRR_WORKTREE_REPO set, prloop cuts its own worktree detached at this iteration's commit —
+  // the only way to be sure the files analysed are the files under review, since a branch
+  // checked out by name moves the moment the author pushes again. Its preparation — a fetch
+  // and a setup command, up to ten minutes each — used to finish before any finder started;
+  // inside this branch it runs beside them. Failing to get a worktree skips the gate with the
+  // reason named; it never fails the run, because a missing linter is not a missing review.
+  // The head worktree outlives the static branch when the suggested fixes are to be checked
+  // in it after the verdicts (PRR_FIX_CHECKS); removed right after that check, or by
+  // loop.ts's fatal path if the run dies first (git/worktree.ts keeps the list).
+  const kept: { worktree?: PreparedWorktree } = {};
+  const staticBranch = async (): Promise<StaticResult> => {
+    const skipped = (skippedReason: string): StaticResult => ({
+      facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason,
+    });
+    if (SKIP_STATIC) return skipped("static analysis skipped by config");
+    if (noCode) return skipped("no code in this change");
+    let worktree: PreparedWorktree | undefined;
+    // PRR_STATIC_BASELINE: a second worktree at the merge base, where the fact tools run
+    // again (gates/static.ts). Failing to get one costs the comparison, never the gate.
+    let baseWorktree: PreparedWorktree | undefined;
+    // The worktrees' whole life is this gate. Triage reads its source windows out of the
+    // FileIndex (intake's bytes), not off disk, so nothing after this needs the trees — and
+    // `finally` means a crashed gate does not leave one behind, which on a cron over a PR
+    // list would accumulate every day.
+    try {
+      if (WORKTREE_REPO) {
+        const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, ref.prId).catch(
+          (e): { error: string } => ({ error: `worktree preparation failed: ${e instanceof Error ? e.message : String(e)}` }),
+        );
+        if (isWorktreeFailure(prepared)) {
+          log(`[WARN] static: ${prepared.error}`);
+          return skipped(prepared.error);
+        }
+        worktree = prepared;
+        if (STATIC_BASELINE) {
+          const mergeBase = ctx.iteration.commonRefCommit;
+          const base = mergeBase
+            ? await prepareWorktree(WORKTREE_REPO, mergeBase, ref.prId).catch(
+                (e): { error: string } => ({ error: `${e instanceof Error ? e.message : String(e)}` }),
+              )
+            : { error: "the iteration names no merge base" };
+          if (isWorktreeFailure(base)) log(`[WARN] static baseline: no worktree at the merge base, so nothing is compared: ${base.error}`);
+          else baseWorktree = base;
+        }
+      } else if (STATIC_BASELINE) {
+        log(`[WARN] PRR_STATIC_BASELINE needs PRR_WORKTREE_REPO: a merge base cannot be checked out of a checkout prloop does not own`);
+      }
+      const result = await runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir, baseWorktree?.dir);
+      if (worktree && FIX_CHECKS > 0) {
+        kept.worktree = worktree;
+        worktree = undefined;
+      }
+      return result;
+    } finally {
+      await worktree?.cleanup();
+      await baseWorktree?.cleanup();
     }
-  }
+  };
   const [staticResult, finderOut] = await Promise.all([
-    (SKIP_STATIC
-      ? Promise.resolve<StaticResult>({
-          facts: [],
-          needsTriage: [],
-          suppressedCount: 0,
-          ranTools: [],
-          skipped: [],
-          staleFiles: [],
-          unresolved: 0,
-          skippedReason: "static analysis skipped by config",
-        })
-      : worktreeError !== undefined
-        ? Promise.resolve<StaticResult>({
-            facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0,
-            skippedReason: worktreeError,
-          })
-        : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir)
-    )
-      .catch((e): StaticResult => {
-        stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
-        return { facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason: "crashed" };
-      })
-      // The worktree's whole life is this gate. Triage reads its source windows out of the
-      // FileIndex (intake's bytes), not off disk, so nothing after this needs the tree —
-      // and `finally` rather than a line after the await means a crashed gate does not
-      // leave one behind, which on a cron over a PR list would accumulate every day.
-      .finally(() => worktree?.cleanup()),
-    runFinders(opts.runner, {
-      pr: ctx.pr,
-      files: ctx.files,
-      iterationId: ctx.iteration.id,
-      compareTo: ctx.compareTo,
-      conventions,
-    }).catch((e): Awaited<ReturnType<typeof runFinders>> => {
+    timed("static", staticBranch()).catch((e): StaticResult => {
+      stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
+      return { facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason: "crashed" };
+    }),
+    timed("finders", noCode
+      ? Promise.resolve<Awaited<ReturnType<typeof runFinders>>>({ outputs: [], prompt: "", omitted: [], rules: [] })
+      : runFinders(opts.runner, {
+          pr: ctx.pr,
+          files: ctx.files,
+          iterationId: ctx.iteration.id,
+          compareTo: ctx.compareTo,
+          conventions,
+        }, tier.finders)
+    ).catch((e): Awaited<ReturnType<typeof runFinders>> => {
       const why = `finder stage (${e instanceof Error ? e.message : String(e)})`;
       stageFailures.push(why);
       // Nothing read the diff, so nothing about this push is known.
@@ -379,6 +446,15 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
 
   if (staticResult.skippedReason) log(`Static analysis: ${staticResult.skippedReason}`);
   run.saveJson("static.json", staticResult);
+
+  // Triage needs only the static result and the skeptic only the findings, so they run side
+  // by side: triage used to start once the last verdict was in. Collected before finalize.
+  const toolPromise = timed("triage", triageAndConvert(opts.runner, staticResult, ctx.fileIndex)).catch(
+    (e): Awaited<ReturnType<typeof triageAndConvert>> => {
+      stageFailures.push(`triage stage (${e instanceof Error ? e.message : String(e)})`);
+      return { findings: [], triaged: 0, dropped: 0, excluded: 0 };
+    },
+  );
 
   const { outputs, prompt, omitted, rules } = finderOut;
   // finder-prompt.md stays finder 0's prompt, for tooling that reads that name. Every
@@ -403,25 +479,44 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // Learnings: findings a human already dismissed (on this PR or a previous one) skip the
   // skeptic — no verification budget is spent re-litigating a closed decision — and are
   // suppressed by finalize below. Loaded once; also feeds the config hints in the summary.
-  const storedDismissals = LEARN_FROM_DISMISSALS ? loadDismissals(opts.ref) : [];
+  const storedDismissals = LEARN_FROM_DISMISSALS ? loadDismissals(ref) : [];
   const dismissedFps = new Set(storedDismissals.map((d) => d.fingerprint));
-  const freshCandidates = candidates.merged.filter((f) => !dismissedFps.has(f.fingerprint));
+  // And findings an earlier run already posted, which it verified then: publish() will not
+  // post them again, so another verdict would change nothing but the bill.
+  const postedFps = await postedRead;
+  const freshCandidates = candidates.merged.filter((f) => !dismissedFps.has(f.fingerprint) && !postedFps.has(f.fingerprint));
   const knownDismissed = candidates.merged.filter((f) => dismissedFps.has(f.fingerprint));
+  const knownPosted = candidates.merged.filter((f) => !dismissedFps.has(f.fingerprint) && postedFps.has(f.fingerprint));
+  if (knownPosted.length > 0) log(`skeptic: ${knownPosted.length} finding(s) already on the pull request, not verified again`);
 
   // Adversarial verification. The finder ran in coverage mode and is expected to
   // over-report; this is the stage that does the killing. A skeptic stage that throws must
   // degrade to "nothing verified" (recorded as incomplete below), not abort a run that has
   // already paid for its finder calls.
-  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.fileIndex).catch(
-    (e): import("./gates/skeptic").SkepticOutcome[] => {
-      const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
-      stageFailures.push(why);
-      // Fails open, so the findings survive — but unverified, which is not the review the
-      // run was configured to produce, and a re-run can still produce it.
-      unreviewed.push(why);
-      return freshCandidates.map((f) => ({ finding: f, verdicts: [], killed: false }));
-    },
-  );
+  const searchRepo = opts.searchRepo ?? (WORKTREE_REPO || undefined);
+  const lookup = {
+    files: ctx.files,
+    ...(searchRepo && ctx.iteration.sourceRefCommit ? { repo: { dir: searchRepo, commit: ctx.iteration.sourceRefCommit } } : {}),
+  };
+  // Claims a search can settle are settled first (gates/claims.ts): a finding the code
+  // contradicts never costs a verifier call, and its refutation carries the line that proves
+  // it. A checker that throws settles nothing — every finding goes on to the skeptic.
+  const contradictions = await timed("claims", checkClaims(freshCandidates, ctx.fileIndex, lookup)).catch(() => []);
+  const settled = new Set(contradictions.map((c) => c.finding));
+  const toVerify = freshCandidates.filter((f) => !settled.has(f));
+  const outcomes = [
+    ...(await timed("skeptic", runSkeptic(opts.runner, toVerify, ctx.fileIndex, { lookup, rounds: tier.skepticRounds })).catch(
+      (e): import("./gates/skeptic").SkepticOutcome[] => {
+        const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
+        stageFailures.push(why);
+        // Fails open, so the findings survive — but unverified, which is not the review the
+        // run was configured to produce, and a re-run can still produce it.
+        unreviewed.push(why);
+        return toVerify.map((f) => ({ finding: f, verdicts: [], killed: false }));
+      },
+    )),
+    ...contradictions.map(contradictionOutcome),
+  ];
   const survivors = applyVerdicts(outcomes);
   run.saveJson(
     "skeptic.json",
@@ -446,17 +541,13 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       // The prompt is the audit trail for a wrong refutation — without it, a killed real
       // finding cannot be debugged.
       prompt: o.prompt,
+      ...(o.lookupPrompt === undefined ? {} : { lookupPrompt: o.lookupPrompt }),
     })),
   );
 
   // Tool findings join the code axis after triage. They carry real line numbers, so they
   // skip anchoring, and a deterministic tool counts as its own corroboration.
-  const toolOut = await triageAndConvert(opts.runner, staticResult, ctx.fileIndex).catch(
-    (e): Awaited<ReturnType<typeof triageAndConvert>> => {
-      stageFailures.push(`triage stage (${e instanceof Error ? e.message : String(e)})`);
-      return { findings: [], triaged: 0, dropped: 0, excluded: 0 };
-    },
-  );
+  const toolOut = await toolPromise;
   // A triage model that failed or answered unusably deleted every triage-tier finding; the
   // gate returns that as an error rather than throwing, so it lands here, not in the catch.
   if (toolOut.error) stageFailures.push(`triage stage (${toolOut.error})`);
@@ -469,18 +560,62 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // suppression reason — a suppressed finding must stay visible, never vanish.
   const agg = finalize(
     candidates,
-    mergeToolFindings([...survivors, ...knownDismissed], toolOut.findings, ctx.fileIndex),
+    mergeToolFindings([...survivors, ...knownDismissed, ...knownPosted], toolOut.findings),
     dismissedFps,
     outcomes.filter((o) => o.killed).length,
+    tier.minSeverity,
+    postedFps,
   );
+  // On an incremental run, "lines this push did not touch" are two different things: code an
+  // earlier push of this PR wrote — reviewed then, so a finding there now is one that review
+  // missed — and code from before the PR. The whole PR's diff tells them apart; a read that
+  // fails leaves them undivided, as they were.
+  if (ctx.compareTo > 0 && agg.belowBar.some((f) => f.suppressedBy === "pre-existing")) {
+    const whole = await wholePr().catch((e) => {
+      log(`[WARN] could not read the whole pull request to tell missed findings from pre-existing ones: ${e instanceof Error ? e.message : String(e)}`);
+      return undefined;
+    });
+    if (whole) markEarlierPushes(agg.belowBar, new FileIndex(whole.files));
+  }
+
+  // The suggested fixes about to be posted, applied in the worktree and typechecked: one that
+  // breaks the build is dropped, and its finding posted without it. Only fixes that would
+  // actually be posted — a finding already on the PR is not posted again.
+  if (kept.worktree) {
+    const worktreeDir = kept.worktree.dir;
+    try {
+      const checks = await timed(
+        "fix checks",
+        checkFixes(agg.inline.filter((f) => !postedFps.has(f.fingerprint)), ctx.fileIndex, worktreeDir, FIX_CHECKS),
+      ).catch((e): Awaited<ReturnType<typeof checkFixes>> => {
+        log(`[WARN] suggested fixes were not checked: ${e instanceof Error ? e.message : String(e)}`);
+        return [];
+      });
+      for (const c of checks) {
+        if (c.broke === undefined) {
+          c.finding.fixCheckedBy = c.tool;
+        } else {
+          log(`  suggested fix dropped from ${c.finding.file}:${c.finding.anchor?.startLine} — with it, ${c.tool} reports ${c.broke}`);
+          c.finding.fixDropped = `${c.tool}: ${c.broke}`;
+          delete c.finding.suggested_fix;
+        }
+      }
+    } finally {
+      await kept.worktree.cleanup();
+    }
+  }
 
   // Collect the requirement axis now — everything that could run without it has run.
-  const reqOut = await reqPromise;
+  const reqOut = await timed("requirement (after the code axis)", reqPromise);
   const req = reqOut.result;
   if (reqOut.prompt) run.save("requirement-prompt.md", reqOut.prompt);
   if (reqOut.raw) run.save("requirement-raw.txt", reqOut.raw);
   run.saveJson("requirement.json", req);
 
+  // Anchored against THIS push, although the verdicts were reached on the whole PR: an inline
+  // comment is a claim about the lines under review, and one on code an earlier push wrote
+  // was that push's to make. A verdict whose quote lies outside this push stays in the
+  // summary's table, like every other criterion.
   const reqFindings = toRequirementFindings(req, ctx.fileIndex);
   // Attach the tracking id ADO needs for each thread to survive future pushes.
   for (const f of [...agg.inline, ...reqFindings]) {
@@ -500,6 +635,12 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     degraded: agg.degraded,
     stats: agg.stats,
   });
+  if (SAVE_REPLAY) {
+    run.saveJson(
+      "replay.json",
+      toReplayBundle({ files: ctx.files, outputs, outcomes, tools: toolOut.findings, dismissed: dismissedFps, posted: postedFps }),
+    );
+  }
 
   banner("Step 4/4: post comments");
   const durationSec = Math.round((Date.now() - started) / 1000);
@@ -531,8 +672,8 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   if (deadSkeptics > 0) incomplete.push(`${deadSkeptics} findings whose verifier failed`);
   incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
 
-  const publishResult = await publish(
-    opts.ref,
+  const publishResult = await timed("publish", publish(
+    host,
     { requirement: reqFindings, code: agg.inline },
     {
       ctx,
@@ -541,19 +682,26 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       finderErrors,
       omittedFiles: omitted,
       appliedRules: rules,
+      conventionDocs: conventionDocs.map((d) => d.path),
+      ...(RISK_TIERS ? { tier } : {}),
       staticResult,
       dismissalHints: dismissedCategoryHints(storedDismissals, excludedCategories()),
       durationSec,
       runDir: run.dir,
     },
-    { unreviewed, incomplete },
-  );
+    {
+      unreviewed,
+      incomplete,
+      ...(staticResult.evidence ? { toolEvidence: staticResult.evidence } : {}),
+      ...(opts.lease ? { lease: opts.lease } : {}),
+    },
+  ));
   // The publish-side half, produced once by publish() rather than read back off its result
   // here. Appending after the coverage gaps reorders the list against older runs: when the
   // only two reasons are a coverage gap and a refused comment, the first-named reason — and
   // so the status description's headline — is now the coverage gap.
   incomplete.push(...publishResult.gaps);
-  const tokens = tokenTotals();
+  const tokens = tokensOf(opts.runner);
   log(`model usage: ${tokens.calls} calls, ${tokens.promptTokens} in / ${tokens.completionTokens} out tokens`);
   run.saveJson("publish.json", {
     summaryThreadId: publishResult.summaryThreadId,
@@ -568,5 +716,5 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     tokenUsage: tokens,
   });
 
-  return { ctx, agg, req, reqFindings, publishResult, runDir: run.dir, durationSec, incomplete };
+  return { ctx, agg, req, reqFindings, publishResult, runDir: run.dir, durationSec, incomplete, timings };
 }

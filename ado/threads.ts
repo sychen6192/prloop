@@ -9,46 +9,12 @@
 //   - iterationContext, so the thread is pinned to the iteration we actually reviewed
 import { adoGet, adoPatch, adoPost, prBase, type AdoList } from "./client";
 import { normalizePath } from "../libs/fileindex";
-import type { Anchor, PrRef } from "../libs/types";
-
-export interface ThreadComment {
-  id: number;
-  content?: string;
-  commentType?: string;
-  isDeleted?: boolean;
-  author?: { displayName?: string; id?: string };
-}
-
-export interface Thread {
-  id: number;
-  status?: string;
-  comments?: ThreadComment[];
-  threadContext?: {
-    filePath?: string;
-    rightFileStart?: { line?: number; offset?: number };
-    rightFileEnd?: { line?: number; offset?: number };
-    leftFileStart?: { line?: number; offset?: number };
-    leftFileEnd?: { line?: number; offset?: number };
-  };
-  isDeleted?: boolean;
-}
-
-export type ThreadStatus = "active" | "fixed" | "wontFix" | "closed" | "byDesign" | "pending";
+import type { CreateThreadInput, Thread, ThreadStatus } from "../libs/host";
+import type { PrRef } from "../libs/types";
 
 export async function listThreads(ref: PrRef): Promise<Thread[]> {
   const res = await adoGet<AdoList<Thread>>(`${prBase(ref)}/threads`);
   return (res.value ?? []).filter((t) => !t.isDeleted);
-}
-
-export interface CreateThreadInput {
-  content: string;
-  status?: ThreadStatus;
-  // Omit for a PR-level (non-file) comment.
-  filePath?: string;
-  anchor?: Anchor;
-  changeTrackingId?: number;
-  iterationId?: number;
-  firstComparingIteration?: number;
 }
 
 export async function createThread(ref: PrRef, input: CreateThreadInput): Promise<Thread> {

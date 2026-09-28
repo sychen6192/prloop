@@ -48,6 +48,13 @@ export interface ReviewContext {
    *   reports changeType "rename" without it silently breaks both.
    */
   files: FileDiff[];
+  /**
+   * Changed files that are not code — configuration, markup, documentation — diffed exactly
+   * like `files`, for the requirement axis alone: a criterion is often met in a config file
+   * or a document, and judging it without them calls it missing. Empty unless the provider
+   * was asked for them (IntakeOptions.text); left unread they are listed in `skipped`.
+   */
+  textFiles: FileDiff[];
   // Changed files the provider did not hand over. A file it FAILED to read belongs here with
   // a reason naming the failure — never omitted, and never passed off as an empty file, which
   // diffs as wholly added and reads downstream as a clean review of code nobody saw.
@@ -59,10 +66,7 @@ export interface ReviewContext {
   fileIndex: FileIndex;
 }
 
-/**
- * What the orchestrator needs from an intake: a PrRef in, a ReviewContext out.
- *
- * Two adapters satisfy it — ado/intake.ts against the REST API, git/intake.ts against a
- * working tree — which is what makes this a real seam rather than a hypothetical one.
- */
-export type IntakeProvider = (ref: PrRef) => Promise<ReviewContext>;
+export interface IntakeOptions {
+  /** Also diff the changed non-code text files into `textFiles`. Costs their blob reads. */
+  text?: boolean;
+}

@@ -9,13 +9,11 @@
 // State lives in the PR itself (a marker inside our own summary comment), not on disk:
 // the tool is meant to be runnable from a pipeline agent, a laptop, or a cron box without
 // them sharing a filesystem.
-import { readMarkers } from "./markers";
+import { readMarkers, spanMark, type SpanMark } from "./markers";
 import { neutralizeLine } from "../prompts/untrusted";
-import { isSelfIdentity, selfIdentityId } from "../ado/identity";
-import { listThreads, setThreadStatus, type Thread, type ThreadComment } from "../ado/threads";
 import type { FileIndex } from "../libs/fileindex";
+import { isSelfIdentity, type ReviewHost, type Thread, type ThreadComment } from "../libs/host";
 import { log, logVerbose } from "../libs/log";
-import type { PrRef } from "../libs/types";
 
 /**
  * The iteration recorded by our last run, read back from the sticky summary.
@@ -64,9 +62,9 @@ export function lastReviewedIteration(threads: Thread[], selfId?: string): numbe
  * so failing here costs a tick and saves the entire model budget of a run that was going to
  * fail at the end anyway.
  */
-export async function resolveLastReviewedIteration(ref: PrRef): Promise<number | undefined> {
+export async function resolveLastReviewedIteration(host: ReviewHost): Promise<number | undefined> {
   try {
-    const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+    const [threads, selfId] = await Promise.all([host.threads(), host.selfId()]);
     return lastReviewedIteration(threads, selfId);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -169,18 +167,77 @@ export interface StaleThread {
   /** From the comment's marker, so closing it can be recorded as an outcome. */
   fingerprint?: string;
   category?: string;
+  /** Likes on prloop's comment when it was closed. */
+  likes?: number;
+}
+
+/** Likes on a comment, when the server reports them; undefined when it does not. */
+const likesOf = (c: ThreadComment | undefined): number | undefined =>
+  Array.isArray(c?.usersLiked) ? c.usersLiked.length : undefined;
+
+/**
+ * Where the code a comment was about sits in `lines` now: the start line of the matching
+ * window nearest `near`, or undefined when that code is nowhere in the file. Exported for
+ * publish.ts, which relocates threads the same way for position dedupe.
+ */
+export function locateSpan(lines: readonly string[], span: SpanMark, near: number): number | undefined {
+  let best: number | undefined;
+  for (const start of windowsOf(lines, span.lines).get(span.hash) ?? []) {
+    if (best === undefined || Math.abs(start - near) < Math.abs(best - near)) best = start;
+  }
+  return best;
+}
+
+// Every window of a file hashed once per window length and kept for as long as the file's
+// lines are: a PR with fifty open threads in one large file would otherwise hash the whole
+// file fifty times over.
+const windowCache = new WeakMap<readonly string[], Map<number, Map<string, number[]>>>();
+
+function windowsOf(lines: readonly string[], size: number): Map<string, number[]> {
+  let bySize = windowCache.get(lines);
+  if (!bySize) windowCache.set(lines, (bySize = new Map()));
+  let windows = bySize.get(size);
+  if (!windows) {
+    windows = new Map();
+    for (let start = 1; start + size - 1 <= lines.length; start++) {
+      const hash = spanMark(lines.slice(start - 1, start - 1 + size)).hash;
+      const at = windows.get(hash);
+      if (at) at.push(start);
+      else windows.set(hash, [start]);
+    }
+    bySize.set(size, windows);
+  }
+  return windows;
 }
 
 /**
  * Threads of ours whose anchored code no longer exists in the current iteration.
  *
  * The test is deliberately narrow: the thread must be one of ours, still active, anchored
- * to a file we have in hand, and the line it points at must no longer contain what it
- * originally flagged. Anything less certain is left alone — wrongly resolving a live issue
- * is worse than leaving a stale thread for a human to close.
+ * to a file we have in hand, and what it originally flagged must be gone from that file.
+ * Anything less certain is left alone — wrongly resolving a live issue is worse than leaving
+ * a stale thread for a human to close.
+ *
+ * "Gone" is decided by content wherever the comment recorded its code (the span marker): the
+ * flagged lines appear nowhere in the file now. It used to be decided by position alone — the
+ * line the thread was posted on now past the end of the file — which closed a live thread as
+ * fixed when lines were deleted above it, and left a fixed one open whenever the file had not
+ * shrunk. A comment from before the marker still gets the position test; nothing better is
+ * known about it.
  */
-export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThread[] {
+/**
+ * What the static-analysis tools established this run: the files each one analysed after
+ * running cleanly, and the fingerprints of everything they reported on them, before any
+ * filter. The only grounds on which a tool's comment is closed.
+ */
+export interface ToolEvidence {
+  analysed: Readonly<Record<string, readonly string[]>>;
+  reported: readonly string[];
+}
+
+export function findStaleThreads(threads: Thread[], index: FileIndex, tools?: ToolEvidence): StaleThread[] {
   const stale: StaleThread[] = [];
+  const reported = new Set(tools?.reported ?? []);
   for (const t of threads) {
     if (t.status !== "active") continue;
     // Markers alone, with no authorship check, and that is a decision rather than an
@@ -203,20 +260,44 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
     if (!fd) continue;
 
     const line = ctx.rightFileStart.line;
-    // ADO re-anchors tracked threads onto each new iteration. If the tracked line now sits
-    // outside the file, or the line is no longer one this PR touches while the file itself
-    // was rewritten, the original code is gone.
-    if (line > fd.rightLines.length) {
-      const m = readMarkers(first.content);
+    const m = readMarkers(first.content);
+    // A tool's comment closes on the tool's word, reviewdog's rule: the same tool ran on the
+    // file this time and no longer reports it. "The code moved" is right for a model's
+    // finding, which nothing re-runs; a tool does re-run, and when it did not — skipped, a
+    // broken toolchain, a file it was not given — its silence is not evidence of anything.
+    if (m.tool) {
+      const analysed = tools?.analysed[m.tool];
+      if (analysed?.includes(fd.path) && m.fingerprint && !reported.has(m.fingerprint)) {
+        stale.push({
+          threadId: t.id,
+          file: ctx.filePath,
+          line,
+          reason: `${m.tool} ran on this file and no longer reports it`,
+          fingerprint: m.fingerprint,
+          ...(m.category ? { category: m.category } : {}),
+          ...(likesOf(first) === undefined ? {} : { likes: likesOf(first) }),
+        });
+      }
+      continue;
+    }
+    const reason = m.span
+      ? locateSpan(fd.rightLines, m.span, line) === undefined
+        ? "the code it flagged is no longer in the file"
+        : undefined
+      : line > fd.rightLines.length
+        ? "line is past the end of the file"
+        : undefined;
+    if (reason !== undefined) {
       stale.push({
         threadId: t.id,
         file: ctx.filePath,
         line,
-        reason: "line is past the end of the file",
+        reason,
         // Carried so the close can be recorded as an outcome. Absent on threads a version
         // before the marker protocol wrote; those still close, they are just not counted.
         ...(m.fingerprint ? { fingerprint: m.fingerprint } : {}),
         ...(m.category ? { category: m.category } : {}),
+        ...(likesOf(first) === undefined ? {} : { likes: likesOf(first) }),
       });
     }
   }
@@ -224,7 +305,7 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
 }
 
 /**
- * Closes them, and returns the ones ADO accepted.
+ * Closes them, and returns the ones the host accepted.
  *
  * The ones it accepted, not the ones we asked about: a close that failed left the thread
  * open, and recording it as an outcome would book a comment as acted on because we tried to
@@ -232,11 +313,11 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
  * human fixes — prloop's auto-close sets the same `fixed` status a person does and leaves no
  * comment behind, so the next run cannot tell them apart from the thread alone.
  */
-export async function resolveStaleThreads(ref: PrRef, stale: StaleThread[]): Promise<StaleThread[]> {
+export async function resolveStaleThreads(host: ReviewHost, stale: StaleThread[]): Promise<StaleThread[]> {
   const closed: StaleThread[] = [];
   for (const s of stale) {
     try {
-      await setThreadStatus(ref, s.threadId, "fixed");
+      await host.setThreadStatus(s.threadId, "fixed");
       closed.push(s);
       logVerbose(`  Closed thread ${s.threadId} (${s.file}:${s.line}): ${s.reason}`);
     } catch (e) {
@@ -301,7 +382,8 @@ export interface OutcomeRecord {
   fingerprint: string;
   file: string;
   category?: string;
-  outcome: "fixed" | "auto-closed";
+  outcome: "fixed" | "auto-closed" | "ignored" | "closed";
+  likes?: number;
 }
 
 /**
@@ -332,6 +414,43 @@ export function collectOutcomes(threads: Thread[], selfId?: string): OutcomeReco
       file: t.threadContext?.filePath ?? "",
       ...(m.category ? { category: m.category } : {}),
       outcome: "fixed",
+      ...(likesOf(c) === undefined ? {} : { likes: likesOf(c) }),
+    });
+  }
+  return out;
+}
+
+/**
+ * What became of the rest, read once the pull request has merged: a comment still open was
+ * ignored, and one a human set to "closed" was acknowledged without a verdict. Only for a
+ * merged PR — before the merge, an open comment is simply not answered YET.
+ *
+ * The addressed rate needs this denominator. Without it the only outcomes on record were
+ * the ones somebody acted on, so a category nobody ever responded to looked no worse than
+ * one that was always fixed — both had no dismissals.
+ *
+ * Same authorship rule as the other two collectors, for the same reason: a record here is a
+ * claim about prloop's own comment, and a store the PR author could write to would let them
+ * write the tool's success rate. First-record-wins in the store (libs/outcomes.ts) keeps a
+ * fix recorded earlier from being overwritten by this.
+ */
+export function collectFinalOutcomes(threads: Thread[], selfId?: string): OutcomeRecord[] {
+  const out: OutcomeRecord[] = [];
+  for (const t of threads) {
+    const outcome = t.status === "active" || t.status === "pending" ? "ignored" : t.status === "closed" ? "closed" : undefined;
+    if (!outcome) continue;
+    const c = t.comments?.find(
+      (x) => !x.isDeleted && readMarkers(x.content).ours && isSelfIdentity(x.author?.id, selfId),
+    );
+    if (!c) continue;
+    const m = readMarkers(c.content);
+    if (!m.fingerprint) continue;
+    out.push({
+      fingerprint: m.fingerprint,
+      file: t.threadContext?.filePath ?? "",
+      ...(m.category ? { category: m.category } : {}),
+      outcome,
+      ...(likesOf(c) === undefined ? {} : { likes: likesOf(c) }),
     });
   }
   return out;

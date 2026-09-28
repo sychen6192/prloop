@@ -17,7 +17,9 @@ diff inside them, each model's raw output, the skeptic verdicts, and `config.jso
 settings the run used and where each value came from. **These files contain the reviewed
 code.** `runs/` is gitignored, never uploaded anywhere by prloop, and pruned by
 `PRR_RUNS_KEEP` / `PRR_RUNS_MAX_AGE_DAYS`; treat the directory with the same care as a
-checkout of the repositories you review. Two JSONL files sit above the pruned run
+checkout of the repositories you review. prloop creates every directory under it readable by
+its owner only (0700), so another account on a shared build agent cannot list or read it;
+directories that already exist keep their mode. Two JSONL files sit above the pruned run
 directories and outlive them: `dismissals.jsonl`, the findings a reviewer rejected, and
 `outcomes.jsonl`, the ones they fixed. Both hold a fingerprint, a file path and a category —
 no source, no quote — and neither is ever read into a model prompt.
@@ -25,10 +27,11 @@ no source, no quote — and neither is ever read into a model prompt.
 ## What is defended
 
 - **Secrets are redacted where text leaves the process** (`libs/redact.ts`): log lines,
-  `runs/` artifacts, error messages and the summary comment posted on the PR. The motivating
-  leak: gateways that echo the presented credential back inside a 401 body, which was then
-  relayed into the log, into `runs/` and onto the pull request. Redaction is applied at the
-  egress, not per producer, so a new call site cannot forget it.
+  `runs/` artifacts, error messages, `prloop --config`, and every comment posted on the PR —
+  the summary and each inline finding, whose claim, evidence and suggested fix are the model's
+  own words. The motivating leak: gateways that echo the presented credential back inside a
+  401 body, which was then relayed into the log, into `runs/` and onto the pull request.
+  Redaction is applied at the egress, not per producer, so a new call site cannot forget it.
 - **Static analysis runs with a scrubbed environment** (`libs/shell.ts`, `scrubbedEnv`).
   `PRR_WORKDIR` is a checkout of the PR's *source branch*, and linters execute that branch's
   code — an eslint config, a Maven plugin or a lint hook is a program the PR author wrote. Every
@@ -39,7 +42,10 @@ no source, no quote — and neither is ever read into a model prompt.
   profile that exports `OPENAI_API_KEY` or `GITHUB_TOKEN` puts back every name the scrub just
   removed. `HOME` itself is passed through by design, so files under it (`~/.npmrc`,
   `~/.git-credentials`, the `~/.azure` token cache) remain readable by the setup command and by
-  the linters.
+  the linters. The fix check (`PRR_FIX_CHECKS`) writes a model's suggested fix into a file and
+  runs the same fact-tier tool again, under the same scrub; it adds no program to what runs —
+  `tsc` and `mypy` type-check a file, they do not execute it — and it only ever edits prloop's
+  own worktree, never a `PRR_WORKDIR` checkout somebody else owns.
 - **prloop's own state on the PR is bound to the identity that wrote it.** prloop keeps its
   cross-run state in hidden HTML comments inside its own comments (`publish/markers.ts`): the
   `--since auto` resume point, a finding's fingerprint, its category. Those markers are text
@@ -52,10 +58,16 @@ no source, no quote — and neither is ever read into a model prompt.
   `<!-- prloop:run=... -->` refreshed often enough would make prloop stand down from that PR
   for good. The dedupe readers deliberately stay on markers alone — forging
   those costs one missing comment, while requiring identity there would double-post whenever
-  prloop's credential differs between a laptop and a pipeline. Markers are read only from the
-  start of a comment body, so model-written text that quotes one is not mistaken for the
-  protocol. Where `connectionData` is unavailable (some on-prem Server versions) prloop falls
-  back to trusting the markers alone and says so, once, in the run log.
+  prloop's credential differs between a laptop and a pipeline. Identity, fingerprint and
+  category are read only from the markers at the start of a comment body, and the resume point
+  and the lease only from those at its end, after prloop's own closing line. Everything in
+  between may quote text prloop did not write — acceptance criteria, model claims and notes —
+  and passing the identity check does not make that text prloop's: a criterion typed as
+  `&lt;!-- prloop:iteration=5 --&gt;` reached the summary as a live marker once the work item
+  was flattened to text. So every HTML comment opener in the quoted text is also defused on
+  its way to the PR (`defuseHtmlComments`), which keeps it readable and keeps it from hiding
+  the rest of the comment. Where `connectionData` is unavailable (some on-prem Server
+  versions) prloop falls back to trusting the markers alone and says so, once, in the run log.
 - **Text prloop did not write is fenced before it reaches a model.** The PR description, the
   reviewed repository's own convention documents, the linked work items (title, description
   and every acceptance criterion) and the static-analysis reports each go into their prompt
@@ -67,17 +79,42 @@ no source, no quote — and neither is ever read into a model prompt.
   a work item's type — are collapsed to one line and capped, because a newline in one of them
   forges a section of the prompt. None of this is a guarantee against a determined injection;
   it makes the boundary explicit, which is what a model can act on.
+- **Code a skeptic's second reading is shown was chosen by the pipeline, and is fenced.** The
+  definitions and callers `gates/lookup.ts` finds are the repository's text — a comment in a
+  caller can address the model as well as the diff can — so they reach the prompt inside a
+  named fence like every other block prloop did not write. The names searched for are
+  identifiers taken from the accused lines, passed to `git grep -F` as fixed strings, never
+  through a shell.
 - **A static-analysis message is source text quoted back.** It becomes the claim of a comment
   prloop signs and the body of a triage prompt, so it is collapsed to one paragraph, stripped
   of HTML comments and leading markdown structure, and capped. Finding fingerprints hash the
   tool, the rule, the file and the line's own text — never the message — so this changes what
   is displayed and never what is suppressed.
+- **The `opencode` runner cannot hand the model a tool.** A review prompt carries text an
+  attacker can write — the diff, the description, the work items — so the agent that reads it
+  must be able to do nothing but answer. prloop does not trust an installed agent file for
+  that: `opencode run --agent` falls back to opencode's default agent, which has every tool,
+  when the named agent is a subagent or cannot be found, and prloop's own agent file used to
+  declare itself a subagent. Every run now gets prloop's definition — a primary agent with
+  every permission denied by name and by wildcard — through `OPENCODE_CONFIG_CONTENT`, which
+  opencode merges over user and project configs, and again as the `opencode.json` of the
+  empty temporary directory the run is launched from, well away from prloop's `.env`. A
+  run that still prints opencode's fallback warning is killed on that line, and its answer is
+  refused.
+- **Nothing runs at install time.** `.npmrc` sets `ignore-scripts`: none of prloop's
+  dependencies needs an install script, and a compromised release of one would otherwise run
+  with the environment of whoever installs. The CI workflows pin every action to a commit, not
+  a tag that can be moved.
 - **prloop never writes its own configuration** and never votes on a PR. It posts comments and,
   optionally, a status.
 
-Known limit worth stating: `prloop --config` redacts the registered secrets, but a password
-embedded in a proxy or base URL is printed as part of the URL. Scrub that line before sharing
-the output.
+`scripts/bench.ts` clones public repositories and reviews them like any other change, so their
+code goes to the configured model endpoint too; its clones, runs and scores stay wherever you
+point it (the README uses `runs/bench/`). Clone and fetch run with the same scrubbed
+environment as the static tools, and it executes nothing from the repositories it clones.
+
+Known limit worth stating: a `runs/` directory created before prloop made them owner-only
+keeps its old mode. On an existing install, run `chmod -R go-rwx runs/` once.
 
 ## Reporting a vulnerability
 

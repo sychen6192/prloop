@@ -11,7 +11,7 @@
 //              PMD). An LLM judges exploitability in context before anything is posted.
 //   suppress — style and convention noise (checkstyle, most eslint stylistic rules). Never
 //              becomes a comment; summarised as a count so it isn't silently dropped.
-import type { Severity } from "../config";
+import type { Severity } from "../libs/taxonomy";
 
 export type ToolTier = "fact" | "triage" | "suppress";
 
@@ -71,8 +71,8 @@ export interface ToolSpec {
 
 export interface Profile {
   language: string;
-  /** File extensions this profile claims. */
-  extensions: string[];
+  /** File extensions this profile claims, drawn from libs/lang.ts. */
+  extensions: readonly string[];
   tools: ToolSpec[];
   /** Rule ids that are always dropped, whatever tier the tool sits in. */
   ignoreRules?: string[];
@@ -91,5 +91,11 @@ export interface ToolFinding {
   severity: Severity;
   /** The tool's own severity string, kept for the report. */
   rawSeverity?: string;
+  /**
+   * The tool's own classification of the rule, where it has one: PMD's ruleset
+   * ("Security"), SpotBugs' bug category ("MT_CORRECTNESS"). The category mapping reads it
+   * before any guess from the rule id or the message.
+   */
+  group?: string;
   helpUri?: string;
 }

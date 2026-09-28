@@ -27,6 +27,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { RUNS_DIR } from "../config";
 import { normalizePath } from "../libs/fileindex";
+import { stampLabel, type RunStamp } from "../libs/stamp";
 
 // ─── The pure half (exported for the selftest) ──────────────────────────────
 
@@ -42,6 +43,8 @@ import { normalizePath } from "../libs/fileindex";
 export const STAGES = [
   "inline",
   "cap",
+  "pre-existing",
+  "silenced",
   "severity",
   "no-corroboration",
   "dismissed",
@@ -55,6 +58,8 @@ export type Stage = (typeof STAGES)[number];
 export const STAGE_FIX: Record<Stage, string> = {
   inline: "reported on the line",
   cap: "cut by PRR_MAX_INLINE_COMMENTS",
+  "pre-existing": "on lines the change did not touch — the summary's pre-existing list",
+  silenced: "the line carries a suppression marker — libs/suppression.ts",
   severity: "below PRR_MIN_INLINE_SEVERITY",
   "no-corroboration": "one finder only — add a finder, or a skeptic to clear it",
   dismissed: "a human dismissed this finding before; the golden entry may be wrong",
@@ -98,6 +103,8 @@ export interface EvaluatedFinding {
   suppressedBy?: string;
   /** From findings.json degraded: why the quote would not resolve to a line. */
   anchorFailure?: string;
+  /** What the finding said: scripts/bench.ts shows it to a judge. */
+  claim?: string;
 }
 
 export interface RunArtifacts {
@@ -106,6 +113,8 @@ export interface RunArtifacts {
   degraded: EvaluatedFinding[];
   /** Findings the skeptic majority refuted; they appear in no findings.json at all. */
   refuted: EvaluatedFinding[];
+  /** What produced the run (stampLabel), so a report can keep configurations apart. */
+  stamp?: string;
 }
 
 export interface DefectOutcome {
@@ -128,6 +137,8 @@ export interface RunEvaluation {
   falsePositives: EvaluatedFinding[];
   /** Inline comments matching neither a defect nor a clean region. Unknown, not wrong. */
   unattributed: EvaluatedFinding[];
+  /** The scored run's stamp label; absent on a run written before the stamp existed. */
+  stamp?: string;
 }
 
 const sameFile = (a: string, b: string) => normalizePath(a) === normalizePath(b);
@@ -138,9 +149,11 @@ function overlaps(f: EvaluatedFinding, r: Region): boolean {
   return f.start <= r.lines[1] && (f.end ?? f.start) >= r.lines[0];
 }
 
-/** Rank within belowBar: closest to having been published first. */
-const SUPPRESSION_RANK: Record<string, Stage> = {
+/** The stage each publish gate's suppression files a finding under. */
+export const SUPPRESSION_RANK: Record<string, Stage> = {
   cap: "cap",
+  "pre-existing": "pre-existing",
+  silenced: "silenced",
   severity: "severity",
   "no-corroboration": "no-corroboration",
   dismissed: "dismissed",
@@ -214,8 +227,11 @@ export function evaluateRun(golden: GoldenSet, run: RunArtifacts): RunEvaluation
     else unattributed.push(f);
   }
 
-  const reached = new Set<Stage>(["inline", "cap", "severity", "no-corroboration", "dismissed", "refuted"]);
+  // Every stage above the two that mean nothing was located, read off the ladder: a list
+  // kept by hand here missed the stages added to it later.
+  const reached = new Set<Stage>(STAGES.slice(0, STAGES.indexOf("anchor-failed")));
   return {
+    ...(run.stamp === undefined ? {} : { stamp: run.stamp }),
     outcomes,
     hits: outcomes.filter((o) => o.stage === "inline").length,
     found: outcomes.filter((o) => reached.has(o.stage)).length,
@@ -234,17 +250,28 @@ export interface Totals {
   unattributed: number;
   /** Finder model → defects it contributed to finding, at any stage. */
   byFinder: Map<string, number>;
+  /**
+   * Per stamp label: PRs scored and defects reported inline. A golden set scored across a
+   * prompt change is two measurements, and the totals above average them together.
+   */
+  byStamp: Map<string, { prs: number; defects: number; inline: number }>;
 }
 
 /** Sums per-PR evaluations. Separate from evaluateRun so both halves stay testable. */
 export function totalsOf(evaluations: RunEvaluation[]): Totals {
   const byStage = Object.fromEntries(STAGES.map((s) => [s, 0])) as Record<Stage, number>;
   const byFinder = new Map<string, number>();
+  const byStamp = new Map<string, { prs: number; defects: number; inline: number }>();
   let defects = 0;
   let inlineTotal = 0;
   let falsePositives = 0;
   let unattributed = 0;
   for (const e of evaluations) {
+    const st = byStamp.get(e.stamp ?? "(unstamped)") ?? { prs: 0, defects: 0, inline: 0 };
+    st.prs++;
+    st.defects += e.outcomes.length;
+    st.inline += e.outcomes.filter((o) => o.stage === "inline").length;
+    byStamp.set(e.stamp ?? "(unstamped)", st);
     defects += e.outcomes.length;
     inlineTotal += e.inlineTotal;
     falsePositives += e.falsePositives.length;
@@ -257,7 +284,7 @@ export function totalsOf(evaluations: RunEvaluation[]): Totals {
       for (const s of new Set(o.sources)) byFinder.set(s, (byFinder.get(s) ?? 0) + 1);
     }
   }
-  return { prs: evaluations.length, defects, byStage, inlineTotal, falsePositives, unattributed, byFinder };
+  return { prs: evaluations.length, defects, byStage, inlineTotal, falsePositives, unattributed, byFinder, byStamp };
 }
 
 // ─── Reading runs/ ──────────────────────────────────────────────────────────
@@ -289,6 +316,7 @@ function toFinding(v: unknown): EvaluatedFinding | undefined {
     ...(typeof o["category"] === "string" ? { category: o["category"] } : {}),
     ...(typeof o["suppressedBy"] === "string" ? { suppressedBy: o["suppressedBy"] } : {}),
     ...(typeof o["anchorFailure"] === "string" ? { anchorFailure: o["anchorFailure"] } : {}),
+    ...(typeof o["claim"] === "string" ? { claim: o["claim"] } : {}),
   };
 }
 
@@ -304,7 +332,14 @@ export function readRun(dir: string): RunArtifacts | undefined {
   const refuted = Array.isArray(skeptic)
     ? list(skeptic.filter((r) => typeof r === "object" && r !== null && (r as Record<string, unknown>)["killed"] === true))
     : [];
-  return { inline: list(f["inline"]), belowBar: list(f["belowBar"]), degraded: list(f["degraded"]), refuted };
+  const stamp = readJson(path.join(dir, "stamp.json"));
+  return {
+    inline: list(f["inline"]),
+    belowBar: list(f["belowBar"]),
+    degraded: list(f["degraded"]),
+    refuted,
+    ...(typeof stamp === "object" && stamp !== null ? { stamp: stampLabel(stamp as Partial<RunStamp>) } : {}),
+  };
 }
 
 export interface ScanResult {
@@ -451,6 +486,22 @@ export function renderReport(scan: ScanResult, t: Totals, root: string): string 
       `Precision is only as complete as mustNotFlag.`,
     "",
   );
+
+  // Said only when it matters: one configuration is the ordinary case, and a table with one
+  // row restates the headline.
+  if (t.byStamp.size > 1) {
+    out.push(
+      "Scored under more than one configuration — the totals above mix them. Per stamp",
+      "(commit, then hashes of prompts, rules, models and settings):",
+      table(
+        ["stamp", "PRs", "defects", "inline", "recall"],
+        [...t.byStamp.entries()]
+          .sort((a, b) => b[1].prs - a[1].prs || a[0].localeCompare(b[0]))
+          .map(([k, v]) => [k, String(v.prs), String(v.defects), String(v.inline), pct(v.inline, v.defects)]),
+      ),
+      "",
+    );
+  }
 
   const finders = [...t.byFinder.entries()].sort((a, b) => b[1] - a[1]);
   out.push(

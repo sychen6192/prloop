@@ -145,8 +145,16 @@ export interface DiffResult {
   changedLeftLines: Set<number>;
 }
 
-/** Groups an edit script into unified-diff hunks with asymmetric context. */
-export function buildHunks(a: string[], b: string[], edits: Edit[]): DiffResult {
+/**
+ * Groups an edit script into unified-diff hunks with asymmetric context. `context` overrides
+ * PRR_HUNK_CONTEXT_BEFORE/AFTER; infinite context is the whole file as one hunk.
+ */
+export function buildHunks(
+  a: string[],
+  b: string[],
+  edits: Edit[],
+  context: { before: number; after: number } = { before: HUNK_CONTEXT_BEFORE, after: HUNK_CONTEXT_AFTER },
+): DiffResult {
   const changedRightLines = new Set<number>();
   const changedLeftLines = new Set<number>();
   for (const e of edits) {
@@ -163,7 +171,7 @@ export function buildHunks(a: string[], b: string[], edits: Edit[]): DiffResult 
     return { hunks: [], changedRightLines, changedLeftLines };
   }
 
-  const gap = HUNK_CONTEXT_BEFORE + HUNK_CONTEXT_AFTER;
+  const gap = context.before + context.after;
   const groups: Array<{ start: number; end: number }> = [];
   let gStart = changeIdx[0]!;
   let gEnd = changeIdx[0]!;
@@ -194,8 +202,8 @@ export function buildHunks(a: string[], b: string[], edits: Edit[]): DiffResult 
 
   const hunks: Hunk[] = [];
   for (const g of groups) {
-    const from = Math.max(0, g.start - HUNK_CONTEXT_BEFORE);
-    const to = Math.min(edits.length - 1, g.end + HUNK_CONTEXT_AFTER);
+    const from = Math.max(0, g.start - context.before);
+    const to = Math.min(edits.length - 1, g.end + context.after);
 
     let leftCount = 0;
     let rightCount = 0;
@@ -226,11 +234,28 @@ export function buildHunks(a: string[], b: string[], edits: Edit[]): DiffResult 
   return { hunks, changedRightLines, changedLeftLines };
 }
 
-/** Renders hunks as a unified diff, with @@ headers carrying real file line numbers. */
-export function renderUnifiedDiff(path: string, hunks: Hunk[]): string {
-  const out: string[] = [`--- a${path}`, `+++ b${path}`];
+/**
+ * Renders hunks as a unified diff, with @@ headers carrying real file line numbers, and the
+ * `a/` and `b/` sides git writes — the rename's old name on the left.
+ *
+ * The header used to be `--- a${path}`, written for paths with a leading slash. Intake strips
+ * that slash, so every production prompt read `--- asrc/pay.ts`, while the selftest kept
+ * passing a slash-prefixed path production never produces. A model that copied the header
+ * into `file` then leaned on the basename to be resolved, and where two changed files share
+ * one, anchoring failed closed: a finding lost without a word.
+ */
+export function renderUnifiedDiff(
+  path: string,
+  hunks: Hunk[],
+  originalPath?: string,
+  scopeOf?: (h: Hunk) => string | undefined,
+): string {
+  const rel = (p: string) => p.replace(/^\/+/, "");
+  const out: string[] = [`--- a/${rel(originalPath ?? path)}`, `+++ b/${rel(path)}`];
   for (const h of hunks) {
-    out.push(`@@ -${h.leftStart},${h.leftCount} +${h.rightStart},${h.rightCount} @@`);
+    // After the closing @@, as git writes it: the declaration the hunk sits in (libs/scope.ts).
+    const scope = scopeOf?.(h);
+    out.push(`@@ -${h.leftStart},${h.leftCount} +${h.rightStart},${h.rightCount} @@${scope ? ` ${scope}` : ""}`);
     out.push(h.body);
   }
   return out.join("\n");

@@ -19,6 +19,16 @@ import { WORKTREE_SETUP_CMD, WORKTREE_SETUP_TIMEOUT_MS } from "../config";
 import { log, logVerbose } from "../libs/log";
 import { run } from "../libs/shell";
 
+// Every worktree this process has cut and not yet removed. A run normally removes each one as
+// soon as its last user is done; this is for the run that dies first (loop.ts's fatal path),
+// since one left behind per crashed tick accumulates on a cron box forever.
+const live = new Set<() => Promise<void>>();
+
+/** Removes every worktree still standing. Best effort; for the exit paths that skipped cleanup. */
+export async function cleanupAllWorktrees(): Promise<void> {
+  for (const cleanup of [...live]) await cleanup().catch(() => undefined);
+}
+
 export interface PreparedWorktree {
   dir: string;
   /** Removes the worktree. Safe to call twice; never throws. */
@@ -128,6 +138,7 @@ export async function prepareWorktree(
   const cleanup = async () => {
     if (removed) return;
     removed = true;
+    live.delete(cleanup);
     // --force because the setup command and the linters both write into the tree, and a
     // worktree git considers dirty is one it refuses to remove. `prune` catches the case
     // where the directory is already gone and only the administrative entry is left, which
@@ -140,6 +151,7 @@ export async function prepareWorktree(
     }
     logVerbose(`worktree: removed ${dir}`);
   };
+  live.add(cleanup);
 
   if (WORKTREE_SETUP_CMD) {
     log(`worktree: running PRR_WORKTREE_SETUP_CMD`);

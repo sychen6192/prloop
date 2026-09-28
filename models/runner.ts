@@ -26,7 +26,7 @@ import { Semaphore } from "../libs/limit";
 import { log, logVerbose } from "../libs/log";
 import { USER_AGENT, dispatcherFor, fetch } from "../libs/proxy";
 import { redactSecrets } from "../libs/redact";
-import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
+import type { ChatRequest, ChatResponse, ModelRunner, ModelErrorKind, TokenTotals } from "../libs/types";
 import { inlineSchema } from "./schemas";
 
 interface OpenAIChoice {
@@ -42,8 +42,11 @@ interface OpenAIChoice {
  * shrug — a production failure at exactly 301s only became explainable once the cause
  * (UND_ERR_HEADERS_TIMEOUT) was visible.
  */
+/** The deadline's own abort, as opposed to a connection that failed. */
+const isAbort = (e: unknown) => e instanceof Error && e.name === "AbortError";
+
 export function describeFetchError(e: unknown, timeoutMs: number): string {
-  if (e instanceof Error && e.name === "AbortError") {
+  if (isAbort(e)) {
     return `timeout (${Math.round(timeoutMs / 1000)}s)`;
   }
   const parts: string[] = [];
@@ -192,19 +195,24 @@ export class SseAccumulator {
  * proves the generation completed. Everything else shares the buffered path's shape
  * checks, so truncation and empty responses read identically in both modes.
  */
-export function describeStreamedCompletion(acc: SseAccumulator, maxTokens: number): string | undefined {
-  if (acc.streamError !== undefined) return acc.streamError;
+export function streamedCompletionFailure(acc: SseAccumulator, maxTokens: number): ModelFailure | undefined {
+  if (acc.streamError !== undefined) return { kind: "api", message: acc.streamError };
   if (!acc.done && acc.finishReason === undefined) {
-    return `stream cut after ${acc.content.length} chars (no finish_reason arrived)`;
+    return { kind: "stream-cut", message: `stream cut after ${acc.content.length} chars (no finish_reason arrived)` };
   }
-  return describeCompletionShape(acc.content, acc.reasoningChars, acc.finishReason, maxTokens);
+  return completionShapeFailure(acc.content, acc.reasoningChars, acc.finishReason, maxTokens);
+}
+
+/** streamedCompletionFailure's message alone. */
+export function describeStreamedCompletion(acc: SseAccumulator, maxTokens: number): string | undefined {
+  return streamedCompletionFailure(acc, maxTokens)?.message;
 }
 
 /**
  * The message a stalled stream fails with. Distinct from the deadline's `timeout (900s)`
  * on purpose: the fix is different (an engine that died mid-generation, not a budget that
  * is too small), and the char count says whether anything was generated before the silence.
- * Transient by isTransientModelError, so the ordinary retry handles it — the point of the
+ * Transient by isTransient ("stalled"), so the ordinary retry handles it — the point of the
  * stall timer is to REACH that retry in two minutes instead of fifteen. Pure, for the test.
  */
 export function streamStallMessage(stallMs: number, chars: number): string {
@@ -218,8 +226,9 @@ export function streamStallMessage(stallMs: number, chars: number): string {
  * an auth failure would fail identically in either mode and stays with the normal retry
  * taxonomy.
  */
-export function isStreamingRejection(error: string): boolean {
-  return /^HTTP 4\d\d/.test(error) && /stream/i.test(error);
+export function isStreamingRejection(res: Pick<ChatResponse, "error" | "errorKind" | "status">): boolean {
+  const status = res.status ?? 0;
+  return res.errorKind === "http" && status >= 400 && status < 500 && /stream/i.test(res.error ?? "");
 }
 
 // ─── Reasoning ───────────────────────────────────────────────────────────────
@@ -386,7 +395,7 @@ export class OpenAICompatRunner implements ModelRunner {
   async chat(req: ChatRequest): Promise<ChatResponse> {
     const wantStream = LLM_STREAM && !this.buffered;
     const res = await this.request(req, wantStream);
-    if (wantStream && res.error !== undefined && isStreamingRejection(res.error)) {
+    if (wantStream && res.error !== undefined && isStreamingRejection(res)) {
       this.buffered = true;
       logVerbose(
         `${req.model}: backend rejected streaming (${res.error.slice(0, 120)}); buffered mode for the rest of this run`,
@@ -447,6 +456,8 @@ export class OpenAICompatRunner implements ModelRunner {
           text: "",
           model: req.model,
           error: redactSecrets(`HTTP ${res.status}: ${text.slice(0, 500)}`),
+          errorKind: "http",
+          status: res.status,
           ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
         };
       }
@@ -458,7 +469,7 @@ export class OpenAICompatRunner implements ModelRunner {
       }
       return this.parseBuffered(await res.text(), req, started);
     } catch (e) {
-      return { text: "", model: req.model, error: describeFetchError(e, timeoutMs) };
+      return { text: "", model: req.model, error: describeFetchError(e, timeoutMs), errorKind: isAbort(e) ? "timeout" : "transport" };
     } finally {
       clearTimeout(timer);
     }
@@ -469,21 +480,21 @@ export class OpenAICompatRunner implements ModelRunner {
     try {
       parsed = JSON.parse(text) as OpenAIResponse;
     } catch {
-      return { text: "", model: req.model, error: `response is not JSON: ${text.slice(0, 500)}` };
+      return { text: "", model: req.model, error: `response is not JSON: ${text.slice(0, 500)}`, errorKind: "not-json" };
     }
     if (parsed.error?.message) {
-      return { text: "", model: req.model, error: parsed.error.message };
+      return { text: "", model: req.model, error: parsed.error.message, errorKind: "api" };
     }
     const choice = parsed.choices?.[0];
     const content = choice?.message?.content ?? "";
     const reasoned = (choice?.message?.reasoning ?? choice?.message?.reasoning_content ?? "").length;
 
-    const bad = describeBadCompletion(choice, req.maxTokens ?? LLM_MAX_TOKENS);
+    const bad = badCompletion(choice, req.maxTokens ?? LLM_MAX_TOKENS);
     // The usage rides along even on the failure: this response ARRIVED, so the endpoint
     // billed for it — and a completion truncated at the token limit is the most expensive
     // failure there is. Dropping its counts made the one call that spent a full budget the
     // one call that looked free, and withRetries' summation had nothing to sum.
-    if (bad) return { text: content, model: req.model, error: bad, ...usageOf(parsed.usage) };
+    if (bad) return { text: content, model: req.model, error: bad.message, errorKind: bad.kind, ...usageOf(parsed.usage) };
     return this.accept(req, started, content, reasoned, parsed.usage, false);
   }
 
@@ -533,7 +544,7 @@ export class OpenAICompatRunner implements ModelRunner {
       // only this flag tells them apart, and they need different messages: one says raise
       // the timeout, the other says the engine stopped sending.
       if (!stalled) throw e;
-      return { text: "", model: req.model, error: streamStallMessage(this.stallMs, acc.content.length) };
+      return { text: "", model: req.model, error: streamStallMessage(this.stallMs, acc.content.length), errorKind: "stalled" };
     } finally {
       // Never let the timer outlive the stream: a fire after the response was returned
       // would abort the NEXT use of this controller and blame the wrong call.
@@ -542,7 +553,7 @@ export class OpenAICompatRunner implements ModelRunner {
     if (acc.badLines > 0) {
       logVerbose(`${req.model}: skipped ${acc.badLines} unparseable SSE line(s), first: ${acc.badSample ?? ""}`);
     }
-    const bad = describeStreamedCompletion(acc, req.maxTokens ?? LLM_MAX_TOKENS);
+    const bad = streamedCompletionFailure(acc, req.maxTokens ?? LLM_MAX_TOKENS);
     if (bad) {
       // Transport-class failures (in-band error, cut stream) return no text, like every
       // other transport failure; shape-class failures (truncation) keep the partial
@@ -550,7 +561,7 @@ export class OpenAICompatRunner implements ModelRunner {
       const transport = acc.streamError !== undefined || (!acc.done && acc.finishReason === undefined);
       // Same rule as the buffered path: whatever the stats chunk had already reported was
       // billed, whether or not the stream then died.
-      return { text: transport ? "" : acc.content, model: req.model, error: bad, ...usageOf(acc.usage) };
+      return { text: transport ? "" : acc.content, model: req.model, error: bad.message, errorKind: bad.kind, ...usageOf(acc.usage) };
     }
     return this.accept(req, started, acc.content, acc.reasoningChars, acc.usage, true);
   }
@@ -578,23 +589,29 @@ export class OpenAICompatRunner implements ModelRunner {
   }
 }
 
+/** A failure as the runner reports it: what happened, for people, and its kind, for code. */
+export interface ModelFailure {
+  message: string;
+  kind: ModelErrorKind;
+}
+
 /** Shape checks shared by the buffered and streamed paths. */
-function describeCompletionShape(
+function completionShapeFailure(
   content: string,
   reasonedChars: number,
   finishReason: string | undefined,
   maxTokens: number,
-): string | undefined {
+): ModelFailure | undefined {
   const reasoningNote =
     reasonedChars > 0 ? `. The model emitted ${reasonedChars} chars of reasoning, billed to the same budget` : "";
 
   if (finishReason === "length") {
-    return `response truncated at the token limit (${maxTokens}); raise PRR_LLM_MAX_TOKENS${reasoningNote}`;
+    return { kind: "truncated", message: `response truncated at the token limit (${maxTokens}); raise PRR_LLM_MAX_TOKENS${reasoningNote}` };
   }
   if (!content.trim()) {
     return reasonedChars > 0
-      ? `model returned only reasoning (${reasonedChars} chars) and no answer; raise PRR_LLM_MAX_TOKENS`
-      : "model returned an empty response";
+      ? { kind: "reasoning-only", message: `model returned only reasoning (${reasonedChars} chars) and no answer; raise PRR_LLM_MAX_TOKENS` }
+      : { kind: "empty", message: "model returned an empty response" };
   }
   return undefined;
 }
@@ -611,7 +628,7 @@ function describeCompletionShape(
  * model spent 7842 of 8192 tokens, most of it in `reasoning` — 4% of headroom away from
  * silently returning zero findings.
  */
-export function describeBadCompletion(
+export function badCompletion(
   choice:
     | {
         message?: { content?: string | null; reasoning?: string | null; reasoning_content?: string | null };
@@ -619,14 +636,19 @@ export function describeBadCompletion(
       }
     | undefined,
   maxTokens: number,
-): string | undefined {
+): ModelFailure | undefined {
   const msg = choice?.message;
-  return describeCompletionShape(
+  return completionShapeFailure(
     msg?.content ?? "",
     (msg?.reasoning ?? msg?.reasoning_content ?? "").length,
     choice?.finish_reason,
     maxTokens,
   );
+}
+
+/** badCompletion's message alone. */
+export function describeBadCompletion(choice: Parameters<typeof badCompletion>[0], maxTokens: number): string | undefined {
+  return badCompletion(choice, maxTokens)?.message;
 }
 
 /**
@@ -637,23 +659,26 @@ export function describeBadCompletion(
  * that arrived but was unusable (truncated at the token limit, empty, non-JSON body) is
  * DETERMINISTIC — the retry burns a second full-length call to reproduce the identical
  * failure. Only network/5xx/timeout classes are worth a second attempt — a cut stream and
- * a stalled one land there too.
+ * a stalled one land there too. Read off the kind the failure was given where it happened
+ * (ModelErrorKind): it used to be read back out of the message with regexes, so rewording a
+ * message could quietly change what was retried.
  */
-/**
- * True for the one failure whose partial text is still worth reading: a completion cut at
- * the token limit, which usually holds a run of complete items before the cut (see
- * salvageArrayItems). The message is the one describeCompletionShape writes.
- */
-export function isTruncation(error: string): boolean {
-  return /truncated at the token limit/.test(error);
-}
-
-export function isTransientModelError(error: string): boolean {
-  if (/^HTTP (4\d\d)/.test(error)) return /^HTTP (408|429)/.test(error);
-  if (/truncated at the token limit|returned only reasoning|empty response|response is not JSON/.test(error)) {
-    return false;
+export function isTransient(res: Pick<ChatResponse, "errorKind" | "status">): boolean {
+  switch (res.errorKind) {
+    case "truncated":
+    case "reasoning-only":
+    case "empty":
+    case "not-json":
+      return false;
+    case "http": {
+      // A 4xx is the request being refused, and would be again — except a timeout (408) and a
+      // rate limit (429), which say to come back.
+      const status = res.status ?? 0;
+      return status < 400 || status >= 500 || status === 408 || status === 429;
+    }
+    default:
+      return true;
   }
-  return true;
 }
 
 /**
@@ -712,7 +737,7 @@ function withRetries(inner: ModelRunner, attempts: number): ModelRunner {
         return res;
       };
       let last = await once();
-      for (let i = 0; i < attempts && last.error && isTransientModelError(last.error); i++) {
+      for (let i = 0; i < attempts && last.error && isTransient(last); i++) {
         const wait = backoffMs(i, last.retryAfterMs);
         logVerbose(
           `retrying ${req.model} in ${Math.round(wait / 1000)}s after transient failure: ${last.error.slice(0, 160)}`,
@@ -731,18 +756,17 @@ function withRetries(inner: ModelRunner, attempts: number): ModelRunner {
 // The adapter has always parsed usage out of the response; this is the one place every
 // call passes through, so totals are collected here instead of threading counters
 // through four gate modules. Read at the end of a run for the summary and artifacts.
-export interface TokenTotals {
-  calls: number;
-  promptTokens: number;
-  completionTokens: number;
-}
-const totals: TokenTotals = { calls: 0, promptTokens: 0, completionTokens: 0 };
+//
+// Per runner, not per process: a review is handed its runner, so the runner's totals are the
+// run's. They used to be one module-level count, which a second review in the same process —
+// every test that runs two — read as its own.
+export const NO_TOKENS: TokenTotals = { calls: 0, promptTokens: 0, completionTokens: 0 };
 
-export function tokenTotals(): TokenTotals {
-  return { ...totals };
-}
+/** What a runner has spent so far; nothing, for one that does not count. */
+export const tokensOf = (runner: ModelRunner | undefined): TokenTotals => runner?.tokens?.() ?? { ...NO_TOKENS };
 
 function counted(inner: ModelRunner): ModelRunner {
+  const totals: TokenTotals = { ...NO_TOKENS };
   return {
     async chat(req) {
       const res = await inner.chat(req);
@@ -751,6 +775,7 @@ function counted(inner: ModelRunner): ModelRunner {
       totals.completionTokens += res.completionTokens ?? 0;
       return res;
     },
+    tokens: () => ({ ...totals }),
   };
 }
 

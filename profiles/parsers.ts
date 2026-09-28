@@ -2,7 +2,7 @@
 // never knows which linter a finding came from.
 import { parseJsonObject } from "../libs/json";
 import { log } from "../libs/log";
-import type { Severity } from "../config";
+import type { Severity } from "../libs/taxonomy";
 import type { OutputFormat, ToolFinding, ToolSpec } from "./types";
 
 function rel(p: string, workdir: string): string {
@@ -103,8 +103,10 @@ function parseRuffJson(raw: string, spec: ToolSpec, workdir: string): ToolFindin
       file: rel(f.filename!, workdir),
       line: f.location!.row!,
       endLine: f.end_location?.row,
-      // Ruff has no severity axis; the S-prefixed (bandit) rules are the security ones.
-      severity: (f.code ?? "").startsWith("S") ? "high" : "medium",
+      // Ruff has no severity axis; its flake8-bandit rules are the security ones. Those are
+      // S followed by digits — a bare "S" prefix also caught the whole flake8-simplify
+      // family (SIM102, SIM108), and rated every one of them high.
+      severity: /^S\d/.test(f.code ?? "") ? "high" : "medium",
       helpUri: f.url,
     }));
 }
@@ -165,6 +167,8 @@ function parseCheckstyleXml(raw: string, spec: ToolSpec, workdir: string): ToolF
       if (!Number.isFinite(line) || line <= 0) continue;
       const endLine = Number(attr(a, "endline"));
       const src = attr(a, "source") ?? attr(a, "rule") ?? "";
+      // PMD names the ruleset a rule belongs to; Checkstyle has no equivalent.
+      const ruleset = attr(a, "ruleset");
       // Checkstyle says `severity` in words; PMD's <violation> says `priority`, 1 = most
       // severe down to 5. The shared numeric mapping reads the other way ("2" is high
       // there, "1" medium), so every priority-1 PMD violation was filed as medium and
@@ -193,6 +197,7 @@ function parseCheckstyleXml(raw: string, spec: ToolSpec, workdir: string): ToolF
         ...(Number.isFinite(endLine) && endLine >= line ? { endLine } : {}),
         severity,
         rawSeverity: severityWord ?? (priority !== undefined ? `priority ${priority}` : undefined),
+        ...(ruleset ? { group: decodeXml(ruleset) } : {}),
       });
     }
   }
@@ -235,9 +240,11 @@ function parseSpotbugsXml(raw: string, spec: ToolSpec, workdir: string): ToolFin
     const priority = attr(head, "priority") ?? "";
     const severity: Severity = priority === "1" ? "high" : priority === "2" ? "medium" : "low";
 
+    const category = attr(head, "category");
     out.push({
       tool: spec.name,
       tier: spec.tier,
+      ...(category ? { group: category } : {}),
       ruleId: attr(head, "type") ?? "SPOTBUGS",
       message: decodeXml(text(body, "LongMessage") ?? text(body, "ShortMessage") ?? attr(head, "type") ?? ""),
       file: rel(sourcepath, workdir),

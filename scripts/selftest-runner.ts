@@ -15,29 +15,7 @@
 import { fakeOpenAI, completion, httpError, sse, sseDelta, sseUsage, SSE_DONE } from "./fakes/openai";
 // Type-only: erased at compile time, so it does not import config before the env is set.
 import type { CallRecord } from "../libs/artifacts";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
+import { check, eq, report, section } from "./selftest/harness";
 
 const endpoint = await fakeOpenAI();
 try {
@@ -51,11 +29,13 @@ try {
   process.env["PRR_LLM_STREAM"] = "1";
   process.env["PRR_QUIET"] = "1";
 
-  const { OpenAICompatRunner, createRunner, tokenTotals } = await import("../models/runner");
+  const { OpenAICompatRunner, createRunner, tokensOf } = await import("../models/runner");
   const { attachCallSink, detachCallSink } = await import("../libs/artifacts");
 
   const ask = { model: "m", system: "s", user: "u" };
-  /** Token totals are a process-wide accumulator; every assertion here is on the delta. */
+  /** A runner's totals accumulate over its calls; every assertion here is on the delta. */
+  let counting: import("../libs/types").ModelRunner | undefined;
+  const tokenTotals = () => tokensOf(counting);
   const since = (before: ReturnType<typeof tokenTotals>) => {
     const now = tokenTotals();
     return {
@@ -198,6 +178,7 @@ try {
   section("token accounting: one logical call, every attempt's usage");
   {
     const runner = await createRunner();
+    counting = runner;
 
     // A truncated completion is DETERMINISTIC, so it is not retried — and it is also the
     // most expensive kind of failure there is: the endpoint billed a full budget for it.
@@ -210,6 +191,11 @@ try {
     eq("...counted as one call", since(before).calls, 1);
     eq("...billed for the prompt it sent", since(before).promptTokens, 1200);
     eq("...and for the budget it burned", since(before).completionTokens, 8192);
+    // Totals belong to the runner a review was given, so a second review in the same process
+    // starts from nothing rather than from the first one's bill.
+    const another = await createRunner();
+    eq("another runner has spent nothing", tokensOf(another), { calls: 0, promptTokens: 0, completionTokens: 0 });
+    eq("...and a runner that does not count reads as having spent nothing", tokensOf({ chat: async () => ({ text: "", model: "m" }) }).calls, 0);
 
     // A retry sequence: the endpoint billed for BOTH attempts, so both must be counted,
     // while the caller still made one logical call.
@@ -239,5 +225,4 @@ try {
   await endpoint.close();
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

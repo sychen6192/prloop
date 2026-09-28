@@ -10,11 +10,14 @@
 // "asked for in the prompt". We compensate by injecting the schema as text (schemas.ts,
 // inlineSchema) — and by nothing else: a parse failure is NOT retried, here or anywhere.
 // models/runner.ts wraps this runner in withRetries like any other, but
-// isTransientModelError returns false for parse-shaped failures on purpose, because asking
+// isTransient returns false for parse-shaped failures on purpose, because asking
 // the same model the same question again is not a fix for an answer it was capable of
 // giving wrongly. So a weak model complies less reliably here than on the openai path, and
 // a non-conforming answer costs the whole call. Prefer the openai runner when the endpoint
 // supports guided decoding.
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { run } from "../libs/shell";
 import {
   AGENT_TIMEOUT_MS,
@@ -25,6 +28,7 @@ import {
 } from "../config";
 import { log, logVerbose, startHeartbeat } from "../libs/log";
 import { inlineSchema } from "./schemas";
+import type { ModelFailure } from "./runner";
 import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
 
 export interface Acc {
@@ -53,6 +57,61 @@ function errorMessage(node: unknown, depth = 0): string | undefined {
   return undefined;
 }
 
+// Every permission key opencode documents. Each is denied by name as well as by the wildcard:
+// a named key overwrites the same key from any config merged before prloop's, whereas a lone
+// "*" can lose to a more specific "allow" a user's global config grants that agent.
+const PERMISSION_KEYS = [
+  "read", "edit", "glob", "grep", "list", "bash", "task", "external_directory", "todowrite",
+  "webfetch", "websearch", "lsp", "skill", "question",
+] as const;
+
+/**
+ * The agent every opencode run uses, as prloop defines it — handed to opencode at run time,
+ * never trusted from whatever the machine has installed. Exported for the selftest.
+ *
+ * A review prompt carries a pull request's code, description and work items: text an
+ * attacker writes. The agent file `npm run setup` installs denies every tool, but nothing
+ * checked that the agent opencode ran was that file, and it was not: the file declared
+ * `mode: subagent`, and `opencode run --agent` falls back to the DEFAULT agent — every tool
+ * enabled — for a subagent, and for an agent it cannot find. Launched in prloop's own
+ * directory, next to `.env`.
+ *
+ * So the definition is prloop's, a primary agent that may use nothing, and it overrides
+ * whatever that name means elsewhere. The prompt is set only for the agent prloop ships: an
+ * operator who points PRR_OPENCODE_AGENT at their own agent keeps its instructions, but not
+ * its tools.
+ */
+export function reviewerAgentConfig(agent: string, prompt?: string): Record<string, unknown> {
+  return {
+    $schema: "https://opencode.ai/config.json",
+    agent: {
+      [agent]: {
+        mode: "primary",
+        ...(prompt === undefined ? {} : { description: "prloop's review agent: answers in JSON and uses no tools", prompt }),
+        permission: { "*": "deny", ...Object.fromEntries(PERMISSION_KEYS.map((k) => [k, "deny"])) },
+        // The older spelling of the same thing, for an opencode that predates `permission`.
+        tools: { "*": false, ...Object.fromEntries(PERMISSION_KEYS.map((k) => [k, false])) },
+      },
+    },
+  };
+}
+
+/** The instructions of the agent prloop ships (agents/prloop-reviewer.md), frontmatter off. */
+function shippedAgentPrompt(): string | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(PRLOOP_ROOT, "agents", "prloop-reviewer.md"), "utf8");
+    return raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What opencode prints when it will not run the agent it was given. Watched for and killed
+ * on, because the agent it runs instead is the one with every tool.
+ */
+export const DEFAULT_AGENT_FALLBACK = /Falling back to default agent/i;
+
 /**
  * The error a finished opencode run reports, or undefined for a completion the caller's
  * parse should judge. Exported for the selftest.
@@ -71,15 +130,25 @@ export function runFailure(run: {
   signal: string | null;
   lastError?: string;
   text: string;
-}): string | undefined {
+  killedOn?: string;
+}): ModelFailure | undefined {
+  // Whatever it produced, it produced it as an agent with tools, on a prompt an attacker
+  // helped write: there is no answer here worth reading.
+  if (run.killedOn !== undefined) {
+    return {
+      kind: "process",
+      message: `opencode would not run the ${OPENCODE_AGENT} agent and fell back to its default one, which can use tools; killed before it could ("${run.killedOn}")`,
+    };
+  }
   const detail = run.lastError ? `: ${run.lastError}` : "";
-  if (run.timedOut) return `timeout (${run.timeoutMs}ms)${detail}`;
+  if (run.timedOut) return { kind: "timeout", message: `timeout (${run.timeoutMs}ms)${detail}` };
   // The CLI produced an answer; a non-zero exit next to real output (a warning treated as
   // fatal at shutdown, say) is for the schema parse to judge, not for this to discard.
   if (run.text.trim()) return undefined;
-  if (run.code !== null && run.code !== 0) return `opencode exited ${run.code}${detail}`;
-  if (run.signal) return `opencode killed by ${run.signal}${detail}`;
-  return run.lastError;
+  if (run.code !== null && run.code !== 0) return { kind: "process", message: `opencode exited ${run.code}${detail}` };
+  if (run.signal) return { kind: "process", message: `opencode killed by ${run.signal}${detail}` };
+  // An error the CLI reported in-band, with nothing else to go on.
+  return run.lastError === undefined ? undefined : { kind: "api", message: run.lastError };
 }
 
 // Parses one JSONL event. The real event kind lives in part.type (hyphenated); the outer
@@ -152,7 +221,13 @@ export function buildInvocation(
   return args;
 }
 
-async function runOnce(label: string, model: string, prompt: string, timeoutMs: number): Promise<ChatResponse> {
+/** Where every run is launched, and the configuration it is launched with. */
+interface Sandbox {
+  dir: string;
+  config: string;
+}
+
+async function runOnce(label: string, model: string, prompt: string, timeoutMs: number, sandbox: Sandbox): Promise<ChatResponse> {
   log(`[${label}] opencode session started (model=${model || "(agent default)"})`);
   const stopHeartbeat = startHeartbeat(`[${label}]`);
   const started = Date.now();
@@ -167,7 +242,13 @@ async function runOnce(label: string, model: string, prompt: string, timeoutMs: 
   // grandchild holding an inherited pipe from hanging the run, and an idempotent
   // completion. This used to be a second copy of all of it — one that had dropped the
   // output cap — because run() could not write stdin or stream stdout by line. It can now.
-  const res = await run(OPENCODE_BIN, args, timeoutMs, PRLOOP_ROOT, {
+  // Launched from an empty directory of its own, not prloop's, which holds `.env`: a model
+  // that got a read tool anyway would find nothing next to it. The same configuration goes
+  // in twice — inline, which current opencode merges over every user and project config,
+  // and as that directory's opencode.json, which older versions read as the project's.
+  const res = await run(OPENCODE_BIN, args, timeoutMs, sandbox.dir, {
+    env: { OPENCODE_CONFIG_CONTENT: sandbox.config },
+    killOn: DEFAULT_AGENT_FALLBACK,
     // opencode blocks reading stdin to EOF before it prompts the model.
     stdin: prompt,
     onStdoutLine: (line: string) => {
@@ -194,21 +275,23 @@ async function runOnce(label: string, model: string, prompt: string, timeoutMs: 
     // line) and sends people to reinstall a CLI that is already there.
     const spawnError = `${res.stderr.trim()} — install the opencode CLI, or set PRR_OPENCODE_BIN`;
     log(`[${label}] [FAIL] ${spawnError}`);
-    return { text: "", model, error: spawnError };
+    return { text: "", model, error: spawnError, errorKind: "process" };
   }
 
   const text = OPENCODE_JSON_EVENTS ? (acc.text.trim() ? acc.text : acc.lastText) : res.stdout;
   // A killed or crashed run is not a completed one: it resolves WITH an error (so the
   // transient retry can fire and the stage is reported as failed) and still hands back what
   // arrived, for the artifacts.
-  const error = runFailure({
+  const failure = runFailure({
     timedOut: res.timedOut === true,
     timeoutMs,
     code: res.code,
     signal: res.signal ?? null,
     lastError: acc.lastError,
     text,
+    ...(res.killedOn === undefined ? {} : { killedOn: res.killedOn }),
   });
+  const error = failure?.message;
   log(
     res.timedOut
       ? `[${label}] timed out (elapsed ${secs}s, ${text.length} chars kept)`
@@ -220,7 +303,7 @@ async function runOnce(label: string, model: string, prompt: string, timeoutMs: 
     ...(acc.inputTokens === undefined ? {} : { promptTokens: acc.inputTokens }),
     ...(acc.outputTokens === undefined ? {} : { completionTokens: acc.outputTokens }),
   };
-  return error === undefined ? { text, model, ...usage } : { text, model, ...usage, error };
+  return failure === undefined ? { text, model, ...usage } : { text, model, ...usage, error: failure.message, errorKind: failure.kind };
 }
 
 // Said once per process, not per call: a fleet of finders would otherwise print the same
@@ -234,6 +317,24 @@ function warnUnsupported(field: string, value: unknown, why: string): void {
 }
 
 export class OpencodeRunner implements ModelRunner {
+  private readonly sandbox: Sandbox;
+
+  /**
+   * Throws when the sandbox cannot be prepared: no run may start without prloop's own agent
+   * definition in force, and createRunner is the one place a whole review can still refuse.
+   */
+  constructor() {
+    const config = JSON.stringify(
+      reviewerAgentConfig(OPENCODE_AGENT, OPENCODE_AGENT === "prloop-reviewer" ? shippedAgentPrompt() : undefined),
+      null,
+      2,
+    );
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-opencode-"));
+    fs.writeFileSync(path.join(dir, "opencode.json"), config);
+    process.once("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
+    this.sandbox = { dir, config };
+  }
+
   async chat(req: ChatRequest): Promise<ChatResponse> {
     // opencode has no separate system-message channel here; the role contract lives in the
     // agent .md and everything task-specific is injected into the prompt — "injection over
@@ -255,6 +356,6 @@ export class OpencodeRunner implements ModelRunner {
     // This one it CAN keep. The skeptic sets it because verifying one finding against 25
     // lines is nothing like reading a whole diff, and under this runner every such call was
     // getting the 15-minute agent deadline instead.
-    return runOnce(label, req.model, prompt, req.timeoutMs ?? AGENT_TIMEOUT_MS);
+    return runOnce(label, req.model, prompt, req.timeoutMs ?? AGENT_TIMEOUT_MS, this.sandbox);
   }
 }

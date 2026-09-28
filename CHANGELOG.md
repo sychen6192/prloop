@@ -11,6 +11,124 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **Suggested fixes are checked before they are posted, and shown as diffs.** An inline
+  code suggestion is the strongest predictor that a comment is acted on (arXiv 2607.21997),
+  and a fix that does not compile is worse than none. With `PRR_WORKTREE_REPO` set, the first
+  `PRR_FIX_CHECKS` (3) fixes about to be posted are applied to their anchored lines in
+  prloop's own worktree and the file's fact-tier tool (`tsc`, `mypy`) runs over its project;
+  anything it reports that it did not report before the edit — an error the edited lines
+  already had is not blamed on the fix — drops the fix, never the finding, and is logged and
+  kept in `findings.json`. A fix that passes is headed "typechecks with tsc". The worktree
+  is kept for the check and removed right after it, or by the fatal exit path if the run dies
+  first. Every posted fix is now a `diff` block against the lines it replaces, since Azure
+  DevOps renders no GitHub `suggestion` block.
+- **The unattended mode, packaged for Azure DevOps.** `--active <project or repository URL>`
+  asks Azure DevOps for the active, non-draft pull requests and reviews them as `--batch` would
+  a file, so a scheduled sweep no longer depends on a list somebody keeps up to date.
+  `PRR_BATCH_PARALLEL` runs that many at once, each child with its share of
+  `PRR_LLM_CONCURRENCY` and `PRR_ADO_CONCURRENCY` rather than all of it (N children at the full
+  limit would be N times what the endpoint was sized for), its output prefixed with its pull
+  request. `PRR_REPO_OVERRIDES` names a JSON file of per-repository `PRR_` settings for the
+  children, every key checked before anything runs. A run warns loudly when its runs directory
+  — where reviewers' dismissals are learned — is prloop's own checkout inside a CI job's
+  workspace, or under the temporary directory: neither outlives the job, and every dismissed
+  comment comes back. A run whose lease ran out and was taken over while it was still
+  reviewing now finds that out just before posting and posts nothing, with the reason as exit
+  `3`, instead of interleaving its comments and summary with the run that took over. And
+  `examples/azure-pipelines/` has a build-validation pipeline and a scheduled sweep to start
+  from, both carrying the runs directory between jobs with the Cache task — which saves only
+  after a job that succeeded, so they fail the job only when prloop could not run and leave
+  the merge gate to the status prloop posts.
+- **`PRR_RISK_TIERS=1`: review depth from the change itself, Cloudflare's trivial / lite /
+  full.** Every finder and verifier call carries the same system prompt, rules and repository
+  conventions, so on a three-line change the fixed part of the prompt is nearly all of the
+  cost. With the knob on, a change of at most 20 changed lines in 3 files gets one finder, one
+  verifier round and inline comments one severity stricter than `PRR_MIN_INLINE_SEVERITY`
+  (never past `high`); one of at most 200 lines in 15 files gets two finders; anything larger
+  gets everything configured. `PRR_SENSITIVE_PATHS` lists globs whose changes always get the
+  full review. A second finder is kept whenever there is no skeptic to corroborate one — a
+  single finder would then post nothing. On `--since auto` the tier is the push's, so a small
+  follow-up push gets the light review. The tier and why are in the log, `context.json` and
+  the summary's run notes, and a replay applies the same bar. Off by default: fewer finders
+  find less, and `scripts/bench.ts compare` is how to decide it is worth it.
+- **The instruction files teams already write for Copilot, Cursor and coding agents are read,
+  each in its own scope.** Six fixed root files used to be the whole list. Now also
+  `.github/copilot-instructions.md` and `.cursorrules` for the whole repository; Copilot's
+  `.github/instructions/*.instructions.md` (and `.azuredevops/instructions/`) where their
+  `applyTo` matches a changed file, skipping any marked `excludeAgent: "code-review"`; Cursor's
+  `.cursor/rules/*.mdc` when `alwaysApply` is set or their `globs` match; and an `AGENTS.md` or
+  `CLAUDE.md` in a directory above a changed file, for the files beneath it — the Anthropic
+  review plugin's scoping. All of it is read at the target commit, like the root documents, so
+  a pull request cannot write the instructions it is reviewed by. Each scoped document is
+  labelled with what it applies to, and the narrower of two that disagree wins. The documents
+  share a 16k-character budget (was 12k) split evenly, shortest first, instead of first come
+  first served, which let two long root files crowd out everything after them; past twelve,
+  the rest are named and not read. The summary's run notes list what was read. A convention
+  file that opens with an HTML comment (a markdownlint directive) is no longer mistaken for a
+  sign-in page and dropped. `.cursor/rules` was claimed in PROPOSAL.md and never read until now.
+- **`PRR_STATIC_BASELINE=1`: the fact tools run at the merge base too, and only what the change
+  caused counts.** `tsc` and `mypy` check the whole project, and the gate kept only what they
+  said about changed lines — so a caller the change broke, in a file it did not touch, was
+  filtered away with every pre-existing error. With the knob on, prloop cuts a second worktree
+  at the merge base, runs the fact-tier tools there as well, and subtracts Semgrep-style:
+  tool, rule, rename-aware path and the line's text, duplicates counted. An error the base
+  already had is no longer posted even on a line the change moved; one that is new outside
+  the changed lines is named in the summary as broken by this change. Doubles those tools'
+  time and the worktree setup, and needs `PRR_WORKTREE_REPO`; a tool that cannot run at the
+  base is reported and left uncompared.
+- **Claims a search can settle are settled by one, before any skeptic.** A finder may mark a
+  finding's claim as `unused`, `undefined`, `missing-file` or `duplicate` and name the symbol
+  or path (`claim_kind`, `claim_subject`); `gates/claims.ts` looks it up in the PR's files
+  and, with `git grep` at the commit, in the repository. "X is never used" when a file the
+  model was not shown calls X is the commonest hallucination of a reviewer that sees a diff,
+  and the skeptic, reading 25 lines, cannot settle it either. Only a contradiction found drops
+  a finding — a use (not a mention in a comment or a string; for a local, only inside its own
+  function), an import or a definition in scope, the file at the commit, a name that appears
+  once in the whole repository — and it is recorded in `skeptic.json` as a refutation by
+  `claim-check`, quoting the line that proves it. Kodus drops a finding whose lookup cannot
+  run; here it goes on to the skeptic.
+- **A skeptic that could not check a finding gets one second reading, with code the pipeline
+  looked up.** `insufficient-context` usually names one missing piece — where a field is set,
+  whether a caller passes null — and that piece is usually one lookup away. `gates/lookup.ts`
+  takes the names on the accused lines (called functions first, then types) and finds their
+  definitions and up to four callers: first in the PR's files, already in memory, then with
+  `git grep -F -w` at the commit in `PRR_WORKTREE_REPO` (a local review searches its own
+  repository, unless it is a partial clone), within Kodus's caps of fifteen files and six
+  thousand characters. Fenced as the repository's text; the verifier that answered is asked
+  once more and may quote what it was shown as evidence. Every way it can fail keeps the first
+  answer: nothing found, a call that errored. `skeptic.json` keeps the second prompt and marks
+  the answer, and `scripts/calibrate.ts` reports per verifier how many were read again and how
+  many then held or refuted. `PRR_SKEPTIC_LOOKUP=0` turns it off.
+- **Finders see what a change sits in.** A hunk whose enclosing function, method or class
+  starts above the lines it shows names it after the `@@`, as `git diff` does — found by
+  per-language rules over the file's own lines and its indentation, no parser, and a hint
+  only: anchoring still reads the quote. And a changed file of at most
+  `PRR_WHOLE_FILE_MAX_LINES` lines (300) is shown whole, changes marked and headed `whole
+  file`, when the request has room left after every selected file's hunks: room it would
+  otherwise waste, never a file it would push out. Six lines above a change and three below
+  could not say whether a field is ever reset, or whether `close()` runs on every path, even
+  in a forty-line file. Finders only; the requirement axis keeps its hunks. A finding a finder
+  makes on code the change did not touch still anchors outside the change and stays off the
+  lines, as before.
+- `PRR_SAVE_REPLAY=1` saves `replay.json` — every finder's findings, every skeptic verdict, the
+  triaged tool findings and the file contents they were about — and `scripts/replay.ts <run
+  dir>` re-runs everything after the models offline under the current code and settings,
+  marking what changed. Opt-in: it keeps the reviewed source on disk.
+- `scripts/local-review.ts review <repo> <base> <head> [--criteria <file.md>]` reviews a local
+  branch end to end with the configured models, as a dry run: the production pipeline with only
+  the sources swapped — the diff from git, the convention documents from the repository's own
+  history, the acceptance criteria from a file. It is what an external benchmark runs through,
+  and it needs no Azure DevOps at all. `runReview` takes the conventions and the criteria as
+  providers, as it already took the intake.
+- `scripts/bench.ts` runs a public benchmark end to end: `import` turns AACR-Bench's
+  `positive_samples.json` or Martian's `golden_comments/` into one suite format, `run` reviews
+  every case through `local-review.ts review` against a bare treeless clone fetched with git
+  alone (pinning a pull request's base from its merge base when the dataset names only the
+  pull request), `score` matches the way AACR does — within ±k lines, one comment per
+  reference — with an optional model judge as a second, labelled number, and `compare` sets
+  two configurations against the re-run noise `--repeat 2` measured, refusing across judges,
+  tolerances and suites and exiting `2` on a regression past it.
+
 - Two-axis review: a **code axis** (N finder models over the diff, same prompt, in parallel)
   and a **requirement axis** (linked work items and acceptance criteria, walking one level up),
   run blind to each other with separate comment budgets.
@@ -180,14 +298,96 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   own `result.json` — the exit code alone cannot tell "clean" from "the pull request had
   already merged", and cannot name the stage behind a `3`. The file is validated before the
   first review starts, so a typo on line 40 of a 60-line list no longer surfaces two hours in.
-  One child process per pull request, because per-run state is module-global in four places
-  (token totals, the log clock and sink, the artifact call sink, and `PRR_DRY_RUN` in
-  `process.env`), and strictly sequential, because `PRR_LLM_CONCURRENCY` is the only throttle
-  prloop has on an endpoint and it is per process. Three fatal exits in a row abandon the rest
+  One child process per pull request, because some per-run state is per process (the log
+  clock and sink, the artifact call sink, and `PRR_DRY_RUN` in `process.env`), and one at a
+  time unless `PRR_BATCH_PARALLEL` says more, because `PRR_LLM_CONCURRENCY` is the only
+  throttle prloop has on an endpoint and it is per process. Three fatal exits in a row abandon the rest
   of the list: that is a credential, an endpoint or a proxy rather than those pull requests,
   and the remaining ones would each pay a full retry budget to discover the same thing.
 
 ### Changed
+
+- **Azure DevOps sits behind one interface, `ReviewHost` (`libs/host.ts`).** The orchestrator,
+  the requirement axis and three `publish/` modules used to import `ado/` directly, and the
+  seams that grew around that one at a time — an intake, a conventions reader, a work-item
+  reader, a reader of the fingerprints already posted — were four optional parameters with
+  four ADO defaults. Now a review is handed a host: `ado/host.ts` for a pull request,
+  `git/host.ts` for a local branch (no threads, every write refused), or the in-memory
+  `scripts/fakes/host.ts` a test can build in one line. The thread shapes stay Azure DevOps's
+  and the hidden-marker bytes are unchanged; a second service would be an adapter onto them,
+  not a rewrite. `scripts/selftest-docs.ts` fails on a pipeline module that imports `ado/`
+  again. Nothing a user sees changes.
+- **Internals that other code depended on by accident, made explicit.** Every `PRR_*` knob is
+  declared by the `config.ts` reader that reads it — kind, section, one-line description — and
+  `KNOWN_KEYS` is built from those declarations, so the hand-kept second list of names, and the
+  knob read but never registered that it allowed, are gone; declaring a name twice throws.
+  Severities and finding categories moved to `libs/taxonomy.ts`: they are the review's
+  vocabulary, not settings. A model call's failure now carries its kind (`truncated`, `empty`,
+  `http` with its status, `timeout`, `stalled`, …) from where it happened, and retries, the
+  streaming fallback and the finder's truncation salvage decide on that instead of matching
+  the message with regexes — rewording a message could quietly change what was retried. The
+  run lease is a handle the run carries to the pre-post check and the release, not a flag in
+  the lease module, and token totals are counted per runner, so they are the run's: two reviews
+  in one process (every test that runs two) no longer share either. Nothing a user sees
+  changes; the hidden-marker bytes are untouched.
+- **The slow steps are off the critical path.** The static gate's worktree — a fetch and a
+  setup command, up to ten minutes each — is now prepared inside the static branch, beside the
+  finders, instead of before any finder starts. Triage runs beside the skeptic instead of after
+  it. A finding whose fingerprint is already on the pull request skips the claim check and the
+  skeptic — publish() would not post it again, and an earlier run verified it — and counts as
+  corroborated, so the summary still shows it as already commented; the fingerprints are read
+  beside the finders, and a failed read verifies everything, as before. The part notice of a
+  split finder request now follows the rules, so every part shares its start and a server's
+  prefix cache (vLLM's) can reuse it. `result.json` records each stage's wall time under
+  `timingsMs`.
+- **On a `--since auto` run, a finding on lines the push left alone says who wrote them.**
+  The whole pull request's diff — read once and shared with the requirement axis — splits
+  them: code an earlier push of the PR wrote is listed as *Previously missed*, the finding its
+  review should have made; code from before the PR as *Pre-existing issues*. A finding an
+  earlier run already commented on is not called missed. If the whole PR cannot be read the
+  list stays as one, *On lines this push did not touch*.
+- **Two kinds of finding no longer become new comments: one on lines the change did not touch,
+  and one on a line whose author silenced a check.** A finding whose quoted lines hold nothing
+  the change added or removed — or, for a removal, the line on either side of it — is listed
+  in the summary under *Pre-existing issues* (on an incremental run, *On lines this push did not
+  touch*) instead of commented, and it no longer fails the PR status: a high-severity problem in
+  code that was already there stops blocking a change that did not write it. A finding on a line
+  carrying `# noqa`, `eslint-disable`, `@SuppressWarnings`, `NOSONAR`, `# nosec`, `//nolint`,
+  `# type: ignore`, `@ts-ignore` or one of their kin (`libs/suppression.ts`), on the line or on
+  the comment and annotation lines just above it, is listed under *Other findings* with the
+  marker named. Both lanes come after corroboration and the severity bar, so they list only
+  findings that earned a comment, and both let a **critical** finding through, posted with a
+  line saying why it sits where it does. Tool findings never enter a lane. A finding an
+  earlier run already commented on is reported as commented, not as new. The finder is told
+  to quote the changed line when the change is what makes an old line wrong.
+  `scripts/evaluate.ts` and `scripts/bench.ts` file such findings under the new stages
+  `pre-existing` and `silenced`.
+- **A static-analysis comment closes only on the tool's evidence.** It used to close like a
+  model's, when the code under it changed — which is the right test for a finding nothing
+  re-checks, and the wrong one for a tool that re-runs every time. It now closes only when
+  the same tool analysed that file this run and no longer reports the finding (reviewdog's
+  rule); a skipped tool, a broken toolchain or a file it was not given leaves it open. Tool
+  comments carry a `<!-- prloop:tool=... -->` marker after the existing ones, so a model
+  finding's bytes are unchanged, and `static.json` records what each tool analysed and every
+  fingerprint it reported there, on any line.
+- `scripts/selftest.ts` is one module per area under `scripts/selftest/` — anchoring, finder,
+  skeptic, aggregate, requirement, static, rules, publish, models, security, config, measure —
+  and takes area names to run a subset (`npx tsx scripts/selftest.ts anchoring` runs in about a
+  second). The same 1,456 assertions, checked name for name before and after. Every net now
+  takes its assertion helpers from `scripts/selftest/harness.ts` instead of its own copy.
+- calibrate measures what comments led to, not only what was rejected: an **addressed rate**
+  (a human fixed it, or the code it flagged changed under the open comment), comments still
+  open when the PR merged (`ignored`) and ones closed without a verdict, ADO likes, a table by
+  severity with a caution when low-severity comments are addressed more than critical ones,
+  a table per static-analysis rule (tool findings now carry `rule`), and per-repository
+  **demotion proposals** for a category or rule nobody acts on — printed, never applied.
+
+- Every run records what produced it — `stamp.json` in the run directory and a `stamp` block in
+  `result.json`: prloop's commit and whether its checkout was dirty, and 12-hex hashes of the
+  prompts, the loaded rules, the model fleet and the review-shaping settings. `calibrate` and
+  `evaluate` group by it when runs span more than one, so "did that prompt change help?" is
+  answerable: the version had said 0.1.0 since the first commit, and the reports pooled every
+  configuration into one rate.
 
 - Guided decoding is used where the backend enforces it; where it does not, the JSON schema is
   inlined into the prompt instead (`PRR_LLM_STRUCTURED=0`).
@@ -203,9 +403,76 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   life in April 2026. CI runs 22 and 24. Requests now take `fetch` from the same undici as
   their dispatcher — Node's global fetch is its own bundled undici, and undici 8 rejects the
   handler an older one hands it.
+- `PRR_RULES_DIR` is added to the shipped rules instead of replacing them: a team that wrote
+  its own C# pack used to lose the base smells and every language pack with it. A file named
+  like a shipped one (`_base.md`, `java.md`) still replaces that one — which is how to opt out
+  of a pack. **If you pointed `PRR_RULES_DIR` at a full copy of `rules/`, nothing changes; if
+  you relied on it to drop the shipped packs, add same-named files to override them.**
+- Configuration, markup and documentation files changed by a PR are now read by the
+  requirement axis (never by the finders), so a criterion met in `appsettings.json` or a
+  pipeline YAML is judged against it. They cost one blob read each, and only on a PR with a
+  linked work item that has criteria.
 
 ### Fixed
 
+- The README's cost formula: the requirement axis disputes its accusations in one batched
+  call, and `partial` is one of them — `1 + D` calls, not `1 + A`.
+- **A local review no longer shows the base branch's later changes as the branch reverting
+  them.** `git/intake.ts` listed the changed files three-dot, against the merge base, but read
+  each file's left side at the base branch's tip. Once the base had moved on after the fork,
+  every line it changed in a file the branch also touched reached the finders as a `-`/`+` pair
+  the branch never wrote. The left side is now read at the merge base too, as a pull request's
+  diff is; it is what makes a benchmark's pull request, pinned to a base that moved on, review
+  the diff its references were written against.
+- **A PR in C#, Go, Rust, PHP, C++ or another language outside a nine-entry list is reviewed,
+  not reported as reviewed.** Such a PR had "no reviewable code changes": no finder read it,
+  the requirement axis was skipped along with them although it does not depend on language,
+  and the status read `succeeded — Reviewed 0 files, no blockers`. One table in
+  `libs/lang.ts` now says what every file is — the code axis reviews source in the common
+  languages, and the static-analysis profiles take their extensions from the same table. A
+  change with no code (docs, config, only deletions) still runs the requirement axis, and the
+  summary and status say no code was reviewed instead of "no issues found". A changed file of
+  a type prloop does not know is named in the summary rather than dropped silently.
+- **prloop's comments follow their code, not the line they were posted on.** Stale-thread
+  auto-close read "the posted line is now past the end of the file" as "the code is gone", so
+  deleting lines above a comment closed a live thread as fixed — and a fixed one stayed open
+  whenever the file had not shrunk; position dedupe likewise let a comment whose code had
+  moved down swallow a new finding on whatever code landed at its old line. Each new comment
+  now records the lines it was about (a `span` marker: line count and a hash), and both
+  checks find that code by content in the current file. Older comments keep the old rule.
+  ADO's `$iteration` position tracking is not used: what it returns for deleted code is
+  undocumented, and the content check does not need it.
+- **The diff every model reads carries git's `a/` and `b/` prefixes.** The header was written
+  as `--- a${path}` for slash-prefixed paths; intake strips that slash, so every prompt read
+  `--- asrc/pay.ts`. A model that copied the header into a finding's `file` was then resolved
+  by basename alone, and on a PR where two changed files share a name the finding failed to
+  anchor — dropped without a word. Renames now name their old path on the left, and a path
+  copied from either side of the header resolves exactly.
+- **`--since auto` no longer fails a PR for acceptance criteria an earlier push delivered.** The
+  requirement axis judged each incremental run's diff as if it were the whole PR, so a
+  criterion implemented two pushes ago came back "missing", the dispute pass — shown the same
+  partial diff — could not refute it, and the status failed the PR (exit 2) for work it
+  already contained. The axis now reads the whole PR on every run, budgets that diff in the
+  requirement model's tokens, and takes back a "missing" verdict when files were too large
+  to show it (not-verifiable, with the files named). Blobs are cached by content, so the
+  second read fetches only files the push did not touch.
+- **Two models' different claims about one line are no longer merged into one.** Any
+  identical quote, or two short spans sharing a changed line, counted as agreement whatever
+  the claims said, and the merge kept the first claim while taking the higher severity from
+  the other finding. So a low "unused variable" and a critical "SQL injection" quoting the
+  same line were posted as one critical "unused variable" credited to both models — it passed
+  the consensus gate, and the injection was reported nowhere. Findings now merge only when
+  their claims agree (the same quote classified as the same kind of problem, or claims worded
+  alike); otherwise each stays its own finding with its own severity, sources, verification
+  and comment. Expect the occasional second comment on a line where two models genuinely
+  disagreed.
+- **Style rules are no longer filed as security findings.** Every tool's rule whose
+  upper-cased id began with "S" was categorised as security — meant for ruff's flake8-bandit
+  rules, it also caught ruff's flake8-simplify family (`SIM102`), eslint's `semi` and
+  `strict`, PMD's `SimplifyBooleanReturns` and SpotBugs' `SE_BAD_FIELD` — and ruff rated every
+  `SIM` rule high. Categories now come from each tool's own taxonomy first (ruff `S` + digits,
+  eslint security plugins, PMD's ruleset, SpotBugs' bug category), and a type checker's
+  finding is correctness even when its message mentions a password.
 - **`result.json` is written on every exit path, and says which run it belongs to.** It was
   written in exactly one place, after `runReview` returned, so a throw inside any stage went
   to `main().catch` and left a run directory holding findings and nothing saying the run had
@@ -338,3 +605,27 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   echo the presented credential inside a 401 body.
 - Static analysis tools and the `opencode` child process run with a secret-scrubbed environment;
   `PRR_WORKDIR` is the PR author's branch, and its lint hooks are their code.
+- Anyone who could edit a linked work item could stop `--since auto` from reviewing a push.
+  An acceptance criterion typed as `&lt;!-- prloop:iteration=5 --&gt;` reached the sticky
+  summary as a live marker, ahead of the real one, inside a comment that passes the resume
+  point's authorship check because prloop wrote it; a forged lease in a note made prloop stand
+  down the same way. The resume point and the lease are now read only from the end of the
+  summary, and every HTML comment opener in text prloop quotes is defused before it is posted.
+  A suggested fix now gets a fence longer than any backtick run inside it, so the fix cannot
+  end its own code block.
+- **The `opencode` runner could review a pull request with every tool enabled.**
+  `opencode run --agent` falls back to opencode's default agent — read, write, bash,
+  webfetch — when the named agent is a subagent or is not installed, and prloop's agent file
+  declared itself a subagent. The fallback is a warning line nobody read, so a prompt carrying
+  attacker-written PR text could run with tools, launched from prloop's own directory beside
+  `.env`. Every run now gets prloop's agent definition at run time: a primary agent with every
+  permission denied by name and by wildcard, through `OPENCODE_CONFIG_CONTENT` and as the
+  `opencode.json` of an empty temporary directory the run starts in. A run that prints the
+  fallback warning anyway is killed on that line and its answer refused. `npm run setup` is
+  now optional.
+- Inline comments are redacted like the summary: the model's claim, evidence and suggested
+  fix were posted verbatim, and they quote configuration and error text as readily.
+- Directories under `runs/` are created owner-only (0700). They hold the reviewed source; an
+  existing `runs/` keeps its mode, so `chmod -R go-rwx runs/` once on an existing install.
+- `.npmrc` sets `ignore-scripts` — no dependency needs an install script — and the CI
+  workflows pin their actions to commits instead of movable tags.

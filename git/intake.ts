@@ -5,13 +5,14 @@
 // needing ADO credentials. It reuses libs/diff.ts wholesale, so what it validates is the
 // same code that runs in production, not a parallel implementation.
 import { FileIndex } from "../libs/fileindex";
-import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
+import { UNKNOWN_FILE_TYPE, detectLanguage, fileKind, isNoiseFile } from "../libs/lang";
 import { buildHunks, diffLines } from "../libs/diff";
 import { splitLines } from "../libs/text";
 import { log, logVerbose } from "../libs/log";
 import { run } from "../libs/shell";
-import type { ChangeType, FileDiff, PrInfo } from "../libs/types";
+import type { ChangeType, FileDiff, PrInfo, PrRef } from "../libs/types";
 import type { ReviewContext, SkippedFile } from "../libs/context";
+import { gatherConventions, type ConventionDoc } from "../libs/conventions";
 
 async function git(repo: string, args: string[]): Promise<string> {
   const res = await run("git", ["-C", repo, ...args], 120_000);
@@ -57,20 +58,57 @@ function mapStatus(code: string): ChangeType {
   return "other";
 }
 
+/**
+ * The repository's own instruction documents at a commit, read from its history — the local
+ * counterpart of ado/conventions.ts, gathered by the same rules (libs/conventions.ts), for the
+ * same reason: they are what makes the rules' "the repo's conventions override this
+ * baseline" enforceable.
+ */
+export async function readLocalConventions(repo: string, commit: string, changedPaths: readonly string[] = []): Promise<ConventionDoc[]> {
+  const { docs, failures } = await gatherConventions(
+    {
+      async read(p) {
+        const res = await showFile(repo, commit, p.replace(/^\//, ""));
+        if ("failure" in res) throw new Error(res.failure);
+        return res.lines.length > 0 ? res.lines.join("\n") : undefined;
+      },
+      async list(dir, deep) {
+        // Nothing listed for a directory the commit does not have: ls-tree answers it empty.
+        const out = await git(repo, ["ls-tree", ...(deep ? ["-r"] : []), "--name-only", commit, "--", `${dir.replace(/^\//, "")}/`]);
+        return out.split("\n").filter(Boolean).map((p) => `/${p}`);
+      },
+    },
+    changedPaths,
+  );
+  if (failures.length > 0) log(`[WARN] repo conventions: ${failures.length} could not be read. First: ${failures[0]}`);
+  return docs;
+}
+
+/**
+ * The pull request reference a local review files its runs under. prId 0 and the empty
+ * baseUrl are sentinels — there is no pull request — and git/host.ts, not these, is what keeps
+ * a local review from ever reaching Azure DevOps.
+ */
+export function localRef(repo: string): PrRef {
+  return { baseUrl: "", org: "local", project: "local", repoId: repo, prId: 0 };
+}
+
 export interface LocalIntakeOptions {
   repo: string;
   base: string;
   head: string;
+  /** Also diff the changed non-code text files into `textFiles` (libs/context.ts). */
+  text?: boolean;
 }
 
 export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise<ReviewContext> {
-  // Three-dot: compare against the merge base, which is what a PR diff actually shows.
-  const raw = await git(opts.repo, [
-    "diff",
-    "--name-status",
-    "--find-renames",
-    `${opts.base}...${opts.head}`,
-  ]);
+  // Everything is taken against the merge base, which is what a pull request's diff shows —
+  // the file list AND the left side of each file. The list was three-dot while the left side
+  // was read at the base branch's tip, so once that branch moved on after the fork, every
+  // change it made to a file the branch also touched was shown to the finders as the branch
+  // reverting it: `-` the base's new line, `+` the old one, in code the branch never touched.
+  const mergeBase = (await git(opts.repo, ["merge-base", opts.base, opts.head])).trim();
+  const raw = await git(opts.repo, ["diff", "--name-status", "--find-renames", mergeBase, opts.head]);
 
   const entries = raw
     .split("\n")
@@ -89,6 +127,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
 
   const skipped: SkippedFile[] = [];
   const files: FileDiff[] = [];
+  const textFiles: FileDiff[] = [];
 
   for (const e of entries) {
     const changeType = mapStatus(e.status);
@@ -96,12 +135,13 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       skipped.push({ path: e.path, reason: "generated/lock/vendor" });
       continue;
     }
-    if (!isReviewable(e.path)) {
-      skipped.push({ path: e.path, reason: `non-code (${detectLanguage(e.path)})` });
-      continue;
-    }
     if (changeType === "delete") {
       skipped.push({ path: e.path, reason: "deleted" });
+      continue;
+    }
+    const kind = fileKind(e.path);
+    if (kind === "unknown" || (kind === "text" && !opts.text)) {
+      skipped.push({ path: e.path, reason: kind === "text" ? `not code (${detectLanguage(e.path)})` : UNKNOWN_FILE_TYPE });
       continue;
     }
 
@@ -110,11 +150,13 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     // wholly new file.
     const [right, left] = await Promise.all([
       showFile(opts.repo, opts.head, e.path),
-      showFile(opts.repo, opts.base, e.originalPath ?? e.path),
+      showFile(opts.repo, mergeBase, e.originalPath ?? e.path),
     ]);
     const failure = "failure" in right ? right.failure : "failure" in left ? left.failure : undefined;
     if (failure !== undefined) {
-      skipped.push({ path: e.path, reason: failure });
+      // A text file too large to read is no coverage gap, so it must not carry the reason
+      // orchestrator.ts counts as one — the same distinction ado/intake.ts draws.
+      skipped.push({ path: e.path, reason: kind === "text" && failure === "too large" ? "too large (not code)" : failure });
       continue;
     }
     const rightLines = (right as { lines: string[] }).lines;
@@ -130,7 +172,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     }
     // Canonical path shape, same as the ADO intake produces after normalization: no
     // leading slash, forward separators. git already reports exactly that.
-    files.push({
+    (kind === "code" ? files : textFiles).push({
       path: e.path,
       ...(e.originalPath === undefined ? {} : { originalPath: e.originalPath }),
       changeType,
@@ -162,22 +204,22 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
   // Real commits, not empty strings. orchestrator.ts fetches the repository's convention
   // files at ctx.iteration.targetRefCommit and hands ctx.iteration.sourceRefCommit to the
   // static gate; a sentinel there satisfies the type and then silently means "no
-  // conventions" and "no source commit". prId 0 and the empty baseUrl stay sentinels — there
-  // is no PR — and every ADO call is gated on having one before it runs.
+  // conventions" and "no source commit". Only the ref is a sentinel (localRef).
   const iteration = {
     id: 1,
     sourceRefCommit: (await git(opts.repo, ["rev-parse", opts.head])).trim(),
     targetRefCommit: (await git(opts.repo, ["rev-parse", opts.base])).trim(),
-    commonRefCommit: (await git(opts.repo, ["merge-base", opts.base, opts.head])).trim(),
+    commonRefCommit: mergeBase,
     createdDate: "",
   };
   return {
-    ref: { baseUrl: "", org: "local", project: "local", repoId: opts.repo, prId: 0 },
+    ref: localRef(opts.repo),
     pr,
     iterations: [iteration],
     iteration,
     compareTo: 0,
     files,
+    textFiles,
     skipped,
     changeTrackingIds: new Map(),
     fileIndex: new FileIndex(files),

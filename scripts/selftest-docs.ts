@@ -15,22 +15,10 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
+import { check, report } from "./selftest/harness";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p: string) => readFileSync(path.join(root, p), "utf8");
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
 
 const readme = read("README.md");
 const workflow = read(".github/workflows/check.yml");
@@ -110,6 +98,39 @@ console.log("\nEntry points the selftests cannot reach");
   check("README still documents --config as the settings dump", readme.includes("prloop --config"));
 }
 
+console.log("\nThe pipeline reaches Azure DevOps only through a ReviewHost");
+{
+  // CLAUDE.md says so, and the claim is the whole value of libs/host.ts: a local review, an
+  // in-memory test host or a second service can stand in for ADO only while nothing in the
+  // pipeline calls ado/ behind the host's back. It used to — the requirement axis, three
+  // publish/ modules and the orchestrator each imported it directly — and every one of those
+  // imports was reasonable on the day it was written.
+  check("CLAUDE.md states the rule", read("CLAUDE.md").includes("only through a `ReviewHost`"));
+  const pipeline = [
+    "orchestrator.ts",
+    ...["anchoring", "gates", "models", "prompts", "publish"].flatMap((dir) =>
+      readdirSync(path.join(root, dir))
+        .filter((f) => f.endsWith(".ts"))
+        .map((f) => `${dir}/${f}`),
+    ),
+  ];
+  check("the scan found the pipeline's modules", pipeline.length > 20, String(pipeline.length));
+  const reaches = pipeline.filter((f) => /(?:from|import\()\s*["'](?:\.\.?\/)+ado\//.test(read(f)));
+  check("no pipeline module imports ado/", reaches.length === 0, reaches.join(", "));
+}
+
+console.log("\nChecklists state today's rules");
+{
+  // A new setting went from four places to three when KNOWN_KEYS started being built from the
+  // readers' declarations. CLAUDE.md and CONTRIBUTING.md changed with it; the pull request and
+  // feature-request templates did not, so the checklist every contributor ticks still asked for
+  // a step that no longer exists.
+  check("CLAUDE.md gives a new knob three places", read("CLAUDE.md").includes("Add all three or none"));
+  for (const f of [".github/PULL_REQUEST_TEMPLATE.md", ".github/ISSUE_TEMPLATE/feature_request.yml", "README.md", "CONTRIBUTING.md"]) {
+    check(`${f} does not ask for the retired fourth place`, !/\b(?:all four|four places)\b/i.test(read(f)));
+  }
+}
+
 console.log("\nPaths documents point at");
 {
   // docs/superpowers/specs/ was renamed to docs/design/; a stale link in a doc is silent.
@@ -118,5 +139,4 @@ console.log("\nPaths documents point at");
   }
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

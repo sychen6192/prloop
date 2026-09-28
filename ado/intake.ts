@@ -3,14 +3,12 @@
 // Everything downstream (finder prompt, anchoring, publishing) reads from here.
 import { ADO_CONCURRENCY } from "../config";
 import { getBlob } from "./blobs";
-// Re-exported for the callers that grew up importing it from here; libs/context.ts owns it.
-export type { ReviewContext } from "../libs/context";
 import { getIterationChanges, getPrInfo, listIterations } from "./iterations";
 import { buildHunks, diffLines } from "../libs/diff";
 import { FileIndex, normalizePath } from "../libs/fileindex";
-import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
+import { UNKNOWN_FILE_TYPE, detectLanguage, fileKind, isNoiseFile } from "../libs/lang";
 import { log, logVerbose } from "../libs/log";
-import type { ReviewContext, SkippedFile } from "../libs/context";
+import type { IntakeOptions, ReviewContext, SkippedFile } from "../libs/context";
 import type { ChangeEntry, FileDiff, PrRef } from "../libs/types";
 
 async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> {
@@ -48,7 +46,7 @@ async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> 
   };
 }
 
-export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<ReviewContext> {
+export async function buildReviewContext(ref: PrRef, compareTo = 0, opts: IntakeOptions = {}): Promise<ReviewContext> {
   const [pr, iterations] = await Promise.all([getPrInfo(ref), listIterations(ref)]);
   if (iterations.length === 0) {
     throw new Error(`PR !${ref.prId} has no iterations; nothing to review`);
@@ -66,6 +64,7 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
   const skipped: SkippedFile[] = [];
   const changeTrackingIds = new Map<string, number>();
   const targets: ChangeEntry[] = [];
+  const textTargets: ChangeEntry[] = [];
 
   for (const e of entries) {
     if (e.changeTrackingId !== undefined) changeTrackingIds.set(e.path, e.changeTrackingId);
@@ -73,19 +72,48 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
       skipped.push({ path: e.path, reason: "generated/lock/vendor" });
       continue;
     }
-    if (!isReviewable(e.path)) {
-      skipped.push({ path: e.path, reason: `non-code (${detectLanguage(e.path)})` });
-      continue;
-    }
     if (e.changeType === "delete") {
       skipped.push({ path: e.path, reason: "deleted" });
       continue;
     }
-    targets.push(e);
+    const kind = fileKind(e.path);
+    if (kind === "code") targets.push(e);
+    else if (kind === "text" && opts.text) textTargets.push(e);
+    else skipped.push({ path: e.path, reason: kind === "text" ? `not code (${detectLanguage(e.path)})` : UNKNOWN_FILE_TYPE });
   }
 
-  log(`${entries.length} changed files: ${targets.length} under review, ${skipped.length} skipped`);
+  log(
+    `${entries.length} changed files: ${targets.length} under review` +
+      (opts.text ? `, ${textTargets.length} non-code read for the requirement axis` : "") +
+      `, ${skipped.length} skipped`,
+  );
 
+  const files = await buildFileDiffs(ref, targets, skipped, "too large");
+  // A text file too large to read is not a coverage gap — no finder was ever going to read
+  // it — so it must not carry the one reason orchestrator.ts counts as one.
+  const textFiles = await buildFileDiffs(ref, textTargets, skipped, "too large (not code)");
+
+  return {
+    ref,
+    pr,
+    iterations,
+    iteration,
+    compareTo,
+    files,
+    textFiles,
+    skipped,
+    changeTrackingIds,
+    fileIndex: new FileIndex(files),
+  };
+}
+
+/** Diffs `targets`, recording each file that cannot be diffed in `skipped` with its reason. */
+async function buildFileDiffs(
+  ref: PrRef,
+  targets: ChangeEntry[],
+  skipped: SkippedFile[],
+  tooLarge: string,
+): Promise<FileDiff[]> {
   const files: FileDiff[] = [];
   // Modest concurrency: two blob fetches per file, and ADO rate-limits aggressively.
   const CONCURRENCY = ADO_CONCURRENCY;
@@ -98,7 +126,7 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
         continue;
       }
       if (fd.truncated) {
-        skipped.push({ path: fd.path, reason: "too large" });
+        skipped.push({ path: fd.path, reason: tooLarge });
         continue;
       }
       if (fd.hunks.length === 0) {
@@ -109,16 +137,5 @@ export async function buildReviewContext(ref: PrRef, compareTo = 0): Promise<Rev
       logVerbose(`  ${fd.path}: ${fd.hunks.length} hunks, ${fd.changedRightLines.size} changed lines`);
     }
   }
-
-  return {
-    ref,
-    pr,
-    iterations,
-    iteration,
-    compareTo,
-    files,
-    skipped,
-    changeTrackingIds,
-    fileIndex: new FileIndex(files),
-  };
+  return files;
 }

@@ -7,6 +7,7 @@
 //      PBI/User Story. So when a linked item has no criteria we walk up one level.
 import { adoGet, orgBase, prBase, type AdoList } from "./client";
 import { htmlToText } from "../libs/html";
+import type { LinkedRequirements } from "../libs/host";
 import { logVerbose } from "../libs/log";
 import type { PrRef, WorkItem } from "../libs/types";
 
@@ -65,12 +66,6 @@ async function fetchWorkItems(ref: PrRef, ids: number[]): Promise<WorkItem[]> {
     { query: { ids: ids.join(","), $expand: "relations" } },
   );
   return (res.value ?? []).map(toWorkItem);
-}
-
-export interface LinkedRequirements {
-  items: WorkItem[];
-  // Parents pulled in because the directly-linked item had no criteria of its own.
-  inheritedFrom: number[];
 }
 
 export async function getLinkedRequirements(ref: PrRef): Promise<LinkedRequirements> {

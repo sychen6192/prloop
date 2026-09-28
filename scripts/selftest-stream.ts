@@ -11,7 +11,8 @@ import {
   buildChatBody,
   describeStreamedCompletion,
   isStreamingRejection,
-  isTransientModelError,
+  isTransient,
+  streamedCompletionFailure,
   parseRetryAfter,
   reasoningFields,
   resolveFlavor,
@@ -29,29 +30,7 @@ import {
 } from "../config";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
+import { check, eq, report, section } from "./selftest/harness";
 
 section("SSE stream assembly (streaming keeps gateways from 504ing long generations)");
 {
@@ -127,7 +106,8 @@ section("streamed completion taxonomy: cut streams fail, a missing [DONE] alone 
   const cut = mk('data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n');
   const cutMsg = describeStreamedCompletion(cut, 8192) ?? "";
   check("no finish_reason and no [DONE] fails", cutMsg.includes("stream cut"));
-  check("a cut stream is transient (retried)", isTransientModelError(cutMsg));
+  const cutKind = streamedCompletionFailure(cut, 8192)?.kind;
+  check("a cut stream is transient (retried)", cutKind === "stream-cut" && isTransient({ errorKind: cutKind }));
 
   // Some proxies swallow the [DONE] sentinel; a finish_reason already proves completion.
   const noDone = mk('data: {"choices":[{"delta":{"content":"whole"},"finish_reason":"stop"}]}\n\n');
@@ -136,16 +116,19 @@ section("streamed completion taxonomy: cut streams fail, a missing [DONE] alone 
   // Shape checks are shared with the buffered path: truncation is still truncation.
   const trunc = mk('data: {"choices":[{"delta":{"content":"{\\"find"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n');
   check("streamed truncation reported as truncation", (describeStreamedCompletion(trunc, 8192) ?? "").includes("truncated"));
+  eq("...of the kind salvage reads, and a retry never repeats", streamedCompletionFailure(trunc, 8192)?.kind, "truncated");
 
   const nothing = mk("data: [DONE]\n\n");
   check("empty streamed response is named", (describeStreamedCompletion(nothing, 8192) ?? "").includes("empty"));
 
   // The buffered fallback fires only when a 4xx names streaming as the problem — the
   // request shape was refused, not the generation.
-  check("400 naming stream_options falls back", isStreamingRejection('HTTP 400: {"error":{"message":"stream_options is not supported"}}'));
-  check("a schema 400 does not", !isStreamingRejection("HTTP 400: Invalid schema for response_format"));
-  check("a 5xx does not (already transient)", !isStreamingRejection("HTTP 500: stream backend crashed"));
-  check("a timeout does not", !isStreamingRejection("timeout (900s)"));
+  const http = (status: number, error: string) => ({ error, errorKind: "http" as const, status });
+  check("400 naming stream_options falls back", isStreamingRejection(http(400, 'HTTP 400: {"error":{"message":"stream_options is not supported"}}')));
+  check("a schema 400 does not", !isStreamingRejection(http(400, "HTTP 400: Invalid schema for response_format")));
+  check("a 5xx does not (already transient)", !isStreamingRejection(http(500, "HTTP 500: stream backend crashed")));
+  check("a timeout does not", !isStreamingRejection({ error: "timeout (900s)", errorKind: "timeout" }));
+  check("...nor a message that merely reads like one", !isStreamingRejection({ error: "HTTP 400: stream_options", errorKind: "api" }));
 }
 
 section("request body assembly: PRR_LLM_EXTRA_BODY adds engine knobs, never breaks the shape");
@@ -345,8 +328,8 @@ section("PRR_REASONING / PRR_LLM_TEMPERATURE parse at startup, never as a 400 mi
 section("stream stall detection: a dead engine costs two minutes, not fifteen");
 {
   eq("the message names the silence and what had arrived", streamStallMessage(120_000, 512), "stream stalled after 120s (512 chars received)");
-  check("a stall is transient, so the existing retry handles it", isTransientModelError(streamStallMessage(120_000, 0)));
-  check("...and is not mistaken for a streaming rejection (no buffered fallback)", !isStreamingRejection(streamStallMessage(120_000, 0)));
+  check("a stall is transient, so the existing retry handles it", isTransient({ errorKind: "stalled" }));
+  check("...and is not mistaken for a streaming rejection (no buffered fallback)", !isStreamingRejection({ error: streamStallMessage(120_000, 0), errorKind: "stalled" }));
 
   // End to end against a server that sends one chunk and then goes silent without closing
   // the socket — the failure the per-call deadline cannot see until the full 900s are gone.
@@ -402,5 +385,4 @@ section("retry discipline: jittered backoff, and Retry-After when the endpoint s
   eq("...but never shortens the backoff", backoffMs(5, 1000, () => 1), 60_000);
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

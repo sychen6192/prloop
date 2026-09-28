@@ -13,42 +13,7 @@
 // Shares the fake ADO with selftest-publish.ts and keeps its own file: that one is about
 // what prloop WRITES, this one about what it believes when it READS.
 import { fakeAdo, type FakeAdoState } from "./fakes/ado";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
-
-async function capture<T>(fn: () => Promise<T>): Promise<{ value: T; lines: string[] }> {
-  const lines: string[] = [];
-  const real = console.log;
-  console.log = (...a: unknown[]) => {
-    lines.push(a.map(String).join(" "));
-  };
-  try {
-    return { value: await fn(), lines };
-  } finally {
-    console.log = real;
-  }
-}
+import { capture, check, eq, report, section } from "./selftest/harness";
 
 const ado = await fakeAdo();
 try {
@@ -245,6 +210,40 @@ try {
     setState({ items: { "/AGENTS.md": { body: "   \n\n" } } });
     const { value: blank } = await capture(() => fetchRepoConventions(ref, "tgt3"));
     eq("an empty document adds nothing", blank.length, 0);
+
+    // The page, not anything that starts with `<`: markdown often opens with a lint directive.
+    setState({ items: { "/CLAUDE.md": { body: "<!-- markdownlint-disable MD013 -->\n# House rules\n" } } });
+    const { value: commented } = await capture(() => fetchRepoConventions(ref, "tgt3"));
+    eq("a document opening with an HTML comment is kept", commented.map((d) => d.path), ["/CLAUDE.md"]);
+  }
+
+  section("repo conventions: the instruction files teams write for their other tools");
+  {
+    // Copilot's and Cursor's files, and an AGENTS.md beside the code, read at the TARGET
+    // commit like the root documents, each only where its scope meets the change.
+    setState({
+      items: {
+        "/.github/copilot-instructions.md": { body: "Prefer early returns." },
+        "/.github/instructions/api.instructions.md": { body: '---\napplyTo: "src/api/**"\n---\nValidate every request body.' },
+        "/.github/instructions/web.instructions.md": { body: '---\napplyTo: "web/**"\n---\nNo inline styles.' },
+        "/src/api/AGENTS.md": { body: "Handlers never throw." },
+        "/src/api/users.ts": { body: "export {}" },
+      },
+    });
+    const { value: docs } = await capture(() => fetchRepoConventions(ref, "tgt3", ["src/api/users.ts"]));
+    eq(
+      "the root, the matching instructions and the package's own AGENTS.md",
+      docs.map((d) => d.path),
+      ["/.github/copilot-instructions.md", "/.github/instructions/api.instructions.md", "/src/api/AGENTS.md"],
+    );
+    const listings = ado.matching("GET", /\/items$/).filter((r) => r.query["scopePath"] !== undefined);
+    check("directories are listed, not guessed at", listings.some((r) => r.query["scopePath"] === "/.github/instructions" && r.query["recursionLevel"] === "Full"), JSON.stringify(listings.map((r) => r.query)));
+    check("...the package directory one level only", listings.some((r) => r.query["scopePath"] === "/src/api" && r.query["recursionLevel"] === "OneLevel"));
+    check(
+      "every read and listing is at the target commit",
+      ado.matching("GET", /\/items$/).every((r) => r.query["versionDescriptor.version"] === "tgt3"),
+      JSON.stringify(ado.matching("GET", /\/items$/).map((r) => r.query["versionDescriptor.version"])),
+    );
   }
 
   section("repo conventions: a 404 is silence, a 401 is a failure that must be said");
@@ -271,9 +270,46 @@ try {
     const { lines: allDenied } = await capture(() => fetchRepoConventions(ref, "tgt3"));
     eq("six failures are one warning, not six", allDenied.filter((l) => l.includes("[WARN]")).length, 1);
   }
+  section("--active: the pull requests to review, asked of Azure DevOps");
+  {
+    const { discoverActivePrs, parseScopeUrl } = await import("../ado/discover");
+    // Every form a browser shows a project or a repository in.
+    const cloud = parseScopeUrl("https://dev.azure.com/contoso/Shop", "");
+    eq("a project URL names the project", [cloud.webBase, cloud.project, cloud.repo], ["https://dev.azure.com/contoso", "Shop", undefined]);
+    const repo = parseScopeUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequests?_a=active", "");
+    eq("a repository URL names the repository too, whatever page it is on", [repo.project, repo.repo], ["Shop", "shop-api"]);
+    eq("an old-style host keeps the organisation in the name", parseScopeUrl("https://contoso.visualstudio.com/Shop", "").webBase, "https://contoso.visualstudio.com");
+    const onPrem = parseScopeUrl("https://tfs.contoso.local/tfs/DefaultCollection/My%20Shop/_git/api", "");
+    eq("an on-prem server keeps its collection", [onPrem.webBase, onPrem.project, onPrem.repo], ["https://tfs.contoso.local/tfs/DefaultCollection", "My Shop", "api"]);
+    eq("the API host may differ from the browser's", parseScopeUrl("https://dev.azure.com/contoso/Shop", "https://api.contoso.local/").baseUrl, "https://api.contoso.local");
+    let noProject = "";
+    try {
+      parseScopeUrl("https://dev.azure.com/", "");
+    } catch (e) {
+      noProject = e instanceof Error ? e.message : String(e);
+    }
+    check("a URL with no project is refused, not guessed", noProject.includes("No project"), noProject);
+
+    const pr = (id: number, name: string, isDraft = false) => ({ pullRequestId: id, isDraft, repository: { name, project: { name: "Shop" } } });
+    setState({ activePrs: [pr(12, "shop-api"), pr(7, "shop-web"), pr(9, "shop-api", true), ...Array.from({ length: 150 }, (_, i) => pr(100 + i, "bulk"))] });
+    const { value: urls, lines } = await capture(() => discoverActivePrs(parseScopeUrl(`${ado.origin}/contoso/Shop`, ado.origin)));
+    eq("every active pull request of the project, oldest first, past one page", [urls.length, urls[0], urls[1]], [
+      152,
+      `${ado.origin}/contoso/Shop/_git/shop-web/pullrequest/7`,
+      `${ado.origin}/contoso/Shop/_git/shop-api/pullrequest/12`,
+    ]);
+    check("...drafts left out, and said so", !urls.some((u) => u.endsWith("/9")) && lines.some((l) => l.includes("1 draft left out")), lines.join(" | "));
+    check("...each a URL a review can be run on", urls.every((u) => parsePrUrl(u).prId > 0));
+    const repoUrls = (await capture(() => discoverActivePrs(parseScopeUrl(`${ado.origin}/contoso/Shop/_git/shop-api`, ado.origin)))).value;
+    eq("a repository URL lists only that repository's", repoUrls, [`${ado.origin}/contoso/Shop/_git/shop-api/pullrequest/12`]);
+    check(
+      "...asked for active ones only",
+      ado.matching("GET", /pullrequests$/i).every((r) => r.query["searchCriteria.status"] === "active"),
+      JSON.stringify(ado.matching("GET", /pullrequests$/i).map((r) => r.query)),
+    );
+  }
 } finally {
   await ado.close();
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

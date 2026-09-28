@@ -3,27 +3,25 @@
 // issue twice (the "re-review amnesia" failure mode).
 import { LEARN_FROM_DISMISSALS, POST_STATUS, isDryRun } from "../config";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
-import { AdoError } from "../ado/client";
-import { isSelfIdentity, selfIdentityId } from "../ado/identity";
-import { createThread, listThreads, updateComment, type Thread } from "../ado/threads";
-import { postStatus, type StatusState } from "../ado/statuses";
+import { isSelfIdentity, refusalStatus, type ReviewHost, type StatusState, type Thread } from "../libs/host";
 import { reviewOutcome } from "./status";
 import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
 import { recordOutcomes } from "../libs/outcomes";
 import { log } from "../libs/log";
-import { collectDismissals, collectOutcomes, findStaleThreads, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
-import { iterationMarker, readMarkers } from "./markers";
-import type { AnchoredFinding, PrRef } from "../libs/types";
-import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, WatermarkDecision } from "./lifecycle";
+import { collectDismissals, collectFinalOutcomes, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
+import { iterationMarker, readMarkers, spanMark, type SpanMark } from "./markers";
+import { leaseTakenOver, type LeaseHandle } from "./lease";
+import type { AnchoredFinding } from "../libs/types";
+import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, ToolEvidence, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
 
 export interface PublishResult {
   summaryThreadId?: number;
   posted: AnchoredFinding[];
   alreadyPosted: AnchoredFinding[];
-  // `status` is ADO's, when it gave one. A 4xx is final (ado/client.ts does not retry below
-  // 500), which is what tells the watermark decision apart from a transport blip.
+  // `status` is the host's, when it gave one. A 4xx is final (ado/client.ts does not retry
+  // below 500), which is what tells the watermark decision apart from a transport blip.
   failed: Array<{ finding: AnchoredFinding; error: string; status?: number }>;
   // Our own threads auto-closed because the code they pointed at changed.
   resolved: number;
@@ -123,19 +121,47 @@ export function postedPositions(threads: Thread[], index: FileIndex): PostedPosi
     if (!ctx?.filePath || !ctx.rightFileStart?.line) continue;
     const ourComment = t.comments?.find((c) => !c.isDeleted && readMarkers(c.content).ours);
     if (!ourComment) continue;
-    const cat = readMarkers(ourComment.content).category;
+    const m = readMarkers(ourComment.content);
+    // Thread paths come back from ADO in its own shape and may cite a pre-rename path;
+    // resolve through the index so a thread on the old name still occupies the renamed
+    // file's lines. A thread on a file outside this iteration keeps its normalized path
+    // — it cannot collide with a finding, which is always on a changed file.
+    const fd = index.resolvePrior(ctx.filePath);
+    let start = ctx.rightFileStart.line;
+    let end = ctx.rightFileEnd?.line ?? start;
+    // Where its code is NOW, when the comment recorded it: the posted line is where that code
+    // was, and code moves. Code that is gone occupies nothing — a finding on the new code
+    // there is a new finding, not this one again.
+    if (m.span && fd) {
+      const at = locateSpan(fd.rightLines, m.span, start);
+      if (at === undefined) continue;
+      start = at;
+      end = at + m.span.lines - 1;
+    }
     out.push({
-      // Thread paths come back from ADO in its own shape and may cite a pre-rename path;
-      // resolve through the index so a thread on the old name still occupies the renamed
-      // file's lines. A thread on a file outside this iteration keeps its normalized path
-      // — it cannot collide with a finding, which is always on a changed file.
-      file: index.resolvePrior(ctx.filePath)?.path ?? normalizePath(ctx.filePath),
-      start: ctx.rightFileStart.line,
-      end: ctx.rightFileEnd?.line ?? ctx.rightFileStart.line,
-      ...(cat ? { axis: axisOf(cat) } : {}),
+      file: fd?.path ?? normalizePath(ctx.filePath),
+      start,
+      end,
+      ...(m.category ? { axis: axisOf(m.category) } : {}),
     });
   }
   return out;
+}
+
+/** The lines a right-side finding is anchored to, as the file has them: what a fix replaces. */
+function anchoredLines(f: AnchoredFinding, index: FileIndex): string[] | undefined {
+  const a = f.anchor;
+  if (!a || a.side !== "right") return undefined;
+  const lines = index.exact(f.file)?.rightLines.slice(a.startLine - 1, a.endLine) ?? [];
+  return lines.length > 0 ? lines : undefined;
+}
+
+/** The span mark of the lines a right-side finding is anchored to, for its comment. */
+function spanOf(f: AnchoredFinding, index: FileIndex): SpanMark | undefined {
+  const a = f.anchor;
+  if (!a || a.side !== "right") return undefined;
+  const lines = index.exact(f.file)?.rightLines.slice(a.startLine - 1, a.endLine) ?? [];
+  return lines.length > 0 ? spanMark(lines) : undefined;
 }
 
 /**
@@ -178,6 +204,11 @@ function postedFingerprints(threads: Thread[]): Set<string> {
   return out;
 }
 
+/** Every fingerprint already on the pull request, read on its own for the skeptic's filter. */
+export async function postedFingerprintsOnPr(host: ReviewHost): Promise<Set<string>> {
+  return postedFingerprints(await host.threads());
+}
+
 /**
  * Reads what humans did to prloop's comments and records it. No writes of any kind.
  *
@@ -187,18 +218,20 @@ function postedFingerprints(threads: Thread[]): Set<string> {
  * richest the dismissal and outcome stores ever get. Returning early without this would trade
  * the whole harvest for the model budget it was meant to save.
  */
-export async function harvestClosedThreads(ref: PrRef): Promise<{ dismissals: number; outcomes: number }> {
-  const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+export async function harvestClosedThreads(host: ReviewHost): Promise<{ dismissals: number; outcomes: number }> {
+  const [threads, selfId] = await Promise.all([host.threads(), host.selfId()]);
   const dismissals = collectDismissals(threads, selfId);
-  const outcomes = collectOutcomes(threads, selfId);
+  // The fixes first: the store keeps the first record per finding, and a comment fixed
+  // before the merge must not be filed as ignored because it is also past the merge.
+  const outcomes = [...collectOutcomes(threads, selfId), ...collectFinalOutcomes(threads, selfId)];
   return {
-    dismissals: LEARN_FROM_DISMISSALS ? recordDismissals(ref, dismissals) : 0,
-    outcomes: recordOutcomes(ref, outcomes),
+    dismissals: LEARN_FROM_DISMISSALS ? recordDismissals(host.ref, dismissals) : 0,
+    outcomes: recordOutcomes(host.ref, outcomes),
   };
 }
 
 export async function publish(
-  ref: PrRef,
+  host: ReviewHost,
   axes: { requirement: AnchoredFinding[]; code: AnchoredFinding[] },
   summaryInput: SummaryInput,
   /**
@@ -213,6 +246,10 @@ export async function publish(
     unreviewed: readonly string[];
     /** Every reason this review is incomplete so far. Decides the branch-policy status. */
     incomplete: readonly string[];
+    /** What the static tools established; decides whether a tool's comment may close. */
+    toolEvidence?: ToolEvidence;
+    /** The run lease this run holds, if it took one: checked once more before anything is written. */
+    lease?: LeaseHandle;
   } = { unreviewed: [], incomplete: [] },
 ): Promise<PublishResult> {
   const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [], outcomes: [], gaps: [] };
@@ -249,7 +286,7 @@ export async function publish(
     });
     result.status = outcome.state;
     try {
-      await postStatus(ref, outcome.state, outcome.description, { iterationId: ctx.iteration.id });
+      await host.postStatus(outcome.state, outcome.description, { iterationId: ctx.iteration.id });
       log(`Reported PR status: ${outcome.state} (${outcome.description})`);
     } catch (e) {
       log(`[FAIL] PR status report failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -277,7 +314,7 @@ export async function publish(
   let threads: Thread[];
   let selfId: string | undefined;
   try {
-    [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
+    [threads, selfId] = await Promise.all([host.threads(), host.selfId()]);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[FAIL] Could not read the PR's existing comments: ${msg}`);
@@ -289,11 +326,20 @@ export async function publish(
     await reportStatus();
     return result;
   }
+  // The lease, once more, now that nothing has been written yet: a review that outlived it
+  // and was taken over stands down here rather than posting beside the run that took over.
+  const lost = leaseTakenOver(threads, selfId, known.lease);
+  if (lost) {
+    log(`[WARN] ${lost} — posting nothing, so the two reviews do not interleave`);
+    for (const f of findings) result.failed.push({ finding: f, error: `not posted: ${lost}` });
+    result.gaps.push(lost);
+    return result;
+  }
   const seen = postedFingerprints(threads);
 
   // Close our own threads whose code has since changed, before adding new ones — otherwise
   // a PR accumulates stale comments the author already addressed.
-  const closed = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex));
+  const closed = await resolveStaleThreads(host, findStaleThreads(threads, ctx.fileIndex, known.toolEvidence));
   result.resolved = closed.length;
   // From the same pre-close snapshot as the outcomes below, so a thread this run has just
   // closed is still `active` in it and cannot also be booked as a reviewer's fix.
@@ -316,16 +362,17 @@ export async function publish(
         file: c.file,
         ...(c.category ? { category: c.category } : {}),
         outcome: "auto-closed" as const,
+        ...(c.likes === undefined ? {} : { likes: c.likes }),
       })),
   ];
   if (result.outcomes.length > 0) {
-    const newly = recordOutcomes(ref, result.outcomes);
+    const newly = recordOutcomes(host.ref, result.outcomes);
     if (newly > 0) log(`Recorded ${newly} findings the author acted on (scripts/calibrate.ts reports the rate)`);
   }
   if (result.dismissals.length > 0 && LEARN_FROM_DISMISSALS) {
     // Persist into the per-repo learnings store: the next run (on this PR or any other)
     // suppresses findings matching these fingerprints instead of re-litigating them.
-    const newly = recordDismissals(ref, result.dismissals);
+    const newly = recordDismissals(host.ref, result.dismissals);
     log(
       `Found ${result.dismissals.length} comments dismissed by a human` +
         (newly > 0 ? ` (${newly} newly recorded — future runs will not repeat them)` : " (all already recorded)"),
@@ -345,8 +392,8 @@ export async function publish(
       continue;
     }
     try {
-      await createThread(ref, {
-        content: renderFindingComment(f),
+      await host.createThread({
+        content: renderFindingComment(f, spanOf(f, ctx.fileIndex), anchoredLines(f, ctx.fileIndex)),
         status: "active",
         filePath: f.file,
         anchor: f.anchor,
@@ -361,9 +408,17 @@ export async function publish(
       log(`[FAIL] Could not create comment ${f.file}:${f.anchor.startLine}: ${msg}`);
       // The status is kept, not just stringified: whether this rejection can ever succeed
       // again is what decides if the run may advance the resume point (watermarkFor).
-      const status = e instanceof AdoError ? e.status : undefined;
+      const status = refusalStatus(e);
       result.failed.push({ finding: f, error: msg, ...(status === undefined ? {} : { status }) });
     }
+  }
+
+  // A lane (gates/aggregate.ts, laneOf) decides where a NEW comment would go, and cannot
+  // unsay one an earlier run left — typically in the push that wrote the line, which this push
+  // did not touch. Such a finding is reported as already commented, never as not commented.
+  for (const f of summaryInput.agg.belowBar) {
+    if (f.suppressedBy !== "pre-existing" && f.suppressedBy !== "silenced") continue;
+    if (seen.has(f.fingerprint) || coveredByThread(f, positions)) result.alreadyPosted.push(f);
   }
 
   if (result.alreadyPosted.length > 0) {
@@ -417,13 +472,13 @@ export async function publish(
 
   try {
     if (existing) {
-      await updateComment(ref, existing.thread.id, existing.commentId, summaryBody);
+      await host.updateComment(existing.thread.id, existing.commentId, summaryBody);
       result.summaryThreadId = existing.thread.id;
       log(`Updated summary comment (thread ${existing.thread.id})`);
     } else {
       // Closed, not active: the summary is informational and should never trip a
       // "comment resolution required" policy.
-      const t = await createThread(ref, { content: summaryBody, status: "closed" });
+      const t = await host.createThread({ content: summaryBody, status: "closed" });
       result.summaryThreadId = t.id;
       log(`Created summary comment (thread ${t.id})`);
     }

@@ -17,8 +17,12 @@ npm run check     # typecheck + every offline selftest
 No test needs ADO credentials or a model endpoint; everything is offline. Several nets run, and
 they fail for different reasons:
 
-- `scripts/selftest.ts` — anchoring and the pipeline. If you touched `libs/diff.ts` or
-  `anchoring/locate.ts`, a failure here is a comment landing on the wrong line in production.
+- `scripts/selftest.ts` — anchoring and the pipeline's pure halves, one module per area under
+  `scripts/selftest/` (anchoring, finder, skeptic, aggregate, requirement, static, rules,
+  publish, models, security, config, measure). Name areas to run a subset:
+  `npx tsx scripts/selftest.ts anchoring`. If you touched `libs/diff.ts` or
+  `anchoring/locate.ts`, a failure in `anchoring` is a comment landing on the wrong line in
+  production.
 - `scripts/selftest-stream.ts` — SSE assembly and the failure taxonomy around it.
 - `scripts/selftest-runner.ts` — the HTTP model transport, against a fake OpenAI-compatible
   endpoint: which failures earn a retry, the buffered fallback sticking for the rest of a run,
@@ -30,32 +34,43 @@ they fail for different reasons:
   and conventions (a sign-in page served with a 200, a 401 that must be reported).
 - `scripts/selftest-cli.ts` — the argument grammar and the exit code, which is the only part
   of a run CI reads.
+- `scripts/selftest-e2e.ts` — one pull request reviewed twice, a full review and then
+  `--since auto` on the next push, through every stage against a fake Azure DevOps and a fake
+  model that answers only from what its prompt shows; a local branch through
+  `local-review.ts review` with nothing posted; and a benchmark through `bench.ts` — run twice,
+  scored by line and by a judge, compared, and refused a second configuration. The place a
+  defect between two stages shows up: what the PR ends up carrying, not what one module
+  returned.
 - `scripts/selftest-docs.ts` — the claims the documentation makes about the code (an undefined
   symbol in the README's model-call arithmetic, a Node version pinned in two places that
   disagree, a link to a path that was renamed, a selftest nobody runs). A doc that has quietly
   stopped being true is the one failure nothing else notices.
 
-The runner, publish and ADO nets drive the real code against fake servers in `scripts/fakes/`,
+The runner, publish, ADO and end-to-end nets drive the real code against fake servers in `scripts/fakes/`,
 built from `node:http` and plain objects — test infrastructure, never a dependency. If you add
-one: bind port 0, never a fixed port, and close the server in a `finally`. Add new test files
-rather than growing `selftest.ts`, and wire them into `npm run check` (`selftest-docs.ts` fails
-if you forget).
+one: bind port 0, never a fixed port, and close the server in a `finally`. A test of a pure
+function goes in the area module it belongs to; a new area is a file in `scripts/selftest/`
+and one line in `selftest.ts`'s list. A new net is a new `scripts/selftest-*.ts` wired into
+`npm run check` (`selftest-docs.ts` fails if you forget). Every net takes `check`, `eq`,
+`section`, `skip`, `capture` and `report` from `scripts/selftest/harness.ts`.
 
 There is no build step. `tsx` runs the TypeScript directly and `tsc --noEmit` is typecheck
 only, so nothing is compiled and nothing is published.
 
-## Adding a knob: four places or none
+## Adding a knob: three places or none
 
-Every setting is a `PRR_*` env var and lives in exactly four places:
+Every setting is a `PRR_*` env var and lives in exactly three places:
 
-1. read once in `config.ts` (nowhere else — a knob read elsewhere has no provenance, no
-   `--config` row and no typo warning),
-2. registered in `config.ts`'s `KNOWN_KEYS`,
-3. documented in `.env.example`,
-4. listed in the README settings table.
+1. read once in `config.ts`, by the reader that declares it — its kind, its section and a
+   one-line description (nowhere else: a knob read elsewhere has no provenance, no `--config`
+   row and no typo warning),
+2. documented in `.env.example`,
+3. listed in the README settings table.
 
-`scripts/selftest.ts` fails if any of the four is missing. Adding one and skipping the
-registry produces a variable that silently does nothing and warns the user it is unknown.
+`KNOWN_KEYS` is built from the declarations, so there is no second list to forget — the
+knob that used to be read and never registered, and so did nothing while warning the user it
+was unknown, cannot be written any more. `scripts/selftest.ts` fails if either document is
+missing a knob, or names one that does not exist.
 
 ## Comments
 
@@ -71,6 +86,7 @@ are four different problems with four different fixes. Never collapse them into 
 Two git branches through the identical diff and anchoring path — no credentials, no PR:
 
 ```bash
+npx tsx scripts/local-review.ts review <repo> <base> <head> [--criteria <file.md>]   # real models, dry run
 npx tsx scripts/local-review.ts prompt <repo> <base> <head> [out.md]
 npx tsx scripts/local-review.ts anchor <repo> <base> <head> <findings.json>
 npx tsx scripts/demo.ts        # render comments from fake data, no network at all

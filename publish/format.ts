@@ -1,15 +1,17 @@
 // Comment rendering. Every comment carries hidden markers so re-runs can recognise their
 // own threads: the bot marker identifies authorship, the fingerprint identifies the issue.
 import { MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "../config";
-import { findingMarkers, summaryMarkers } from "./markers";
-import { detectLanguage } from "../libs/lang";
+import { defuseHtmlComments, findingMarkers, summaryMarkers, type SpanMark } from "./markers";
+import { UNKNOWN_FILE_TYPE, detectLanguage } from "../libs/lang";
 import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
 import type { AggregateResult } from "../gates/aggregate";
 import type { CategoryHint } from "../libs/learnings";
 import type { ThreadTally, WatermarkDecision } from "./lifecycle";
-import type { ReviewContext } from "../ado/intake";
+import type { ReviewContext } from "../libs/context";
 import type { StaticResult } from "../gates/static";
+import { sanitizeToolMessage } from "../prompts/untrusted";
+import { describeTier, type RiskTier } from "../libs/tier";
 
 const SEVERITY_LABEL: Record<string, string> = {
   critical: "🔴 Critical",
@@ -39,6 +41,18 @@ const SUPPRESSED_LABEL: Record<string, string> = {
   dismissed: "matches a finding a reviewer previously dismissed (wontFix/byDesign)",
 };
 
+function whyNotCommented(f: AnchoredFinding, bar: string): string {
+  if (f.suppressedBy === "silenced") {
+    return `the line carries \`${f.silencedBy ?? "a suppression marker"}\`, a check its author already silenced there`;
+  }
+  // The run's bar, which a risk tier may have made stricter than PRR_MIN_INLINE_SEVERITY.
+  if (f.suppressedBy === "severity") return `below the ${bar} comment threshold`;
+  return SUPPRESSED_LABEL[f.suppressedBy ?? ""] ?? "below the reporting threshold";
+}
+
+// Enough to see what broke and where; the rest is one file away in the run directory.
+const BROKE_SHOWN = 20;
+
 const FAILURE_LABEL: Record<string, string> = {
   "quote-not-found": "quoted code not found in the file",
   "quote-ambiguous": "quoted code appears more than once, location ambiguous",
@@ -51,14 +65,30 @@ const FAILURE_LABEL: Record<string, string> = {
 // one line, so the whole opening tag has to be emitted as a single string.
 const detailsOpen = (title: string) => `<details><summary>${title}</summary>`;
 
-export function renderFindingComment(f: AnchoredFinding): string {
+/**
+ * A backtick fence longer than any backtick run inside `code`, so nothing in it can close
+ * the block. A fix carrying ``` of its own — a markdown file, a template literal — ended a
+ * fixed three-backtick block early, and everything after rendered as markdown, live markup
+ * included, in a comment prloop signed.
+ */
+function codeFence(code: string): string {
+  const longest = Math.max(0, ...(code.match(/`+/g) ?? []).map((run) => run.length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+/** The static-analysis tool behind a finding, or undefined for a model's. */
+export function toolOf(f: AnchoredFinding): string | undefined {
+  return f.tier === undefined ? undefined : f.rule?.split(":")[0] || f.sources[0];
+}
+
+export function renderFindingComment(f: AnchoredFinding, span?: SpanMark, original?: readonly string[]): string {
   const parts: string[] = [
-    findingMarkers(f),
     `**${SEVERITY_LABEL[f.severity] ?? f.severity}** · ${CATEGORY_LABEL[f.category] ?? f.category}`,
     "",
     f.claim,
   ];
   if (f.evidence) parts.push("", f.evidence);
+  let fix: string[] = [];
   if (f.suggested_fix) {
     // Tag the fence with the file's language: the field is contracted to be code, and an
     // untagged block renders it as flat grey text right where a reviewer is comparing it
@@ -68,7 +98,19 @@ export function renderFindingComment(f: AnchoredFinding): string {
     // line against the left margin while every line below kept its indent, so a fix that is
     // contracted to be paste-ready arrived misaligned.
     const body = f.suggested_fix.replace(/^(?:[ \t]*\r?\n)+/, "").replace(/\s+$/, "");
-    parts.push("", "**Suggested fix**", "", `\`\`\`${lang === "other" ? "" : lang}`, body, "```");
+    // A fix that was applied and typechecked says so: that it compiles is the part a reader
+    // cannot see from the comment.
+    const heading = f.fixCheckedBy ? `**Suggested fix** (typechecks with ${f.fixCheckedBy})` : "**Suggested fix**";
+    if (original && original.length > 0) {
+      // As a diff against the lines it replaces. ADO renders no GitHub ```suggestion block, and
+      // a bare block of new code left the reader to work out which lines it was meant to replace.
+      const lines = [...original.map((l) => `-${l.replace(/\r$/, "")}`), ...body.split(/\r?\n/).map((l) => `+${l}`)].join("\n");
+      const fence = codeFence(lines);
+      fix = ["", heading, "", `${fence}diff`, lines, fence];
+    } else {
+      const fence = codeFence(body);
+      fix = ["", heading, "", `${fence}${lang === "other" ? "" : lang}`, body, fence];
+    }
   }
   const conf = Math.round(f.confidence * 100);
   const bits: string[] = [`confidence ${conf}%`];
@@ -77,6 +119,10 @@ export function renderFindingComment(f: AnchoredFinding): string {
   if (f.overlapping?.length) {
     bits.push(`${f.overlapping.join(", ")} flagged these lines with a different claim (not counted as corroboration)`);
   }
+  // Only a critical finding is posted from either lane (gates/aggregate.ts, laneOf), and its
+  // reader should know why a comment sits where it does.
+  if (f.untouched && !toolOf(f)) bits.push("on lines this change did not touch - it may predate the change");
+  if (f.silencedBy && !toolOf(f)) bits.push(`posted although the line carries ${f.silencedBy}, as it is critical`);
   if (f.skepticVerdicts) {
     // The qualifiers are the point. "Passed verification" reads as a stronger check than it
     // is when the verifier is the finder's own model family (shared blind spots), or when
@@ -92,8 +138,16 @@ export function renderFindingComment(f: AnchoredFinding): string {
         : `cleared by ${f.skepticVerdicts} of its verifiers (${caveats.join("; ")})`,
     );
   }
-  parts.push("", `<sub>${bits.filter(Boolean).join(" | ")}</sub>`);
-  return parts.join("\n");
+  const footer = `<sub>${bits.filter(Boolean).join(" | ")}</sub>`;
+  // The prose is defused and the fix is not: inside a fence nothing can close, an HTML
+  // comment is literal text, and a fix is contracted to be pasted as it stands.
+  //
+  // Redacted as a whole, like the summary: only the summary used to be, and an inline
+  // comment carries the model's claim, evidence and fix verbatim — text that quotes
+  // configuration and error output as readily as the summary's run notes do.
+  return redactSecrets(
+    [findingMarkers({ ...f, ...(toolOf(f) ? { tool: toolOf(f) } : {}) }, span), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n"),
+  );
 }
 
 export interface SummaryInput {
@@ -103,6 +157,10 @@ export interface SummaryInput {
   finderErrors: Array<{ model: string; error: string }>;
   omittedFiles: string[];
   appliedRules: string[];
+  /** The repository's own instruction documents the finders were given (libs/conventions.ts). */
+  conventionDocs?: string[];
+  /** The review depth PRR_RISK_TIERS chose; absent when the setting is off. */
+  tier?: RiskTier;
   staticResult?: StaticResult;
   // "The team keeps dismissing category X" — surfaced as a config suggestion, never applied.
   dismissalHints?: CategoryHint[];
@@ -139,7 +197,7 @@ const REQ_LABEL: Record<ReqVerdict, string> = {
 // The requirement axis gets its own block above the code axis, with its own verdict.
 // Deliberately not merged into the findings table: a shared ranking lets code findings
 // bury "this requirement was never implemented" (PROPOSAL §6.1).
-function renderRequirementSection(req: RequirementResult | undefined): string[] {
+function renderRequirementSection(req: RequirementResult | undefined, incremental: boolean): string[] {
   const lines: string[] = ["### 📋 Requirement check", ""];
 
   if (!req || req.skipped) {
@@ -180,6 +238,9 @@ function renderRequirementSection(req: RequirementResult | undefined): string[] 
         `and ${scoped.length === 1 ? "was" : "were"} not counted against this change._`,
     );
   }
+  // Said on incremental runs because the scope line above names one push, and a reader
+  // would otherwise take "all implemented" as a claim about that push alone.
+  if (incremental) lines.push("", "_Judged against the whole pull request, not only this push._");
   lines.push("", "| Status | Acceptance criterion | Note |", "| --- | --- | --- |");
   for (const c of req.criteria) {
     const loc = c.file ? ` (\`${c.file}\`)` : "";
@@ -266,7 +327,6 @@ function postingClaim(input: SummaryInput, inline: AnchoredFinding[]): string {
 export function renderSummary(input: SummaryInput): string {
   const { ctx, agg } = input;
   const lines: string[] = [
-    summaryMarkers(),
     `## 🔍 prloop automated review`,
     "",
   ];
@@ -282,16 +342,34 @@ export function renderSummary(input: SummaryInput): string {
 
   lines.push(...renderThreadStatus(input));
 
-  lines.push(...renderRequirementSection(input.req));
+  lines.push(...renderRequirementSection(input.req, ctx.compareTo > 0));
 
   lines.push("### 🔍 Code check", "");
 
   // The no-comment path is a feature: silence on a clean PR is what makes the noisy runs
-  // worth reading.
-  if (agg.inline.length === 0 && agg.belowBar.length === 0 && agg.degraded.length === 0) {
+  // worth reading. But "no issues found" is a claim about code somebody read, and a change
+  // with none in it must not make it.
+  const nothingFound = agg.inline.length === 0 && agg.belowBar.length === 0 && agg.degraded.length === 0;
+  const preExisting = agg.belowBar.filter((f) => f.suppressedBy === "pre-existing");
+  const notCommented = agg.belowBar.filter((f) => f.suppressedBy !== "pre-existing");
+  // A laned finding a live thread already carries (publish.ts): no comment from this run, one
+  // from an earlier run, which the reader should not be told does not exist.
+  const already = new Set((input.alreadyPosted ?? []).map((f) => f.fingerprint));
+  const earlier = (f: AnchoredFinding) =>
+    (f.suppressedBy === "pre-existing" || f.suppressedBy === "silenced") && already.has(f.fingerprint)
+      ? " _(commented by an earlier run)_"
+      : "";
+  if (nothingFound && ctx.files.length === 0) {
+    lines.push("_No code in this change for the code check to review._", "");
+  } else if (nothingFound) {
     lines.push("✅ **No issues found.**", "");
   } else if (agg.inline.length === 0) {
-    lines.push("✅ **No issues above the reporting threshold.**", "");
+    lines.push(
+      preExisting.length > 0
+        ? "✅ **No issues on the changed lines above the reporting threshold.**"
+        : "✅ **No issues above the reporting threshold.**",
+      "",
+    );
   } else {
     lines.push(postingClaim(input, agg.inline), "");
     const bySeverity = new Map<string, number>();
@@ -313,14 +391,47 @@ export function renderSummary(input: SummaryInput): string {
     lines.push("");
   }
 
-  if (agg.belowBar.length > 0) {
-    lines.push(detailsOpen(`Other findings, not commented (${agg.belowBar.length})`), "");
-    for (const f of agg.belowBar) {
+  // Findings that earned a comment, on lines the change did not touch: most often code that
+  // was there before it, worth knowing about and not the author's to answer for in this PR. On
+  // an incremental run "the change" is the push, and the lines it left alone are split by who
+  // wrote them (markEarlierPushes): an earlier push of this PR, whose review missed what is
+  // found there now, or nobody in this PR. One an earlier run already commented on was not
+  // missed, whoever wrote the line.
+  const incremental = ctx.compareTo > 0;
+  const lanes: Array<[string, AnchoredFinding[]]> = [
+    [
+      "Previously missed (N) - in code an earlier push of this pull request wrote, found only now; no new comments",
+      preExisting.filter((f) => incremental && f.earlierPush === true && !already.has(f.fingerprint)),
+    ],
+    [
+      incremental
+        ? "Pre-existing issues (N) - on lines this pull request did not touch, no new comments"
+        : "Pre-existing issues (N) - on lines this change did not touch, no new comments",
+      preExisting.filter((f) => !incremental || f.earlierPush === false),
+    ],
+    [
+      "On lines this push did not touch (N) - no new comments",
+      preExisting.filter((f) => incremental && (f.earlierPush === undefined || (f.earlierPush && already.has(f.fingerprint)))),
+    ],
+  ];
+  for (const [title, group] of lanes) {
+    if (group.length === 0) continue;
+    lines.push(detailsOpen(title.replace("(N)", `(${group.length})`)), "");
+    for (const f of group) {
+      const loc = f.anchor ? `${f.file}:${f.anchor.startLine}` : f.file;
+      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}${earlier(f)}`);
+    }
+    lines.push("", "</details>", "");
+  }
+
+  if (notCommented.length > 0) {
+    lines.push(detailsOpen(`Other findings, not commented (${notCommented.length})`), "");
+    for (const f of notCommented) {
       const loc = f.anchor ? `${f.file}:${f.anchor.startLine}` : f.file;
       const overlap = f.overlapping?.length
         ? `; ${f.overlapping.join(", ")} flagged the same lines with a different claim`
         : "";
-      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}`, `  <sub>${SUPPRESSED_LABEL[f.suppressedBy ?? ""] ?? "below the reporting threshold"}${overlap}</sub>`);
+      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}${earlier(f)}`, `  <sub>${whyNotCommented(f, input.tier?.minSeverity ?? MIN_INLINE_SEVERITY)}${overlap}</sub>`);
     }
     lines.push("", "</details>", "");
   }
@@ -339,15 +450,47 @@ export function renderSummary(input: SummaryInput): string {
     lines.push("", "</details>", "");
   }
 
+  // PRR_STATIC_BASELINE: what a fact tool reports at the head and not at the merge base,
+  // outside the lines this change touched — typically a caller it broke. Not inline: the
+  // lines are not this PR's to comment on, and the finding is still the PR author's to fix.
+  const broke = input.staticResult?.broke ?? [];
+  if (broke.length > 0) {
+    const tools = [...new Set(broke.map((b) => b.tool))].join(", ");
+    lines.push(
+      detailsOpen(`Broken outside the changed lines (${broke.length}) - new with this change, found by ${tools} against the merge base`),
+      "",
+    );
+    for (const b of broke.slice(0, BROKE_SHOWN)) {
+      lines.push(`- \`${b.file}:${b.line}\` ${b.tool}${b.ruleId ? ` ${b.ruleId}` : ""}: ${sanitizeToolMessage(b.message, 300)}`);
+    }
+    if (broke.length > BROKE_SHOWN) lines.push(`- … and ${broke.length - BROKE_SHOWN} more, in static.json`);
+    lines.push("", "</details>", "");
+  }
+
   const notes: string[] = [];
   if (input.omittedFiles.length > 0) {
     notes.push(`Diff size limit: ${input.omittedFiles.length} files left out of this analysis: ${input.omittedFiles.slice(0, 10).join(", ")}${input.omittedFiles.length > 10 ? " and more" : ""}`);
   }
-  if (ctx.skipped.length > 0) {
-    notes.push(`Skipped ${ctx.skipped.length} non-code/generated files`);
+  // Named, not counted: a file type prloop does not know may be code in a language it does
+  // not review yet, and that is the one skip a reader has to be able to see.
+  const unknown = ctx.skipped.filter((f) => f.reason === UNKNOWN_FILE_TYPE).map((f) => f.path);
+  if (unknown.length > 0) {
+    notes.push(
+      `Not reviewed, file type unknown to prloop: ${unknown.slice(0, 10).join(", ")}${unknown.length > 10 ? ` and ${unknown.length - 10} more` : ""}`,
+    );
   }
+  const otherSkips = ctx.skipped.length - unknown.length;
+  if (otherSkips > 0) {
+    notes.push(`The code check skipped ${otherSkips} files that are not code, generated, deleted or binary`);
+  }
+  if (input.tier) notes.push(`Review depth (PRR_RISK_TIERS): ${describeTier(input.tier)}`);
   if (input.appliedRules.length > 0) {
     notes.push(`Review rules applied: ${input.appliedRules.join(", ")}`);
+  }
+  // Named, so a team that wrote instructions for another tool can see they were read — and
+  // which scoped ones matched this change.
+  if (input.conventionDocs?.length) {
+    notes.push(`Repository instructions read: ${input.conventionDocs.join(", ")}`);
   }
   const sr = input.staticResult;
   if (sr?.skippedReason) {
@@ -429,11 +572,15 @@ export function renderSummary(input: SummaryInput): string {
     lines.push("", "</details>", "");
   }
 
+  // The last line of every summary, and load-bearing: publish() and the lease append their
+  // markers after it, and markers.ts reads the resume point and the lease from there alone.
   lines.push(`<sub>prloop · this comment updates on every push</sub>`);
   // The summary is posted to the PR: the run notes quote finder and requirement errors,
   // which relay gateway bodies — "Model X produced no result: HTTP 401: …" once carried the
-  // rejected key to everyone who could read the repository.
-  return redactSecrets(lines.join("\n"));
+  // rejected key to everyone who could read the repository. Defused as a whole rather than
+  // field by field: nearly every line quotes something prloop did not write, and a field
+  // added later is covered without anyone remembering to.
+  return redactSecrets(`${summaryMarkers()}\n${defuseHtmlComments(lines.join("\n"))}`);
 }
 
 function escapeCell(s: string): string {
