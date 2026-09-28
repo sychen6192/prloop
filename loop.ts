@@ -26,6 +26,7 @@ import { resolveLastReviewedIteration } from "./publish/lifecycle";
 import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir } from "./libs/artifacts";
 import { batchExitCode, forwardedArgs, readBatchList, renderBatchReport, runBatch } from "./libs/batch";
 import { parseArgs } from "./libs/cli";
+import { runStamp } from "./libs/stamp";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
 import type { PrRef } from "./libs/types";
@@ -184,6 +185,7 @@ async function main() {
       createSkipDir(ref).saveJson(
         "result.json",
         buildResultSummary({
+          stamp: await runStamp().catch(() => undefined),
           exitCode: 0,
           skippedReason: reason,
           identity: runIdentity(undefined, compareTo),
@@ -224,6 +226,7 @@ async function main() {
     openRunDir(result.runDir).saveJson(
       "result.json",
       buildResultSummary({
+        stamp: await runStamp().catch(() => undefined),
         exitCode: 0,
         skippedReason: result.skippedReason,
         identity: runIdentity(result.ctx.iteration.id, compareTo),
@@ -271,6 +274,7 @@ async function main() {
   openRunDir(result.runDir).saveJson(
     "result.json",
     buildResultSummary({
+      stamp: await runStamp().catch(() => undefined),
       exitCode,
       identity: runIdentity(result.ctx.iteration.id, compareTo),
       incomplete: result.incomplete,
@@ -322,6 +326,7 @@ main().catch(async (e) => {
       run.saveJson(
         "result.json",
         buildResultSummary({
+          stamp: await runStamp().catch(() => undefined),
           exitCode: 1,
           fatal: e instanceof Error ? e.message : String(e),
           identity: runIdentity(),

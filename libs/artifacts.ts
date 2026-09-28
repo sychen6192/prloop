@@ -190,6 +190,8 @@ export interface ResultSummaryInput {
   fatal?: string;
   /** Why the run reviewed nothing, e.g. a pull request that has already merged. */
   skippedReason?: string;
+  /** What produced the run (libs/stamp.ts): commit, and hashes of prompts, rules, fleet, settings. */
+  stamp?: unknown;
 }
 
 /**
@@ -209,6 +211,7 @@ export function buildResultSummary(input: ResultSummaryInput): Record<string, un
     tokens: { ...input.tokens },
     durationSec: input.durationSec,
     version: PRLOOP_VERSION,
+    ...(input.stamp === undefined ? {} : { stamp: input.stamp }),
   };
 }
 

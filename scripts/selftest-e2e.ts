@@ -404,7 +404,7 @@ try {
       const files = fs.readdirSync(path.join(prDir, d));
       check(
         `${d.split("-").slice(0, 2).join("-")} holds the prompts, the verdicts and the review`,
-        ["finder-prompt.md", "skeptic.json", "findings.json", "publish.json", "review.html"].every((f) => files.includes(f)),
+        ["finder-prompt.md", "skeptic.json", "findings.json", "publish.json", "review.html", "stamp.json"].every((f) => files.includes(f)),
         files.join(", "),
       );
     }

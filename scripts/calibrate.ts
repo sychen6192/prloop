@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 import { RUNS_DIR } from "../config";
 import { loadDismissals } from "../libs/learnings";
 import { loadOutcomes } from "../libs/outcomes";
+import { stampLabel, type RunStamp } from "../libs/stamp";
 
 // ─── The pure half (exported for the selftest) ──────────────────────────────
 
@@ -29,6 +30,8 @@ export interface CalibrationFinding {
   sources: string[];
   // It reached an inline comment — the only findings a human ever got the chance to dismiss.
   published: boolean;
+  // What produced the run it came from (libs/stamp.ts stampLabel); absent on older runs.
+  stamp?: string;
 }
 
 /** One verifier answer as it appears in a run's skeptic.json. */
@@ -149,6 +152,9 @@ export interface CalibrationReport {
   byConfidence: Bucket[];
   byCategory: Bucket[];
   byFinder: Bucket[];
+  // By what produced the run: a prompt or rule change is only measurable against the runs
+  // before it if the two are kept apart.
+  byStamp: Bucket[];
   skeptics: SkepticStats[];
 }
 
@@ -251,6 +257,7 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   const conf = new Map<string, ReturnType<typeof tally>>();
   const cat = new Map<string, ReturnType<typeof tally>>();
   const finder = new Map<string, ReturnType<typeof tally>>();
+  const stamp = new Map<string, ReturnType<typeof tally>>();
   const add = (
     m: Map<string, ReturnType<typeof tally>>,
     key: string,
@@ -285,6 +292,9 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     add(cat, f.category || "(none)", f, dismissed, killed, fixed);
     // A finding found by two models is credit — and blame — for both.
     for (const s of f.sources.length > 0 ? f.sources : ["(unknown)"]) add(finder, s, f, dismissed, killed, fixed);
+    // The configuration it was first seen under: a later run re-reporting it under a new
+    // prompt did not produce it, it only failed to stop producing it.
+    add(stamp, f.stamp ?? "(unstamped)", f, dismissed, killed, fixed);
   }
 
   const skeptics = new Map<string, SkepticStats>();
@@ -323,6 +333,7 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     byConfidence: toBuckets(conf, CONFIDENCE_FLOORS.map(([, k]) => k)),
     byCategory: toBuckets(cat),
     byFinder: toBuckets(finder),
+    byStamp: toBuckets(stamp),
     skeptics: [...skeptics.values()].sort((a, b) => b.answered - a.answered || a.model.localeCompare(b.model)),
   };
 }
@@ -365,6 +376,8 @@ const num = (v: unknown, fallback: number) => (typeof v === "number" && Number.i
 const str = (v: unknown) => (typeof v === "string" ? v : "");
 
 function readFindings(file: string, into: CalibrationFinding[]): boolean {
+  const stampFile = readJson(path.join(path.dirname(file), "stamp.json"));
+  const stamp = typeof stampFile === "object" && stampFile !== null ? stampLabel(stampFile as Partial<RunStamp>) : undefined;
   const v = readJson(file);
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
@@ -389,6 +402,7 @@ function readFindings(file: string, into: CalibrationFinding[]): boolean {
         confidence: num(f["confidence"], 0),
         sources: Array.isArray(f["sources"]) ? f["sources"].filter((s): s is string => typeof s === "string") : [],
         published,
+        ...(stamp === undefined ? {} : { stamp }),
       });
     }
   }
@@ -554,6 +568,13 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
     bucketTable("Dismissal rate by finder model", report.byFinder),
     "",
   );
+  // Only when there is a comparison to make: one configuration is the ordinary case.
+  if (report.byStamp.length > 1) {
+    out.push(
+      bucketTable("By configuration — commit, then prompts · rules · models · settings hashes", report.byStamp),
+      "",
+    );
+  }
   const totalReasons = report.reasons.reduce((n, r) => n + r.count, 0);
   if (totalReasons > 0 || report.reasonless > 0) {
     out.push(

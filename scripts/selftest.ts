@@ -99,6 +99,7 @@ import { rankForVerification } from "../gates/skeptic";
 import { calibrate, groupReasons } from "./calibrate";
 import { evaluateRun, totalsOf, STAGES, type EvaluatedFinding, type GoldenSet } from "./evaluate";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
+import { stampHashes, stampLabel } from "../libs/stamp";
 import type { CriterionCheck, ReqVerdict, RequirementResult, WorkItem } from "../libs/types";
 import { FINDINGS_SCHEMA, REQ_DISPUTE_SCHEMA, REQUIREMENT_SCHEMA, TRIAGE_SCHEMA, VERDICT_SCHEMA } from "../models/schemas";
 import {
@@ -2040,6 +2041,46 @@ section("calibration: joining what we published to what humans rejected");
   );
   eq("blank replies are not a reason", groupReasons(["   ", ""]), []);
   eq("nothing recorded is an empty list, not a zero row", calibrate({ findings: [], verdicts: [], dismissed: new Set() }).reasons, []);
+
+  // "Did the prompt change help?" needs the runs before and after it kept apart. They were
+  // pooled into one rate — the average of the thing and what it was compared against.
+  const byStamp = calibrate({
+    findings: [
+      { fingerprint: "s1", category: "correctness", confidence: 0.8, sources: ["m"], published: true, stamp: "old" },
+      { fingerprint: "s2", category: "correctness", confidence: 0.8, sources: ["m"], published: true, stamp: "new" },
+      { fingerprint: "s3", category: "correctness", confidence: 0.8, sources: ["m"], published: true, stamp: "new" },
+      // The same finding again under the new prompt: it was first produced under the old one.
+      { fingerprint: "s1", category: "correctness", confidence: 0.8, sources: ["m"], published: true, stamp: "new" },
+    ],
+    verdicts: [],
+    dismissed: new Set(["s1"]),
+  });
+  eq("findings are grouped by the configuration that produced them",
+    byStamp.byStamp.map((b) => [b.key, b.findings, b.dismissed]), [["new", 2, 0], ["old", 1, 1]]);
+}
+
+section("run stamp: what produced a run, as hashes a report can group by");
+{
+  const base = {
+    promptSources: "prompts/finder.ts\nexport const X = 1;",
+    rules: [{ name: "_base.md", body: "# Base" }, { name: "java.md", body: "# Java" }],
+    models: { finders: ["a", "b"], skeptics: ["c"] },
+    settings: [{ name: "PRR_MIN_INLINE_SEVERITY", value: "medium" }, { name: "PRR_MAX_DIFF_CHARS", value: "240000" }],
+  };
+  const h = stampHashes(base);
+  check("every hash is 12 hex", Object.values(h).every((x) => /^[0-9a-f]{12}$/.test(x)), JSON.stringify(h));
+  eq("the same inputs give the same stamp", stampHashes(base), h);
+  eq("rule and setting order do not matter",
+    stampHashes({ ...base, rules: [...base.rules].reverse(), settings: [...base.settings].reverse() }), h);
+  const edited = stampHashes({ ...base, promptSources: `${base.promptSources} ` });
+  check("a one-byte prompt edit changes the prompts hash", edited.prompts !== h.prompts);
+  eq("...and nothing else", [edited.rules, edited.models, edited.config], [h.rules, h.models, h.config]);
+  check("a setting change moves only the config hash",
+    stampHashes({ ...base, settings: [{ name: "PRR_MIN_INLINE_SEVERITY", value: "high" }, base.settings[1]!] }).config !== h.config);
+  eq("a label names the commit and a prefix of each hash",
+    stampLabel({ commit: "0123456789abcdef", dirty: true, hashes: { prompts: "aaaaaa111111", rules: "bbbbbb222222", models: "cccccc333333", config: "dddddd444444" } }),
+    "0123456+ p:aaaaaa r:bbbbbb m:cccccc c:dddddd");
+  eq("a run from before the stamp says so", stampLabel(undefined), "(unstamped)");
 }
 
 section("golden-set evaluation: which stage lost the defect, not just that one was lost");
@@ -2111,6 +2152,8 @@ section("golden-set evaluation: which stage lost the defect, not just that one w
 
   const t = totalsOf([e]);
   eq("every stage is a row, even at zero", Object.keys(t.byStage).length, STAGES.length);
+  const mixed = totalsOf([{ ...e, stamp: "p:old" }, { ...e, stamp: "p:new" }]);
+  eq("runs scored under two configurations are kept apart", [...mixed.byStamp.keys()].sort(), ["p:new", "p:old"]);
   eq("totals carry the defect count", t.defects, 6);
   eq("both finders on one defect are both credited", [t.byFinder.get("m1"), t.byFinder.get("m2")], [4, 2]);
 

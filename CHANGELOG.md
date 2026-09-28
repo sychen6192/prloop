@@ -189,6 +189,13 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- Every run records what produced it — `stamp.json` in the run directory and a `stamp` block in
+  `result.json`: prloop's commit and whether its checkout was dirty, and 12-hex hashes of the
+  prompts, the loaded rules, the model fleet and the review-shaping settings. `calibrate` and
+  `evaluate` group by it when runs span more than one, so "did that prompt change help?" is
+  answerable: the version had said 0.1.0 since the first commit, and the reports pooled every
+  configuration into one rate.
+
 - Guided decoding is used where the backend enforces it; where it does not, the JSON schema is
   inlined into the prompt instead (`PRR_LLM_STRUCTURED=0`).
 - Output schemas carry no value constraints — backends disagree on the JSON Schema dialect and

@@ -379,7 +379,12 @@ make a run readable on its own: `run.log` (every log line, including the ones pr
 the directory existed), `calls.jsonl` (one line per model *attempt* — stage, model, retry
 number, duration, tokens, error), and `result.json` (the outcome: exit code, what was
 incomplete, the counts down the funnel, tokens, duration, version). Start there when a
-result looks wrong.
+result looks wrong. `stamp.json` (also inside `result.json`) records what produced the run:
+prloop's commit, whether its checkout had uncommitted changes, and short hashes of the
+prompts, the loaded rules, the model fleet and the settings that shape a review.
+`scripts/calibrate.ts` and `scripts/evaluate.ts` report per stamp whenever the runs they read
+span more than one, so a prompt change is measured against the runs before it instead of
+averaged into them.
 
 `review.html` is the run on one screen: the diff, with every anchored finding sitting on the
 line it is about, every finding below the bar shown greyed with the reason it was not

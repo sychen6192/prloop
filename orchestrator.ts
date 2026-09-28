@@ -28,6 +28,7 @@ import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/stat
 import { isWorktreeFailure, prepareWorktree, type PreparedWorktree } from "./git/worktree";
 import { createRunDir, createSkipDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
+import { runStamp } from "./libs/stamp";
 import { tokenTotals } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
@@ -206,6 +207,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // if it recorded the settings it actually ran with — which value won, and whether it came
   // from the shell or the file. Everything else in here records what the models did with it.
   run.saveJson("config.json", configSnapshot());
+  // Beside it, what produced the run in a form reports can group by: calibrate and evaluate
+  // cannot compare a prompt change against what came before it without knowing which runs
+  // used which prompts.
+  run.saveJson("stamp.json", await runStamp());
 
   run.saveJson("context.json", {
     ref: opts.ref,
