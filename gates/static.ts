@@ -800,15 +800,48 @@ export async function triageAndConvert(
   };
 }
 
-// Maps a tool rule to a review category so tool findings sit in the same taxonomy as
-// model findings and dedupe against them.
-function categoryForRule(f: ToolFinding): string {
-  const id = f.ruleId.toUpperCase();
+// What each tool's own taxonomy says, where it says anything. Read before the message
+// heuristics below, and only from fields the tool defines — a rule id's first letter is not
+// one of them.
+const PMD_RULESETS: Record<string, string> = {
+  Security: "security",
+  Multithreading: "concurrency",
+  Performance: "performance",
+};
+const SPOTBUGS_CATEGORIES: Record<string, string> = {
+  SECURITY: "security",
+  MALICIOUS_CODE: "security",
+  MT_CORRECTNESS: "concurrency",
+  PERFORMANCE: "performance",
+  CORRECTNESS: "correctness",
+};
+const TOOL_CATEGORY: Record<string, (f: ToolFinding) => string | undefined> = {
+  bandit: () => "security",
+  mypy: () => "correctness",
+  tsc: () => "correctness",
+  // flake8-bandit's rules are S followed by digits (S105, S608).
+  ruff: (f) => (/^S\d/.test(f.ruleId) ? "security" : undefined),
+  // Security plugins namespace their rules; eslint's core rules have no such prefix.
+  eslint: (f) => (/^(security|security-node|no-unsanitized|@microsoft\/sdl)\//.test(f.ruleId) ? "security" : undefined),
+  pmd: (f) => PMD_RULESETS[f.group ?? ""],
+  spotbugs: (f) => SPOTBUGS_CATEGORIES[f.group ?? ""],
+};
+
+/**
+ * Maps a tool rule to a review category so tool findings sit in the same taxonomy as model
+ * findings and dedupe against them. Exported for the selftest.
+ *
+ * Per tool, from the tool's own classification, and only then from the message. It used to
+ * file every rule whose upper-cased id started with "S" under security, for every tool —
+ * meant for ruff's flake8-bandit rules, it also caught ruff's flake8-simplify (SIM102),
+ * eslint's `semi` and `strict`, PMD's SimplifyBooleanReturns and SpotBugs' SE_BAD_FIELD:
+ * style advice labelled as the category a reviewer is taught to treat as blocking.
+ */
+export function categoryForRule(f: ToolFinding): string {
+  const own = TOOL_CATEGORY[f.tool]?.(f);
+  if (own) return own;
   const msg = f.message.toLowerCase();
-  if (f.tool === "bandit" || id.startsWith("S") || /injection|xss|csrf|secret|password|crypto/.test(msg)) {
-    return "security";
-  }
-  if (f.tool === "mypy" || f.tool === "tsc") return "correctness";
+  if (/injection|xss|csrf|secret|password|crypto/.test(msg)) return "security";
   if (/thread|concurren|synchroniz|atomic|race/.test(msg)) return "concurrency";
   if (/close|leak|resource|stream/.test(msg)) return "reliability";
   if (/performance|inefficient|complexity/.test(msg)) return "performance";

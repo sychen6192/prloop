@@ -63,7 +63,7 @@ import {
   loadDismissals,
   recordDismissals,
 } from "../libs/learnings";
-import { parseTriageVerdicts, triageAndConvert } from "../gates/static";
+import { categoryForRule, parseTriageVerdicts, triageAndConvert } from "../gates/static";
 import type { ToolFinding } from "../profiles/types";
 import type { PrRef } from "../libs/types";
 import type { ToolSpec } from "../profiles/types";
@@ -991,11 +991,14 @@ const spec = (format: string): ToolSpec =>
   const ruff = JSON.stringify([
     { code: "B006", message: "mutable default", filename: "/w/src/a.py", location: { row: 3 } },
     { code: "S602", message: "shell", filename: "/w/src/a.py", location: { row: 9 } },
+    { code: "SIM102", message: "use a single if statement", filename: "/w/src/a.py", location: { row: 12 } },
   ]);
   const fs2 = parseToolOutput(ruff, spec("ruff-json"), "/w");
-  eq("ruff two entries", fs2.length, 2);
+  eq("ruff entries", fs2.length, 3);
   eq("workdir prefix stripped", fs2[0]?.file, "src/a.py");
-  eq("S prefix treated as security (high)", fs2[1]?.severity, "high");
+  eq("a flake8-bandit rule (S + digits) is high", fs2[1]?.severity, "high");
+  // A bare "S" prefix caught flake8-simplify too, and rated style advice high.
+  eq("...a flake8-simplify rule (SIM) is not", fs2[2]?.severity, "medium");
 }
 {
   const eslint = JSON.stringify([
@@ -1071,6 +1074,32 @@ const spec = (format: string): ToolSpec =>
   eq("priority 2 is medium", f[0]?.severity, "medium");
   eq("priority 1 is high", f[1]?.severity, "high");
   eq("path is the source path", f[1]?.file, "com/acme/Svc.java");
+  eq("the bug category is kept, for the category", f.map((x) => x.group), ["STYLE", "CORRECTNESS"]);
+}
+{
+  // Each tool's own taxonomy first, the message only after. A rule id's first letter is no
+  // taxonomy: "starts with S" filed ruff's SIM102, eslint's `semi` and `strict`, PMD's
+  // SimplifyBooleanReturns and SpotBugs' SE_BAD_FIELD under security.
+  const tf = (tool: string, ruleId: string, over: Partial<ToolFinding> = {}): ToolFinding =>
+    ({ tool, tier: "triage", ruleId, message: "m", file: "a", line: 1, severity: "medium", ...over });
+  const cases: Array<[string, ToolFinding, string]> = [
+    ["ruff S608 is a flake8-bandit rule", tf("ruff", "S608"), "security"],
+    ["ruff SIM102 is style advice", tf("ruff", "SIM102"), "maintainability"],
+    ["eslint semi is not security", tf("eslint", "semi"), "maintainability"],
+    ["eslint strict is not security", tf("eslint", "strict"), "maintainability"],
+    ["a security plugin's rule is", tf("eslint", "security/detect-eval-with-expression"), "security"],
+    ["PMD SimplifyBooleanReturns is not", tf("pmd", "SimplifyBooleanReturns", { group: "Design" }), "maintainability"],
+    ["PMD's Security ruleset is", tf("pmd", "HardCodedCryptoKey", { group: "Security" }), "security"],
+    ["PMD's Multithreading ruleset is concurrency", tf("pmd", "DoNotUseThreads", { group: "Multithreading" }), "concurrency"],
+    ["SpotBugs SE_BAD_FIELD is not security", tf("spotbugs", "SE_BAD_FIELD", { group: "BAD_PRACTICE" }), "maintainability"],
+    ["SpotBugs' SECURITY category is", tf("spotbugs", "SQL_INJECTION_JDBC", { group: "SECURITY" }), "security"],
+    ["SpotBugs' MT_CORRECTNESS is concurrency", tf("spotbugs", "IS2_INCONSISTENT_SYNC", { group: "MT_CORRECTNESS" }), "concurrency"],
+    ["bandit is always security", tf("bandit", "B602"), "security"],
+    ["a type checker is correctness, whatever its message names",
+      tf("tsc", "TS2339", { message: "Property 'password' does not exist on type 'User'" }), "correctness"],
+    ["with no taxonomy, the message decides", tf("checkstyle", "X", { message: "possible SQL injection" }), "security"],
+  ];
+  for (const [name, finding, want] of cases) eq(name, categoryForRule(finding), want);
 }
 {
   // SpotBugs reports paths relative to the source root; the diff calls the same file
@@ -1111,12 +1140,13 @@ const spec = (format: string): ToolSpec =>
   // the right answer, but only because PMD happens to emit beginline first. XML does not
   // guarantee attribute order.
   const pmd = `<pmd version="7.23.0"><file name="src/A.java">
-    <violation beginline="12" endline="14" rule="UnusedLocalVariable" priority="3">msg</violation>
+    <violation beginline="12" endline="14" rule="UnusedLocalVariable" ruleset="Best Practices" priority="3">msg</violation>
   </file></pmd>`;
   const f = parseToolOutput(pmd, spec("checkstyle-xml"), "/w")[0];
   eq("PMD violation uses beginline", f?.line, 12);
   eq("...and endline", f?.endLine, 14);
   eq("PMD rule attribute is the rule id", f?.ruleId, "UnusedLocalVariable");
+  eq("...and its ruleset is kept, for the category", f?.group, "Best Practices");
 
   const reversed = `<pmd><file name="src/A.java">
     <violation endline="14" beginline="12" rule="R" priority="3">m</violation>

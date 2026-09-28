@@ -91,5 +91,11 @@ export interface ToolFinding {
   severity: Severity;
   /** The tool's own severity string, kept for the report. */
   rawSeverity?: string;
+  /**
+   * The tool's own classification of the rule, where it has one: PMD's ruleset
+   * ("Security"), SpotBugs' bug category ("MT_CORRECTNESS"). The category mapping reads it
+   * before any guess from the rule id or the message.
+   */
+  group?: string;
   helpUri?: string;
 }

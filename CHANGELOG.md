@@ -224,6 +224,13 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   alike); otherwise each stays its own finding with its own severity, sources, verification
   and comment. Expect the occasional second comment on a line where two models genuinely
   disagreed.
+- **Style rules are no longer filed as security findings.** Every tool's rule whose
+  upper-cased id began with "S" was categorised as security — meant for ruff's flake8-bandit
+  rules, it also caught ruff's flake8-simplify family (`SIM102`), eslint's `semi` and
+  `strict`, PMD's `SimplifyBooleanReturns` and SpotBugs' `SE_BAD_FIELD` — and ruff rated every
+  `SIM` rule high. Categories now come from each tool's own taxonomy first (ruff `S` + digits,
+  eslint security plugins, PMD's ruleset, SpotBugs' bug category), and a type checker's
+  finding is correctness even when its message mentions a password.
 - **`result.json` is written on every exit path, and says which run it belongs to.** It was
   written in exactly one place, after `runReview` returned, so a throw inside any stage went
   to `main().catch` and left a run directory holding findings and nothing saying the run had
