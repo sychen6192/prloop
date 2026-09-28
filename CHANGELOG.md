@@ -11,6 +11,17 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **Claims a search can settle are settled by one, before any skeptic.** A finder may mark a
+  finding's claim as `unused`, `undefined`, `missing-file` or `duplicate` and name the symbol
+  or path (`claim_kind`, `claim_subject`); `gates/claims.ts` looks it up in the PR's files
+  and, with `git grep` at the commit, in the repository. "X is never used" when a file the
+  model was not shown calls X is the commonest hallucination of a reviewer that sees a diff,
+  and the skeptic, reading 25 lines, cannot settle it either. Only a contradiction found drops
+  a finding — a use (not a mention in a comment or a string; for a local, only inside its own
+  function), an import or a definition in scope, the file at the commit, a name that appears
+  once in the whole repository — and it is recorded in `skeptic.json` as a refutation by
+  `claim-check`, quoting the line that proves it. Kodus drops a finding whose lookup cannot
+  run; here it goes on to the skeptic.
 - **A skeptic that could not check a finding gets one second reading, with code the pipeline
   looked up.** `insufficient-context` usually names one missing piece — where a field is set,
   whether a caller passes null — and that piece is usually one lookup away. `gates/lookup.ts`

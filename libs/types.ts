@@ -175,7 +175,16 @@ export interface RawFinding {
   // invokes. Structural teeth for the rules' citation contract — a maintainability finding
   // that cites nothing is capped to low severity at validation (gates/finder.ts).
   cites?: string;
+  // A claim that code can settle, and what it is about: "X is never used" names X. Checked
+  // before the skeptic (gates/claims.ts); a lookup that contradicts it drops the finding.
+  claim_kind?: ClaimKind;
+  claim_subject?: string;
 }
+
+// The claims a lookup can settle — Kodus's claimKind. "X is never used" when a file the
+// model was not shown uses X is the commonest hallucination of a reviewer that sees a diff.
+export const CLAIM_KINDS = ["unused", "undefined", "missing-file", "duplicate"] as const;
+export type ClaimKind = (typeof CLAIM_KINDS)[number];
 
 // --- Adversarial verification ---
 

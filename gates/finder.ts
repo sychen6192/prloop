@@ -16,7 +16,7 @@ import { arrayField, parseJsonObject, salvageArrayItems } from "../libs/json";
 import { log } from "../libs/log";
 import { newRunSeed, seedFor } from "../libs/prng";
 import { loadRules, renderRules, ruleHeadings, selectRules, type Rule } from "../libs/rules";
-import type { ModelRunner, RawFinding } from "../libs/types";
+import { CLAIM_KINDS, type ClaimKind, type ModelRunner, type RawFinding } from "../libs/types";
 import { isTruncation } from "../models/runner";
 import { FINDINGS_SCHEMA } from "../models/schemas";
 import { buildFinderPrompts, finderSystemFor, type FinderPromptInput, type RuleHeadingGroup } from "../prompts/finder";
@@ -156,6 +156,8 @@ export function checkFinding(v: unknown, knownCites: ReadonlySet<string> = DEFAU
     if (severityRank(severity) < severityRank(cap)) severity = cap;
   }
 
+  const checkable = claimOf(str("claim_kind"), str("claim_subject"));
+
   return {
     finding: {
       category,
@@ -170,8 +172,24 @@ export function checkFinding(v: unknown, knownCites: ReadonlySet<string> = DEFAU
       evidence: str("evidence"),
       suggested_fix: str("suggested_fix"),
       cites,
+      ...checkable,
     },
   };
+}
+
+/**
+ * A checkable claim, or nothing. The pair is a hint the pipeline acts on — a contradicted
+ * claim drops the finding — so a malformed one is dropped instead of guessed at: the
+ * finding stays, unchecked, exactly as it would without the fields.
+ */
+export function claimOf(kind: string | undefined, subject: string | undefined): { claim_kind?: ClaimKind; claim_subject?: string } {
+  const k = kind?.trim().toLowerCase() ?? "";
+  const s = subject?.trim().replace(/^`+|`+$/g, "") ?? "";
+  if (!(CLAIM_KINDS as readonly string[]).includes(k) || !s || s.length > 300 || /\s/.test(s)) return {};
+  if (k === "missing-file") return { claim_kind: k, claim_subject: s.replace(/^\.\//, "") };
+  // `Util.normalize`, `Foo::bar`, `bar()`: the name a lookup can search for is the last part.
+  const name = s.replace(/\(\)$/, "").split(/\.|::|#/).pop() ?? "";
+  return /^[A-Za-z_$][\w$]*$/.test(name) ? { claim_kind: k as ClaimKind, claim_subject: name } : {};
 }
 
 /** checkFinding without the reason: the finding, or undefined when it was dropped. */

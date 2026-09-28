@@ -24,6 +24,7 @@ import type { LinkedRequirements } from "./ado/workitems";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
 import { runFinders } from "./gates/finder";
+import { checkClaims, contradictionOutcome } from "./gates/claims";
 import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
 import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
@@ -429,21 +430,29 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // degrade to "nothing verified" (recorded as incomplete below), not abort a run that has
   // already paid for its finder calls.
   const searchRepo = opts.searchRepo ?? (WORKTREE_REPO || undefined);
-  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.fileIndex, {
-    lookup: {
-      files: ctx.files,
-      ...(searchRepo && ctx.iteration.sourceRefCommit ? { repo: { dir: searchRepo, commit: ctx.iteration.sourceRefCommit } } : {}),
-    },
-  }).catch(
-    (e): import("./gates/skeptic").SkepticOutcome[] => {
-      const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
-      stageFailures.push(why);
-      // Fails open, so the findings survive — but unverified, which is not the review the
-      // run was configured to produce, and a re-run can still produce it.
-      unreviewed.push(why);
-      return freshCandidates.map((f) => ({ finding: f, verdicts: [], killed: false }));
-    },
-  );
+  const lookup = {
+    files: ctx.files,
+    ...(searchRepo && ctx.iteration.sourceRefCommit ? { repo: { dir: searchRepo, commit: ctx.iteration.sourceRefCommit } } : {}),
+  };
+  // Claims a search can settle are settled first (gates/claims.ts): a finding the code
+  // contradicts never costs a verifier call, and its refutation carries the line that proves
+  // it. A checker that throws settles nothing — every finding goes on to the skeptic.
+  const contradictions = await checkClaims(freshCandidates, ctx.fileIndex, lookup).catch(() => []);
+  const settled = new Set(contradictions.map((c) => c.finding));
+  const toVerify = freshCandidates.filter((f) => !settled.has(f));
+  const outcomes = [
+    ...(await runSkeptic(opts.runner, toVerify, ctx.fileIndex, { lookup }).catch(
+      (e): import("./gates/skeptic").SkepticOutcome[] => {
+        const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
+        stageFailures.push(why);
+        // Fails open, so the findings survive — but unverified, which is not the review the
+        // run was configured to produce, and a re-run can still produce it.
+        unreviewed.push(why);
+        return toVerify.map((f) => ({ finding: f, verdicts: [], killed: false }));
+      },
+    )),
+    ...contradictions.map(contradictionOutcome),
+  ];
   const survivors = applyVerdicts(outcomes);
   run.saveJson(
     "skeptic.json",

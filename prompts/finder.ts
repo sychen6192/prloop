@@ -51,6 +51,12 @@ Output rules (violations cause the finding to be discarded by the system):
    and demoted to the summary. For behavioral findings (correctness, concurrency, security,
    reliability, data-integrity, performance), the quote and evidence are the basis — set
    cites to null.
+9. "claim_kind" and "claim_subject": when the whole claim is a fact that a search of the
+   repository can settle — "unused" (a symbol is never used), "undefined" (a symbol is used
+   but never defined or imported), "missing-file" (a referenced file does not exist),
+   "duplicate" (a symbol is defined twice) — name the kind and the symbol or path. The
+   system checks it against the whole repository, which you cannot see, and discards the
+   finding if the repository says otherwise. Null for every other finding.
 
 Review coverage (coverage mode):
 - Report every issue you observe, including ones you are unsure about. Use "confidence"

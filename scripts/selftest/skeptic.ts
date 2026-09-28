@@ -27,6 +27,8 @@ import { type Severity } from "../../config";
 import * as path from "node:path";
 import { run } from "../../libs/shell";
 import { declares, namesIn, relatedContext } from "../../gates/lookup";
+import { CLAIM_CHECKER, checkClaims, contradictionOutcome } from "../../gates/claims";
+import { claimOf } from "../../gates/finder";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { check, eq, section, skip } from "./harness";
@@ -544,4 +546,123 @@ section("a second reading: what a skeptic could not check, looked up by code and
   await runSkeptic(scripted({ alpha: [unsure, holds] }), [finding], index, opts(["alpha"], false));
   eq("...and PRR_SKEPTIC_LOOKUP=0 never asks again", calls.length, 1);
   detachLogSink();
+}
+
+section("claims a search can settle: settled before the skeptic, and only by a contradiction found");
+{
+  eq(
+    "a checkable claim is a known kind and a name",
+    [claimOf("unused", "Util.normalize"), claimOf("Undefined", "bar()"), claimOf("missing-file", "./config/app.json")],
+    [
+      { claim_kind: "unused", claim_subject: "normalize" },
+      { claim_kind: "undefined", claim_subject: "bar" },
+      { claim_kind: "missing-file", claim_subject: "config/app.json" },
+    ],
+  );
+  eq(
+    "...and anything else is no claim at all, never a guess",
+    [claimOf("never-called", "x"), claimOf("unused", "two words"), claimOf("unused", ""), claimOf(undefined, "x")],
+    [{}, {}, {}, {}],
+  );
+
+  const at = (file: string, line: number, kind: AnchoredFinding["claim_kind"], subject: string, claim = "claimed"): AnchoredFinding => ({
+    category: "correctness",
+    severity: "medium",
+    confidence: 0.8,
+    file,
+    quote: "q",
+    claim,
+    sources: ["finder-a"],
+    fingerprint: `fp-${file}-${line}-${subject}`,
+    claim_kind: kind,
+    claim_subject: subject,
+    anchor: { side: "right", startLine: line, endLine: line, startOffset: 1, endOffset: 2 },
+  });
+  const util = mkFile("src/util.ts", ["export function helper(x: number) {", "  const scratch = x * 2;", "  return x + 1;", "}", "", "export function other() {", "  const scratch = 3;", "  return scratch;", "}"], [2]);
+  const app = mkFile("src/app.ts", ["import { helper } from \"./util\";", "export const out = helper(1);", "// helper is documented in the README", "log(\"helper\");"], [2]);
+  const files = [util, app];
+  const index = new FileIndex(files);
+  const settle = async (f: AnchoredFinding, source: { files: typeof files; repo?: { dir: string; commit: string } } = { files }) =>
+    (await checkClaims([f], index, source))[0]?.evidence;
+
+  eq("\"never used\" about an exported function used in another file is contradicted", await settle(at("src/util.ts", 1, "unused", "helper")), "`helper` is used at src/app.ts:2");
+  eq("...a local is looked for only in its own function, never matched against a namesake elsewhere", await settle(at("src/util.ts", 2, "unused", "scratch")), undefined);
+  eq("...but a use of it inside that function contradicts", await settle(at("src/util.ts", 7, "unused", "scratch")), "`scratch` is used at src/util.ts:8, in the same function");
+  const commentOnly = mkFile("src/c.ts", ["export function lonely() {}", "// lonely() is kept for the plugin API", "const msg = \"call lonely()\";"], [1]);
+  eq(
+    "...and a mention in a comment or a string is not a use",
+    (await checkClaims([at("src/c.ts", 1, "unused", "lonely")], new FileIndex([commentOnly]), { files: [commentOnly] }))[0]?.evidence,
+    undefined,
+  );
+  eq("\"not defined\" about a name the file imports is contradicted", await settle(at("src/app.ts", 2, "undefined", "helper")), "`helper` is imported at src/app.ts:1");
+  const ts2 = mkFile("src/lib/b.ts", ["export function fromElsewhere() {}"], [1]);
+  const tsUse = mkFile("src/app2.ts", ["export const y = fromElsewhere();"], [1]);
+  eq(
+    "...but a definition in another file does not settle a missing import in TypeScript",
+    (await checkClaims([at("src/app2.ts", 1, "undefined", "fromElsewhere")], new FileIndex([ts2, tsUse]), { files: [ts2, tsUse] }))[0]?.evidence,
+    undefined,
+  );
+  const javaA = mkFile("src/pkg/Money.java", ["package pkg;", "public class Money {", "}"], [2]);
+  const javaB = mkFile("src/pkg/Invoice.java", ["package pkg;", "class Invoice { Money total; }"], [2]);
+  eq(
+    "...while a class in the same Java package does",
+    (await checkClaims([at("src/pkg/Invoice.java", 2, "undefined", "Money")], new FileIndex([javaA, javaB]), { files: [javaA, javaB] }))[0]?.evidence,
+    "`Money` is defined in the same package at src/pkg/Money.java:2",
+  );
+  eq("\"missing file\" for a file in this change is contradicted", await settle(at("src/app.ts", 1, "missing-file", "util.ts")), "`util.ts` exists: src/util.ts is part of this change");
+  eq("...and one that is nowhere to be found is not", await settle(at("src/app.ts", 1, "missing-file", "nope.json")), undefined);
+  eq("\"duplicate\" cannot be settled without the whole repository to count in", await settle(at("src/util.ts", 1, "duplicate", "helper")), undefined);
+
+  const gitOk = (await run("git", ["--version"], 10_000)).code === 0;
+  if (!gitOk) {
+    skip("claims settled against the repository", "no git on this platform");
+  } else {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-claims-"));
+    const g = (...args: string[]) => run("git", ["-C", repo, ...args], 20_000);
+    await g("init", "-q", "-b", "main");
+    await g("config", "user.email", "selftest@example.invalid");
+    await g("config", "user.name", "selftest");
+    fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+    fs.mkdirSync(path.join(repo, "config"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "src", "util.ts"), util.rightLines.join("\n") + "\n");
+    fs.writeFileSync(path.join(repo, "src", "caller.ts"), "import { other } from \"./util\";\nother();\n");
+    fs.writeFileSync(path.join(repo, "config", "app.json"), "{}\n");
+    await g("add", "-A");
+    await g("commit", "-qm", "base");
+    const commit = (await g("rev-parse", "HEAD")).stdout.trim();
+    const withRepo = { files: [util], repo: { dir: repo, commit } };
+    const utilOnly = new FileIndex([util]);
+    eq(
+      "a use outside the pull request, found with git grep at the commit, contradicts",
+      (await checkClaims([at("src/util.ts", 6, "unused", "other")], utilOnly, withRepo))[0]?.evidence,
+      "`other` is used at src/caller.ts:2",
+    );
+    eq(
+      "...so does a file that exists at the commit",
+      (await checkClaims([at("src/util.ts", 1, "missing-file", "config/app.json")], utilOnly, withRepo))[0]?.evidence,
+      "`config/app.json` exists at the commit under review: config/app.json",
+    );
+    eq(
+      "...and a name that appears once in the whole repository is not duplicated",
+      (await checkClaims([at("src/util.ts", 3, "duplicate", "helper")], utilOnly, withRepo))[0]?.evidence,
+      "`helper` appears exactly once in the repository at the commit under review",
+    );
+    eq(
+      "...while one that appears twice may be",
+      (await checkClaims([at("src/util.ts", 6, "duplicate", "other")], utilOnly, withRepo))[0]?.evidence,
+      undefined,
+    );
+    eq(
+      "a repository without the commit settles nothing, and keeps the finding",
+      (await checkClaims([at("src/util.ts", 6, "duplicate", "other")], utilOnly, { files: [util], repo: { dir: repo, commit: "0".repeat(40) } })).length,
+      0,
+    );
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+
+  const [c] = await checkClaims([at("src/util.ts", 1, "unused", "helper", "helper() is dead code")], index, { files });
+  const o = contradictionOutcome(c!);
+  eq("a contradiction is recorded as a refutation by the claim checker", [o.killed, o.verdicts[0]?.model, o.verdicts[0]?.verdict], [true, CLAIM_CHECKER, "refuted"]);
+  eq("...quoting the line that proves it", o.verdicts[0]?.evidenceQuote, "export const out = helper(1);");
+  eq("a finding with no checkable claim is left alone", (await checkClaims([{ ...at("src/util.ts", 1, "unused", "helper"), claim_kind: undefined }], index, { files })).length, 0);
 }

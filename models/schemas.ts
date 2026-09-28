@@ -11,7 +11,7 @@
 // are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
 // live in descriptions and in the validators.
 import { FINDER_CATEGORIES, SEVERITIES } from "../config";
-import { REQ_VERDICTS, SKEPTIC_VERDICTS, type ChatRequest } from "../libs/types";
+import { CLAIM_KINDS, REQ_VERDICTS, SKEPTIC_VERDICTS, type ChatRequest } from "../libs/types";
 
 export const FINDINGS_SCHEMA = {
   type: "object",
@@ -29,6 +29,7 @@ export const FINDINGS_SCHEMA = {
         required: [
           "category", "severity", "confidence", "file", "quote", "context_before",
           "context_after", "side", "claim", "evidence", "suggested_fix", "cites",
+          "claim_kind", "claim_subject",
         ],
         properties: {
           // The finder's eight, not the full taxonomy: req-mismatch is the requirement
@@ -69,6 +70,16 @@ export const FINDINGS_SCHEMA = {
             type: ["string", "null"],
             description:
               "For maintainability findings: the named smell or project rule this invokes (e.g. \"Feature Envy\"). Null for findings that rest on concrete broken behavior.",
+          },
+          claim_kind: {
+            type: ["string", "null"],
+            enum: [...CLAIM_KINDS, null],
+            description:
+              "Only when the whole claim is one of these checkable facts: \"unused\" (a symbol is never used), \"undefined\" (a symbol is used but not defined or imported), \"missing-file\" (a referenced file does not exist), \"duplicate\" (a symbol is defined twice). Null otherwise.",
+          },
+          claim_subject: {
+            type: ["string", "null"],
+            description: "With claim_kind: the symbol's name, or the file's path. Null otherwise.",
           },
         },
       },

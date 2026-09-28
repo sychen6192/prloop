@@ -135,6 +135,10 @@ function mergeInto(target: AnchoredFinding, extra: AnchoredFinding): void {
   target.confidence = Math.max(target.confidence, extra.confidence);
   if (!target.suggested_fix && extra.suggested_fix) target.suggested_fix = extra.suggested_fix;
   if (!target.evidence && extra.evidence) target.evidence = extra.evidence;
+  if (!target.claim_kind && extra.claim_kind && extra.claim_subject) {
+    target.claim_kind = extra.claim_kind;
+    target.claim_subject = extra.claim_subject;
+  }
 }
 
 /**

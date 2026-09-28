@@ -103,6 +103,8 @@ interface Defect {
   severity: string;
   /** A hallucination: reported whatever the prompt shows, on a line that exists nowhere. */
   always?: boolean;
+  /** A claim a search of the code can settle (gates/claims.ts). */
+  checkable?: { kind: string; subject: string };
 }
 
 const PAY = "src/pay.ts";
@@ -113,6 +115,8 @@ const DEFECTS: Defect[] = [
   { by: ["finder-a"], file: PAY, quote: "const total = amountCents * 100;", category: "correctness", severity: "high", claim: "Converts cents to cents a second time", always: true },
   { by: ["finder-b"], file: PAY, quote: "for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {", category: "correctness", severity: "medium", claim: "The retry loop never terminates while send() keeps failing" },
   { by: ["finder-a", "finder-b"], file: PAY, quote: "return totalCents / parts;", category: "correctness", severity: "medium", claim: "splitEvenly() returns fractional cents; floor it and hand out the remainder" },
+  // The retry loop three lines down uses it: the claim checker settles this before any skeptic.
+  { by: ["finder-a"], file: PAY, quote: "export const MAX_RETRIES = 3;", category: "correctness", severity: "medium", claim: "MAX_RETRIES is never used", checkable: { kind: "unused", subject: "MAX_RETRIES" } },
   { by: ["finder-a", "finder-b"], file: INVOICE, quote: "public decimal Total => Lines.Sum(l => l.Price);", category: "correctness", severity: "high", claim: "Total ignores each line's quantity" },
 ];
 
@@ -141,6 +145,8 @@ function finderAnswer(model: string, prompt: string): unknown {
     evidence: null,
     suggested_fix: null,
     cites: null,
+    claim_kind: d.checkable?.kind ?? null,
+    claim_subject: d.checkable?.subject ?? null,
   }));
   return { findings };
 }
@@ -349,7 +355,23 @@ try {
     const { value: result } = await capture(() => runReview({ ref, runner, compareTo: 0 }));
 
     eq("each finder is asked once", stageCalls("findings").length, 2);
-    eq("every anchored finding meets a skeptic, the hallucinated one never does", stageCalls("verdict").length, 3);
+    eq(
+      "every anchored finding meets a skeptic — not the hallucinated one, and not the one the code contradicts",
+      stageCalls("verdict").length,
+      3,
+    );
+    check("...no skeptic is shown the claim the code settled", stageCalls("verdict").every((c) => !userPrompt(c).includes("MAX_RETRIES is never used")));
+    const skepticRows = JSON.parse(fs.readFileSync(path.join(result.runDir, "skeptic.json"), "utf8")) as Array<{
+      claim: string;
+      killed: boolean;
+      verdicts: Array<{ model: string; reason: string }>;
+    }>;
+    const settled = skepticRows.find((r) => r.claim === "MAX_RETRIES is never used");
+    eq(
+      "...it is refuted by the claim checker, with the line that uses it",
+      [settled?.killed, settled?.verdicts[0]?.model, settled?.verdicts[0]?.reason],
+      [true, "claim-check", "`MAX_RETRIES` is used at src/pay.ts:4"],
+    );
     eq("the requirement axis is asked once, with no accusation to dispute", [stageCalls("requirements").length, stageCalls("req_dispute").length], [1, 0]);
 
     const posted = inlinePosts();

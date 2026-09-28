@@ -104,6 +104,26 @@ export function declares(line: string, name: string): boolean {
   );
 }
 
+/** Whether a line looks like it brings `name` in from elsewhere: an import, a using, a require. */
+export function imports(line: string, name: string): boolean {
+  return (
+    /^\s*(?:import|from|using|use|#include|require|export\s+\{|(?:const|let|var)\s*\{)/.test(line) &&
+    new RegExp(`(?<![\\w$])${escape(name)}(?![\\w$])`).test(line)
+  );
+}
+
+/**
+ * The code on a line with its string literals and trailing comment removed, so that a name
+ * mentioned in a message or a note is not mistaken for a use of it.
+ */
+export function codeOf(line: string): string {
+  return line
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, '""')
+    // Only after whitespace: `a//b` is Python division and `this.#count` a private field.
+    .replace(/(?:^|\s)(?:\/\/|#(?!include|\[|!)).*$/, "")
+    .replace(/^\s*(?:\/\*|\*).*$/, "");
+}
+
 const calls = (line: string, name: string) => new RegExp(`(?<![\\w$])${escape(name)}\\s*\\(`).test(line);
 
 interface Hit {
@@ -147,7 +167,7 @@ const MAX_CANDIDATE_FILES = 40;
  * files most likely to DEFINE it first — its name in the file's name, the accused file's
  * directory — because git's own order is alphabetical, and alphabetical is not relevance.
  */
-async function grepRepo(
+export async function grepRepo(
   repo: { dir: string; commit: string },
   names: readonly string[],
   near: string,

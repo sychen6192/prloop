@@ -87,7 +87,12 @@ mode** — report everything, including low confidence — and three independent
 do the filtering:
 
 1. **Anchoring** kills hallucinations.
-2. **Skeptic** — a model from a *different family* is told to **refute** the finding, not
+2. **Skeptic** — first, a claim a search can settle is settled by one: a finder marks "X is
+   never used", "X is not defined", "that file does not exist" or "X is defined twice", and
+   `gates/claims.ts` looks it up in the PR's files and, with `git grep` at the commit, in the
+   repository. Only a contradiction found drops a finding — the use, the definition, the file,
+   recorded as a refutation with the line that proves it; a lookup that cannot run keeps it.
+   Then a model from a *different family* is told to **refute** the finding, not
    assess it. A verifier asked "is this right?" agrees. It also **never sees the finder's
    reasoning**, only the claim and the code; shared reasoning creates an anchoring effect.
    Its verdict has three values, not two: `refuted` (which must quote the line that proves
