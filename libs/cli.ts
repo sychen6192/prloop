@@ -16,6 +16,8 @@ export interface CliArgs {
   url?: string;
   /** --since: an iteration number, "auto" to resume from the last reviewed one, or unset. */
   since?: number | "auto";
+  /** --batch: a file of PR URLs, one per line. Mutually exclusive with a URL argument. */
+  batch?: string;
   dryRun: boolean;
   /** --config, or PRR_SHOW_CONFIG when the caller passed it in. */
   showConfig: boolean;
@@ -24,8 +26,12 @@ export interface CliArgs {
   error?: string;
 }
 
+/** Options that take a value; their value must never be mistaken for the positional URL. */
+const VALUED = ["--since", "--batch"] as const;
+
 export function parseArgs(argv: readonly string[], showConfigEnv = false): CliArgs {
   const sinceIdx = argv.indexOf("--since");
+  const batchIdx = argv.indexOf("--batch");
   let since: number | "auto" | undefined;
   let error: string | undefined;
   if (sinceIdx >= 0) {
@@ -44,13 +50,27 @@ export function parseArgs(argv: readonly string[], showConfigEnv = false): CliAr
     }
   }
 
-  // The positional scan skips --since's value: "3" and "auto" do not start with "-", so
-  // without this `prloop --since 3 <URL>` takes "3" for the PR URL.
-  const url = argv.find((a, i) => !a.startsWith("-") && (sinceIdx < 0 || i !== sinceIdx + 1));
+  const batch = batchIdx >= 0 ? argv[batchIdx + 1] : undefined;
+  if (batchIdx >= 0 && (batch === undefined || batch.startsWith("-"))) {
+    error ??= `--batch takes a file of pull request URLs, one per line, got: ${batch ?? "(nothing)"}`;
+  }
+
+  // The positional scan skips the VALUE of every valued option: "3", "auto" and a file path
+  // do not start with "-", so without this `prloop --since 3 <URL>` takes "3" for the PR URL
+  // and `prloop --batch prs.txt` takes prs.txt for it.
+  const valueAt = new Set(VALUED.map((o) => argv.indexOf(o)).filter((i) => i >= 0).map((i) => i + 1));
+  const url = argv.find((a, i) => !a.startsWith("-") && !valueAt.has(i));
+
+  // Both would mean reviewing one PR and a list of them in the same process, and the more
+  // likely reading of `prloop <URL> --batch prs.txt` is a mistake, not an instruction.
+  if (url !== undefined && batch !== undefined) {
+    error ??= "--batch reviews a list of pull requests; do not also pass a URL";
+  }
 
   return {
     ...(url !== undefined ? { url } : {}),
     ...(since !== undefined ? { since } : {}),
+    ...(batch !== undefined && !batch.startsWith("-") ? { batch } : {}),
     dryRun: argv.includes("--dry-run"),
     showConfig: wantsConfigDump(argv, showConfigEnv),
     help: argv.includes("-h") || argv.includes("--help"),

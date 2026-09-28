@@ -159,6 +159,26 @@ export interface ResultSummaryInput {
   counts: { raw: number; anchored: number; survived: number; inline: number; degraded: number };
   tokens: { calls: number; promptTokens: number; completionTokens: number };
   durationSec: number;
+  /**
+   * Which pull request, which iteration, which settings. Without it the file could only be
+   * identified by the directory path it happens to sit in, so any cross-run reporting — a
+   * morning digest over a list of PRs, calibrate joining runs to a repo — had to parse
+   * directory names or open context.json and config.json beside it.
+   */
+  identity?: {
+    ref: PrRef;
+    iteration?: number;
+    compareTo?: number;
+    dryRun: boolean;
+    /** The id this run used on the PR's lease marker (publish/lease.ts). */
+    runId?: string;
+    startedAt: string;
+    models: { finders: readonly string[]; skeptics: readonly string[]; req?: string; triage?: string };
+  };
+  /** Why the run died, on a path that reached no verdict at all. */
+  fatal?: string;
+  /** Why the run reviewed nothing, e.g. a pull request that has already merged. */
+  skippedReason?: string;
 }
 
 /**
@@ -170,6 +190,9 @@ export interface ResultSummaryInput {
 export function buildResultSummary(input: ResultSummaryInput): Record<string, unknown> {
   return {
     exitCode: input.exitCode,
+    ...(input.fatal === undefined ? {} : { fatal: input.fatal }),
+    ...(input.skippedReason === undefined ? {} : { skippedReason: input.skippedReason }),
+    ...(input.identity === undefined ? {} : { identity: input.identity }),
     incomplete: [...input.incomplete],
     counts: { ...input.counts },
     tokens: { ...input.tokens },
@@ -239,16 +262,91 @@ function appender<T>(file: string, render: (item: T) => string): (item: T) => vo
   };
 }
 
+function prDir(ref: PrRef): string {
+  return path.join(RUNS_DIR, safe(ref.org), safe(ref.project), safe(ref.repoId), `pr-${ref.prId}`);
+}
+
+/**
+ * The directory the run in this process is writing into, once it has one.
+ *
+ * Module-level because only loop.ts's fatal handler needs it and it needs it from outside
+ * the call that failed: a crash inside runReview should leave its result.json NEXT TO the
+ * findings and prompts that run produced, not in a directory of its own.
+ */
+let current: string | undefined;
+export const currentRunDir = (): string | undefined => current;
+
 export function createRunDir(ref: PrRef, iterationId: number): RunDir {
-  return openRunDir(
-    path.join(
-      RUNS_DIR,
-      safe(ref.org),
-      safe(ref.project),
-      safe(ref.repoId),
-      `pr-${ref.prId}`,
-      `${ITER_PREFIX}${iterationId}-${timestamp()}`,
-    ),
-    true,
-  );
+  const dir = openRunDir(path.join(prDir(ref), `${ITER_PREFIX}${iterationId}-${timestamp()}`), true);
+  current = dir.dir;
+  return dir;
+}
+
+/**
+ * Where a run that died before it had a run directory records what killed it.
+ *
+ * One fixed directory per PR, overwritten, for the same two reasons as `skipped/`: a nightly
+ * job failing on a revoked PAT would otherwise leave a timestamped directory every night, and
+ * if those counted toward PRR_RUNS_KEEP they would evict that PR's last real review — a week
+ * of auth failures erasing the review anyone would want to look at. The only question this
+ * answers is "why did the last run die", and only the latest answer is the current one.
+ */
+/**
+ * The result.json a child run left behind, found by walking the PR's own directory.
+ *
+ * `--batch` spawns one child per pull request (libs/batch.ts) and needs to say what each one
+ * did. The exit code alone cannot: 0 covers both "clean" and "the PR had already merged", and
+ * 3 names no stage. The child knows, and wrote it down — but into one of three directories
+ * whose names the parent cannot predict (iter-<n>-<timestamp>, skipped, fatal).
+ *
+ * `notBefore` is what makes the answer this run's rather than last night's: result.json
+ * carries the run's own start time in its identity block, which is exactly the field that
+ * makes the file identifiable on its own. A run whose identity is missing or older is
+ * ignored, and the caller reports the exit code alone rather than somebody else's summary.
+ */
+export function latestResult(ref: PrRef, notBefore: number): Record<string, unknown> | undefined {
+  const dir = prDir(ref);
+  let best: { at: number; value: Record<string, unknown> } | undefined;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    try {
+      const raw = fs.readFileSync(path.join(dir, ent.name, "result.json"), "utf8");
+      const value = JSON.parse(raw) as Record<string, unknown>;
+      const started = (value["identity"] as { startedAt?: string } | undefined)?.startedAt;
+      const at = started ? Date.parse(started) : NaN;
+      if (!Number.isFinite(at) || at < notBefore) continue;
+      if (!best || at > best.at) best = { at, value };
+    } catch {
+      // A directory with no result.json, or one being written right now. Neither is news.
+    }
+  }
+  return best?.value;
+}
+
+export function createFatalRunDir(ref: PrRef): RunDir {
+  return openRunDir(path.join(prDir(ref), "fatal"), true);
+}
+
+/**
+ * Where a tick that did no review records why.
+ *
+ * One fixed directory per PR, overwritten each time, and both halves of that matter. It is
+ * not an `iter-` directory, so selectForPruning never counts it — otherwise a daily cron over
+ * a PR that has merged would evict the last REAL review inside PRR_RUNS_KEEP ticks, leaving
+ * calibrate.ts nothing to join that repo's dismissals against and turning every one of them
+ * into an orphan. And it is a fixed name rather than a timestamped one, so a year of daily
+ * ticks leaves one small directory instead of three hundred: the only question it has to
+ * answer is "why did this PR produce nothing today", and only the latest answer is the
+ * current one.
+ */
+export function createSkipDir(ref: PrRef): RunDir {
+  const dir = openRunDir(path.join(prDir(ref), "skipped"), true);
+  current = dir.dir;
+  return dir;
 }

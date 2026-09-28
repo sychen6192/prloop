@@ -9,6 +9,20 @@
 // What they are worth: `prloop --since 3 <URL>` used to be one careless edit away from
 // parsing "3" as the PR URL, and the exit status is the only part of a run that CI reads —
 // a review that could not finish must not answer a gate with the same 0 as a clean one.
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+  FATAL_STREAK_LIMIT,
+  batchExitCode,
+  childCommand,
+  describeResult,
+  forwardedArgs,
+  parseBatchList,
+  readBatchList,
+  renderBatchReport,
+  runBatch,
+} from "../libs/batch";
 import { parseArgs } from "../libs/cli";
 import { exitCodeFor } from "../orchestrator";
 import type { AnchoredFinding, CriterionCheck, ReqVerdict, RequirementResult } from "../libs/types";
@@ -148,6 +162,117 @@ section("exit status: the only part of a run that CI reads");
   eq("an absent requirement result is not an unmet criterion", exitCodeFor({ agg: agg([]), incomplete: [] }), 0);
   eq("...nor is a skipped axis",
     exitCodeFor({ agg: agg([]), req: { workItems: [], criteria: [], extras: [], skipped: "no linked work item" }, incomplete: [] }), 0);
+}
+
+
+section("--batch: review a list of pull requests and keep the exit codes");
+{
+  // The README's own daily job is `while read -r url; do prloop "$url" || true; done`, and
+  // the `|| true` is not laziness: without it the first PR with a blocking finding stops the
+  // loop, so the only way to review the rest is to throw every exit code away.
+  eq("a file of URLs is a batch, not a PR argument", parseArgs(["--batch", "prs.txt"]).batch, "prs.txt");
+  // The rule libs/cli.ts exists for, now applying to a second option: a file path does not
+  // start with "-", so without skipping the value it is read as the positional PR URL.
+  eq("...and the file is never mistaken for the URL", parseArgs(["--batch", "prs.txt"]).url, undefined);
+  eq("...even beside --since", parseArgs(["--since", "3", "--batch", "prs.txt"]).url, undefined);
+  eq("...while a real URL beside --since still parses", parseArgs(["--since", "3", URL_ARG]).url, URL_ARG);
+  check("--batch with no file is an error", (parseArgs(["--batch"]).error ?? "").includes("--batch takes a file"), "");
+  check("...as is --batch followed by another flag", (parseArgs(["--batch", "--dry-run"]).error ?? "").includes("--batch takes a file"), "");
+  // Reviewing one PR and a list of them in the same process is not a thing, and the likelier
+  // reading of the pair is a mistake.
+  check("a URL and a batch together is an error", (parseArgs([URL_ARG, "--batch", "prs.txt"]).error ?? "").includes("do not also pass a URL"), "");
+
+  // Every other flag is forwarded to every child, so `--batch prs.txt --since auto` means
+  // what it reads as.
+  eq("--batch and its file are not forwarded", forwardedArgs(["--batch", "prs.txt", "--since", "auto"]), ["--since", "auto"]);
+  eq("...and nothing else is dropped", forwardedArgs(["--dry-run", "--batch", "p", "--since", "3"]), ["--dry-run", "--since", "3"]);
+
+  // The list. A `#` inside a line is part of a URL, so only a line that STARTS with one is a
+  // comment — truncating at an inline `#` would silently review a different pull request.
+  const list = parseBatchList(`# nightly\n${URL_ARG}\n\n   \n${URL_ARG.replace("4821", "4822")}\n`);
+  eq("comments and blank lines are skipped", list.urls.length, 2);
+  eq("...and nothing is wrong with the file", list.errors, []);
+  const bad = parseBatchList(`${URL_ARG}\nnot-a-url\n`);
+  eq("a line that is not a PR URL is named with its line number", bad.errors.length, 1);
+  check("...by line number", (bad.errors[0] ?? "").startsWith("line 2:"), bad.errors[0]);
+
+  // Validated before the first child is spawned: a typo on line 40 of a 60-line list used to
+  // surface two hours in, after everything above it had been reviewed and paid for.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-batch-"));
+  try {
+    const file = path.join(dir, "prs.txt");
+    fs.writeFileSync(file, `${URL_ARG}\nnope\n`);
+    let err = "";
+    try {
+      readBatchList(file);
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+    }
+    check("a bad line stops the batch before anything is reviewed", err.includes("nothing was reviewed") && err.includes("line 2"), err);
+    fs.writeFileSync(file, "# only comments\n");
+    let empty = "";
+    try {
+      readBatchList(file);
+    } catch (e) {
+      empty = e instanceof Error ? e.message : String(e);
+    }
+    check("...and so does a file with no pull requests in it", empty.includes("lists no pull requests"), empty);
+    fs.writeFileSync(file, `${URL_ARG}\n`);
+    eq("a good file reads back", readBatchList(file), [URL_ARG]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // The batch's own status: the worst thing that happened to anything in it. 1 outranks
+  // everything because it does not describe a pull request at all — prloop could not run.
+  eq("all clean is clean", batchExitCode([0, 0, 0]), 0);
+  eq("one blocking finding is blocking", batchExitCode([0, 2, 0]), 2);
+  eq("one incomplete review is incomplete", batchExitCode([0, 3, 0]), 3);
+  eq("blocking outranks incomplete, exactly as it does for one run", batchExitCode([3, 2]), 2);
+  eq("...and a fatal outranks both", batchExitCode([2, 3, 1]), 1);
+  eq("an empty batch is clean", batchExitCode([]), 0);
+
+  // The exit code alone cannot say what happened: 0 covers both "clean" and "the PR had
+  // already merged", and 3 names no stage. The child wrote all of it into result.json.
+  eq("a merged PR is not silently reported as clean", describeResult({ skippedReason: "the pull request is completed" }, 0), "no review: the pull request is completed");
+  eq("a crash reports what killed it", describeResult({ fatal: "HTTP 401: unauthorized" }, 1), "HTTP 401: unauthorized");
+  eq("an incomplete review names a stage", describeResult({ incomplete: ["finder qwen (timeout)"], counts: { inline: 2 } }, 3), "2 inline comments, review incomplete: finder qwen (timeout)");
+  eq("a clean run says so", describeResult({ incomplete: [], counts: { inline: 0 } }, 0), "clean");
+  eq("...and a run whose artifact is missing falls back to the code", describeResult(undefined, 3), "exit 3 (no result.json found)");
+
+  // prloop runs under tsx, whose loader lives in execArgv. Re-running `node loop.ts` without
+  // it fails on the first TypeScript file.
+  const cmd = childCommand(["a", "b"]);
+  eq("a child is this same node", cmd.file, process.execPath);
+  check("...with this same loader", process.execArgv.every((a) => cmd.args.includes(a)), cmd.args.join(" "));
+  eq("...and the arguments last", cmd.args.slice(-2), ["a", "b"]);
+
+  // End to end, with a child that is not prloop: the loop, the tally and the table are the
+  // parts with the decisions in them, and they must be assertable without a review.
+  const sh = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-child-"));
+  try {
+    const script = path.join(sh, "child.mjs");
+    // Exits with the PR number, so the batch sees 1, 1, 1, ... and must stop.
+    fs.writeFileSync(script, "process.exit(Number(process.argv[2].split('/').pop()));\n");
+    const realArgv1 = process.argv[1] ?? "";
+    process.argv[1] = script;
+    try {
+      // The child exits with the PR number, so a list of 1s is three fatals in a row.
+      const base = "https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/";
+      const urls = [1, 1, 1, 2, 2].map((n) => `${base}${n}`);
+      const outcomes = await runBatch(urls, []);
+      eq(`the batch stops after ${FATAL_STREAK_LIMIT} fatals in a row`, outcomes.filter((o) => o.exitCode === undefined).length, 2);
+      eq("...and the ones it did run kept their codes", outcomes.slice(0, 3).map((o) => o.exitCode), [1, 1, 1]);
+      eq("...while the rest say they were never attempted", outcomes[3]?.detail, "not attempted");
+      const table = renderBatchReport(outcomes);
+      check("the table has a row per pull request", table.split("\n").length === outcomes.length + 1, table);
+      check("...and an unattempted one has no exit code to show", table.includes("—"), table);
+    } finally {
+      process.argv[1] = realArgv1;
+    }
+  } finally {
+    fs.rmSync(sh, { recursive: true, force: true });
+  }
 }
 
 console.log(`\nResult: ${passed} passed, ${failed} failed`);

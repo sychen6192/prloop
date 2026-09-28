@@ -11,6 +11,33 @@ export interface ExecResult {
   code: number;
   /** Set when the deadline fired and the process tree was killed. */
   timedOut?: boolean;
+  /** The signal that ended the child, when one did. */
+  signal?: NodeJS.Signals | null;
+  /**
+   * The command never started — not on PATH, not spawnable, wrong shim. A different failure
+   * from "it ran and exited 1", and callers that suggest an install need to tell them apart.
+   */
+  spawnFailed?: true;
+}
+
+/**
+ * The parts of running a child process that only some callers need. They live here rather
+ * than in a second runner because the alternative was a second runner: models/opencode.ts
+ * needed to write stdin and to read stdout line by line as it arrived, run() could do
+ * neither, and 150 lines of kill escalation, drain handling and idempotent completion were
+ * copied to get them — minus the output cap, which the copy silently dropped.
+ */
+export interface RunExtras {
+  /** Written to the child's stdin, which is then closed. Without it stdin is closed at once. */
+  stdin?: string;
+  /** Each complete line of stdout, as it arrives. The trailing partial line is flushed at the end. */
+  onStdoutLine?: (line: string) => void;
+  /** Each complete line of stderr, as it arrives. */
+  onStderrLine?: (line: string) => void;
+  /** Called when the deadline fires, before the tree is killed — for callers that log it live. */
+  onTimeout?: () => void;
+  /** Grace between the SIGTERM that ends a timed-out tree and the SIGKILL that insists. */
+  killEscalationMs?: number;
 }
 
 // Roughly what execFile's maxBuffer used to cap (that counted bytes, this counts decoded
@@ -70,11 +97,12 @@ export function run(
   args: string[],
   timeoutMs = 60_000,
   cwd?: string,
+  extras: RunExtras = {},
 ): Promise<ExecResult> {
   // Through planSpawn, not spawn directly: on Windows `npx` is npx.cmd, a shim current Node
   // refuses to spawn (CVE-2024-27980), so the whole gate died with EINVAL there. No-op on POSIX.
   const plan = planSpawn(cmd, args);
-  if (plan.error) return Promise.resolve({ stdout: "", stderr: plan.error, code: 1 });
+  if (plan.error) return Promise.resolve({ stdout: "", stderr: plan.error, code: 1, spawnFailed: true });
 
   return new Promise((resolve) => {
     let child: ChildProcess;
@@ -84,21 +112,31 @@ export function run(
         // The static tools run inside a checkout of the PR's source branch and execute
         // its code (eslint configs, Maven plugins); they never get our credentials.
         env: scrubbedEnv(),
-        // stdin is closed, not piped: a tool that decides to prompt gets EOF immediately
-        // instead of blocking on a read nobody will ever answer.
-        stdio: ["ignore", "pipe", "pipe"],
+        // stdin is closed, not piped, unless the caller has something to write: a tool that
+        // decides to prompt gets EOF immediately instead of blocking on a read nobody will
+        // ever answer.
+        stdio: [extras.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         // POSIX only: makes the child a process-group leader so the timeout can kill the
         // whole tree rather than only the process we happen to hold. See killTree below.
         detached: DETACH_CHILDREN,
         ...(plan.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       });
     } catch (err) {
-      resolve({ stdout: "", stderr: explainSpawnError(err as NodeJS.ErrnoException, cmd), code: 1 });
+      resolve({ stdout: "", stderr: explainSpawnError(err as NodeJS.ErrnoException, cmd), code: 1, spawnFailed: true });
       return;
     }
     // A detached child no longer receives the terminal's Ctrl-C, so it has to be registered
     // or an interrupted run leaves linters behind.
     trackForShutdown(child);
+
+    if (extras.stdin !== undefined) {
+      // Written and closed unconditionally: a child that blocks reading stdin to EOF — which
+      // is exactly what opencode does before it prompts the model — hangs forever on a piped
+      // stdin nobody closes. EPIPE is expected when the child dies first (bad flag, missing
+      // auth); the exit path reports that, so it must not surface here as an unhandled error.
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(extras.stdin, "utf8");
+    }
 
     let stdout = "";
     let stderr = "";
@@ -106,6 +144,17 @@ export function run(
     let timedOut = false;
     let spawnError: string | undefined;
     let exitCode: number | undefined;
+    let exitSignal: NodeJS.Signals | null = null;
+    // Partial trailing lines, held back until the newline arrives or the child is done.
+    let outLineBuf = "";
+    let errLineBuf = "";
+
+    const feedLines = (buf: string, chunk: string, sink: (line: string) => void): string => {
+      const parts = (buf + chunk).split("\n");
+      const rest = parts.pop() ?? "";
+      for (const line of parts) sink(line);
+      return rest;
+    };
 
     const cap = (buf: string, chunk: string): string => {
       if (buf.length + chunk.length <= MAX_OUTPUT_CHARS) return buf + chunk;
@@ -115,28 +164,32 @@ export function run(
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (c: string) => {
       stdout = cap(stdout, c);
+      if (extras.onStdoutLine) outLineBuf = feedLines(outLineBuf, c, extras.onStdoutLine);
       if (overflowed) killTree(child, "SIGKILL");
     });
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (c: string) => {
       stderr = cap(stderr, c);
+      if (extras.onStderrLine) errLineBuf = feedLines(errLineBuf, c, extras.onStderrLine);
       if (overflowed) killTree(child, "SIGKILL");
     });
 
     let killEscalation: ReturnType<typeof setTimeout> | undefined;
     let giveUp: ReturnType<typeof setTimeout> | undefined;
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const escalationMs = extras.killEscalationMs ?? KILL_ESCALATION_MS;
     const timer = setTimeout(() => {
       timedOut = true;
       logVerbose(describeRunTimeout(cmd, timeoutMs));
+      extras.onTimeout?.();
       killTree(child, "SIGTERM");
       // Only POSIX has anything to escalate to: on Windows taskkill /F was already a hard kill.
       if (DETACH_CHILDREN) {
-        killEscalation = setTimeout(() => killTree(child, "SIGKILL"), KILL_ESCALATION_MS);
+        killEscalation = setTimeout(() => killTree(child, "SIGKILL"), escalationMs);
       }
       // Last resort. A survivor we cannot signal at all must still not hold the run: the
       // whole point of a timeout is that it bounds the wall clock.
-      giveUp = setTimeout(finish, KILL_ESCALATION_MS + EXIT_DRAIN_MS);
+      giveUp = setTimeout(finish, escalationMs + EXIT_DRAIN_MS);
     }, timeoutMs);
 
     let finished = false;
@@ -147,6 +200,10 @@ export function run(
       if (killEscalation) clearTimeout(killEscalation);
       if (giveUp) clearTimeout(giveUp);
       if (drainTimer) clearTimeout(drainTimer);
+
+      // Whatever arrived without a closing newline is still output the caller asked to see.
+      if (outLineBuf !== "" && extras.onStdoutLine) extras.onStdoutLine(outLineBuf);
+      if (errLineBuf !== "" && extras.onStderrLine) extras.onStderrLine(errLineBuf);
 
       // Named failures first, so a caller that truncates stderr still shows the reason.
       const notes: string[] = [];
@@ -170,18 +227,25 @@ export function run(
         stdout,
         stderr: [...notes, stderr].filter((s) => s !== "").join("\n"),
         code: failed ? exitCode || 1 : exitCode ?? 1,
+        signal: exitSignal,
         ...(timedOut ? { timedOut: true } : {}),
+        ...(spawnError === undefined ? {} : { spawnFailed: true as const }),
       });
     }
 
-    child.on("exit", (code) => {
+    child.on("exit", (code, signal) => {
       if (typeof code === "number") exitCode = code;
+      exitSignal = signal;
       // 'close' waits for the stdio pipes too, so a grandchild holding an inherited pipe
       // keeps it from ever firing. 'exit' always fires; let the pipes drain briefly, then
       // finish regardless. finish() is idempotent, so the usual ordering is unaffected.
       drainTimer = setTimeout(finish, EXIT_DRAIN_MS);
     });
-    child.on("close", finish);
+    child.on("close", (code, signal) => {
+      if (typeof code === "number") exitCode = code;
+      exitSignal = signal;
+      finish();
+    });
     child.on("error", (err) => {
       spawnError = explainSpawnError(err as NodeJS.ErrnoException, cmd);
       finish();

@@ -57,6 +57,29 @@ export interface FakeAdoState {
    * (PublishResult.failed), not an exception the run dies on.
    */
   rejectThreadPost?: (body: Record<string, unknown>) => number | undefined;
+  /**
+   * Rejects the status POST with this HTTP status. A branch-policy check that could not be
+   * updated is its own outcome: the gate on the PR then shows whatever the previous run
+   * left there, which may be green over a review that never ran.
+   */
+  rejectStatusPost?: number;
+  /**
+   * Rejects GET .../threads with this HTTP status. Every dedupe prloop has reads that list,
+   * so a run that cannot get it must post nothing rather than duplicate everything.
+   */
+  rejectThreadList?: number;
+  /**
+   * The identity GET /_apis/connectionData answers with — who prloop's credential posts as.
+   * Undefined serves a 404, which is the on-prem Server case where prloop must fall back to
+   * trusting the markers alone.
+   */
+  selfIdentityId?: string;
+  /**
+   * Runs after a comment PATCH has been applied. The only way to stage a SECOND writer
+   * landing between prloop's own write and the read-back that confirms it — which is the
+   * race the run lease narrows, and the one case where a claim must stand down.
+   */
+  afterCommentPatch?: (comment: FakeComment) => void;
 }
 
 export interface AdoRequest {
@@ -129,8 +152,18 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       }
       return sendJson(res, 200, { changeEntries: [] });
     }
+    // --- identity --------------------------------------------------------------------
+    if (method === "GET" && /\/_apis\/connectionData$/.test(path)) {
+      if (state.selfIdentityId === undefined) {
+        return sendJson(res, 404, { message: "VS402844: connectionData is not available" });
+      }
+      return sendJson(res, 200, { authenticatedUser: { id: state.selfIdentityId } });
+    }
     // --- threads ---------------------------------------------------------------------
     if (method === "GET" && /\/pullRequests\/\d+\/threads$/.test(path)) {
+      if (state.rejectThreadList !== undefined) {
+        return sendJson(res, state.rejectThreadList, { message: "TF400898: an internal error occurred" });
+      }
       return sendJson(res, 200, { count: state.threads.length, value: state.threads });
     }
     if (method === "POST" && /\/pullRequests\/\d+\/threads$/.test(path)) {
@@ -154,6 +187,7 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       const comment = thread?.comments?.find((c) => c.id === Number(commentPatch[2]));
       if (!comment) return sendJson(res, 404, { message: "no such comment" });
       comment.content = (body?.["content"] as string | undefined) ?? comment.content;
+      state.afterCommentPatch?.(comment);
       return sendJson(res, 200, comment);
     }
     const threadPatch = /\/pullRequests\/\d+\/threads\/(\d+)$/.exec(path);
@@ -165,6 +199,9 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
     }
     // --- status checks ---------------------------------------------------------------
     if (method === "POST" && /\/pullRequests\/\d+\/statuses$/.test(path)) {
+      if (state.rejectStatusPost !== undefined) {
+        return sendJson(res, state.rejectStatusPost, { message: "TF401027: the status could not be created" });
+      }
       return sendJson(res, 200, { id: 1, ...(body ?? {}) });
     }
     // --- work items ------------------------------------------------------------------

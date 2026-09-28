@@ -2,13 +2,17 @@
 // Use it to see what a review actually looks like before pointing the tool at a real PR,
 // and to eyeball comment wording after changing publish/format.ts.
 import { buildHunks, diffLines } from "../libs/diff";
+import * as path from "node:path";
+import { RUNS_DIR } from "../config";
+import { openRunDir } from "../libs/artifacts";
 import { renderFindingComment, renderSummary } from "../publish/format";
+import { renderReviewHtml } from "../publish/reviewhtml";
 import type { AnchoredFinding, FileDiff, RequirementResult } from "../libs/types";
 import type { ReviewContext } from "../ado/intake";
 
 function mkFile(path: string, rightLines: string[], changed: number[], language: string): FileDiff {
   const leftLines = rightLines.filter((_, i) => !changed.includes(i + 1));
-  const { hunks, changedRightLines } = buildHunks(
+  const { hunks, changedRightLines, changedLeftLines } = buildHunks(
     leftLines,
     rightLines,
     diffLines(leftLines, rightLines),
@@ -20,6 +24,7 @@ function mkFile(path: string, rightLines: string[], changed: number[], language:
     rightLines,
     leftLines,
     changedRightLines,
+    changedLeftLines,
     binary: false,
     truncated: false,
     language,
@@ -194,3 +199,27 @@ for (const f of findings) {
   console.log("═".repeat(78));
   console.log(renderFindingComment(f));
 }
+
+// The other half of a review, and the one a terminal cannot show: the diff with every
+// finding on its own line. Written where a real run writes its artifacts, so eyeballing the
+// report after changing publish/reviewhtml.ts needs no PR and no model either.
+const demoDir = openRunDir(path.join(RUNS_DIR, "demo"));
+demoDir.save(
+  "review.html",
+  renderReviewHtml({
+    ctx,
+    agg: {
+      inline: findings,
+      belowBar: [],
+      degraded,
+      stats: { raw: 4, afterDedupe: 3, anchored: 3, survived: 2, refuted: 1, inline: 2, byFailure: { "quote-not-found": 1 }, excluded: 0, dismissed: 0 },
+    },
+    reqFindings: [],
+    req,
+    durationSec: 74,
+    dryRun: true,
+  }),
+);
+console.log(`\n${"═".repeat(78)}`);
+console.log(`  Run report → ${path.join(demoDir.dir, "review.html")}`);
+console.log("═".repeat(78));

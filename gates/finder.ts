@@ -19,7 +19,7 @@ import { loadRules, renderRules, ruleHeadings, selectRules, type Rule } from "..
 import type { ModelRunner, RawFinding } from "../libs/types";
 import { isTruncation } from "../models/runner";
 import { FINDINGS_SCHEMA } from "../models/schemas";
-import { buildFinderPrompt, finderSystemFor, type FinderPromptInput, type RuleHeadingGroup } from "../prompts/finder";
+import { buildFinderPrompts, finderSystemFor, type FinderPromptInput, type RuleHeadingGroup } from "../prompts/finder";
 
 export interface FinderOutput {
   model: string;
@@ -32,6 +32,15 @@ export interface FinderOutput {
   // — finder 0's — cannot explain what finder 2 saw. Absent on outputs built offline.
   seed?: number;
   prompt?: string;
+  // What THIS finder was not shown, and which ceiling cut it off. Per finder for the same
+  // reason seed and prompt are: the diff is budgeted against the model's own context window
+  // (PRR_CONTEXT_TOKENS_BY_MODEL) and its own system prompt, so a heterogeneous fleet does
+  // not see the same files. Absent on outputs built offline.
+  omitted?: string[];
+  bound?: "chars" | "tokens";
+  // How many requests this one opinion took (PRR_FINDER_MAX_CHUNKS). Absent, or 1, for the
+  // ordinary case where the whole diff fit in a single call.
+  chunks?: number;
 }
 
 const VALID_SEVERITY = new Set<string>(SEVERITIES);
@@ -202,6 +211,46 @@ function salvageFindings(
   return { findings, rejected };
 }
 
+// A visible seam inside a saved prompt or a saved response, so the artifact for a chunked
+// finder is still one readable file per model with its parts in order.
+const chunkBanner = (i: number, n: number) => `\n\n${"=".repeat(24)} part ${i + 1}/${n} ${"=".repeat(24)}\n\n`;
+
+function joinChunks(parts: string[]): string {
+  return parts.length === 1 ? (parts[0] ?? "") : parts.map((t, i) => `${chunkBanner(i, parts.length)}${t}`).join("");
+}
+
+/**
+ * One finder's chunked requests folded back into the single opinion the rest of the pipeline
+ * is built on.
+ *
+ * Folded rather than returned as N outputs, because every count downstream reads an output
+ * as a MODEL: `sources` is `[out.model]`, the consensus warning counts distinct models, and
+ * the orchestrator's "all N finders failed" compares a failure count against `outputs.length`
+ * — which with three chunks would have reported three finders where one was configured, and
+ * called a run complete because two of its parts had answered.
+ *
+ * A chunk that failed makes the whole opinion an error, naming which part. That is the
+ * conservative reading and it is the right one: nobody else read those files, so the finder
+ * did not review this push, and the resume point must not step over it.
+ */
+export function mergeChunkOutputs(parts: FinderOutput[]): FinderOutput {
+  const first = parts[0]!;
+  if (parts.length === 1) return first;
+  const errors = parts
+    .map((p, i) => (p.error ? `part ${i + 1}/${parts.length}: ${p.error}` : ""))
+    .filter(Boolean);
+  return {
+    model: first.model,
+    findings: parts.flatMap((p) => p.findings),
+    rejected: parts.reduce((n, p) => n + p.rejected, 0),
+    raw: joinChunks(parts.map((p) => p.raw)),
+    ...(errors.length > 0 ? { error: errors.join("; ") } : {}),
+    ...(first.seed === undefined ? {} : { seed: first.seed }),
+    prompt: joinChunks(parts.map((p) => p.prompt ?? "")),
+    chunks: parts.length,
+  };
+}
+
 async function runOne(
   runner: ModelRunner,
   model: string,
@@ -294,9 +343,11 @@ export async function runFinders(
   const knownCites = knownCitesFor(selected, input.conventions);
   const suffixes = opts.promptSuffixes ?? FINDER_PROMPT_SUFFIX_BY_MODEL;
 
-  // Selection is decided once, by budget, and is identical for every finder; only the
-  // order of the included files differs per finder (libs/prng.ts says why). The run seed
-  // is logged so a result can be replayed with PRR_FINDER_SEED.
+  // The seed permutes the ORDER of the selected files per finder and never the selection
+  // itself (libs/prng.ts says why). Selection can still differ between finders, because the
+  // budget does: buildDiffPayload weighs the diff against this model's context window and
+  // this model's system prompt, both of which are per-model. The run seed is logged so a
+  // result can be replayed with PRR_FINDER_SEED.
   const runSeed = opts.seed ?? FINDER_SEED ?? newRunSeed();
   // The system prompt and the schema are handed to the prompt builder, not just to the
   // runner: they share the model's context window with the diff, so the diff cannot be
@@ -304,7 +355,7 @@ export async function runFinders(
   const systems = models.map((m) => finderSystemFor(m, suffixes));
   const schemaText = JSON.stringify(FINDINGS_SCHEMA);
   const promptFor = (i: number) =>
-    buildFinderPrompt({
+    buildFinderPrompts({
       ...input,
       rules,
       ruleHeadings: headings,
@@ -315,20 +366,54 @@ export async function runFinders(
     });
   const prompts = models.map((_, i) => promptFor(i));
   const first = prompts[0] ?? promptFor(0);
-  const omitted = first.omitted;
-  if (omitted.length > 0) {
+  // Coverage is what NO finder saw. Reporting finder 0's list instead let a file the
+  // smallest-window finder dropped pass as reviewed, and — with one finder, the common
+  // case — the two are the same list, so the gap only opened on a mixed fleet.
+  const omitted = first.omitted.filter((f) => prompts.every((p) => p.omitted.includes(f)));
+  // Seen by some finders and not others: reviewed, but by fewer opinions than the run was
+  // configured for, so anything found there cannot reach the corroboration bar. Worth
+  // saying out loud; not grounds for calling the run incomplete.
+  const partial = [...new Set(prompts.flatMap((p) => p.omitted))].filter((f) => !omitted.includes(f));
+  if (omitted.length > 0 || partial.length > 0) {
     // Which ceiling bound decides which knob is worth changing: raising PRR_MAX_DIFF_CHARS
     // does nothing when the model's context window is what ran out.
-    const knob = first.bound === "tokens" ? "the model's context window (PRR_CONTEXT_TOKENS)" : "PRR_MAX_DIFF_CHARS";
-    log(`[WARN] diff over ${knob}; ${omitted.length} files left out of the finder context`);
+    const bound = prompts.find((p) => p.bound)?.bound;
+    const knob = bound === "tokens" ? "the model's context window (PRR_CONTEXT_TOKENS)" : "PRR_MAX_DIFF_CHARS";
+    if (omitted.length > 0) {
+      log(`[WARN] diff over ${knob}; ${omitted.length} files left out of every finder's context`);
+    }
+    if (partial.length > 0) {
+      log(`[WARN] diff over ${knob}; ${partial.length} files seen by only some finders (fewer opinions, no corroboration)`);
+    }
   }
   log(`finder file order: run seed ${runSeed}${models.length > 1 ? `, one permutation per finder` : ""}`);
 
-  // Parallel across models; each is an independent opinion (M3 relies on that independence).
+  // The cost, said before it is spent rather than found on a bill. Chunking is linear in
+  // requests and the files it buys are the ones the budget was refusing, so the line names
+  // both halves.
+  const maxParts = Math.max(...prompts.map((p) => p.chunks.length));
+  if (maxParts > 1) {
+    log(
+      `diff split across ${maxParts} requests per finder (PRR_FINDER_MAX_CHUNKS): ` +
+        `${models.length * maxParts} finder calls instead of ${models.length}, reading files the budget would have dropped`,
+    );
+  }
+
+  // Parallel across models AND across each model's chunks; the runner's own concurrency cap
+  // (PRR_LLM_CONCURRENCY) is what bounds the fan-out. Each model is an independent opinion
+  // (M3 relies on that independence) and its chunks are folded back into one before anything
+  // downstream counts them.
   const outputs = await Promise.all(
-    models.map((m, i) =>
-      runOne(runner, m, systems[i]!, prompts[i]!.text, seedFor(runSeed, i), knownCites),
-    ),
+    models.map(async (m, i) => {
+      const parts = await Promise.all(
+        prompts[i]!.chunks.map((text) => runOne(runner, m, systems[i]!, text, seedFor(runSeed, i), knownCites)),
+      );
+      return {
+        ...mergeChunkOutputs(parts),
+        omitted: prompts[i]!.omitted,
+        ...(prompts[i]!.bound === undefined ? {} : { bound: prompts[i]!.bound }),
+      };
+    }),
   );
-  return { outputs, prompt: first.text, omitted, rules: selected.map((r) => r.name), seed: runSeed };
+  return { outputs, prompt: joinChunks(first.chunks), omitted, rules: selected.map((r) => r.name), seed: runSeed };
 }

@@ -5,8 +5,17 @@
 // where a finding lives and what gets posted are decided by code here (design principle: the
 // loop never hands control to a model). Adding a sixth call site is fine; adding one whose
 // answer selects the next action is not.
-import { LEARN_FROM_DISMISSALS, SKIP_REQUIREMENT, SKIP_STATIC, STRICT_COVERAGE, excludedCategories, isDryRun } from "./config";
+import {
+  LEARN_FROM_DISMISSALS,
+  SKIP_REQUIREMENT,
+  SKIP_STATIC,
+  STRICT_COVERAGE,
+  WORKTREE_REPO,
+  excludedCategories,
+  isDryRun,
+} from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
+import { terminalPrStatus } from "./ado/iterations";
 import { fetchRepoConventions } from "./ado/conventions";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
@@ -14,18 +23,28 @@ import { runFinders } from "./gates/finder";
 import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
 import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
-import { createRunDir } from "./libs/artifacts";
+import { isWorktreeFailure, prepareWorktree, type PreparedWorktree } from "./git/worktree";
+import { createRunDir, createSkipDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
 import { tokenTotals } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
 import type { AnchoredFinding, ModelRunner, PrRef, RequirementResult } from "./libs/types";
-import { publish, type PublishResult } from "./publish/publish";
+import { harvestClosedThreads, publish, type PublishResult } from "./publish/publish";
+import { renderReviewHtml } from "./publish/reviewhtml";
+import { reviewOutcome } from "./publish/status";
 
 export interface ReviewRunOptions {
   ref: PrRef;
   runner: ModelRunner;
   compareTo: number;
+  /**
+   * Where the ReviewContext comes from. Defaults to the Azure DevOps intake; git/intake.ts
+   * is the other adapter at this seam. A parameter rather than a hard-wired import so the
+   * contract in libs/context.ts is something a provider can be held to — including in a
+   * test — instead of being whatever ado/intake.ts happens to return.
+   */
+  intake?: (ref: PrRef, compareTo: number) => Promise<ReviewContext>;
 }
 
 export interface ReviewRunResult {
@@ -42,17 +61,26 @@ export interface ReviewRunResult {
    * the same exit code, and a CI check goes green on an unverified PR.
    */
   incomplete: string[];
+  /**
+   * Why this run did no review at all, e.g. "the pull request is completed". Named
+   * skippedReason rather than skipped because three neighbours already own that word and
+   * mean different things by it: ReviewContext.skipped is a list of files intake did not
+   * fetch, RequirementResult.skipped is a stage's reason string, StaticResult has both.
+   */
+  skippedReason?: string;
 }
 
 /**
  * Coverage gaps that make a review incomplete (PRR_STRICT_COVERAGE). Exported for the
  * selftest.
  *
- * A file the finder never saw was not reviewed, whatever the finder said about the rest:
- * left out of its context because the diff ran past PRR_MAX_DIFF_CHARS, or skipped by
- * intake as too large to fetch. Both were logged and named in the summary, and the run
- * still exited 0 — a green check over a PR whose largest file nobody read. Binary files
- * are not counted: nothing in them is reviewable, so their absence hides nothing.
+ * A file NO finder saw was not reviewed, whatever the finders said about the rest: left out
+ * of every finder's context because the diff ran past PRR_MAX_DIFF_CHARS or past the
+ * models' context windows, or skipped by intake as too large to fetch. Both were logged and
+ * named in the summary, and the run still exited 0 — a green check over a PR whose largest
+ * file nobody read. Binary files are not counted: nothing in them is reviewable, so their
+ * absence hides nothing. A file some finders saw and others did not is not a gap — it was
+ * reviewed, by fewer opinions; runFinders logs that separately.
  */
 export function coverageGaps(
   omitted: string[],
@@ -81,16 +109,93 @@ export function coverageGaps(
  * statement, and the incomplete stages are named in the log either way.
  */
 export function exitCodeFor(result: Pick<ReviewRunResult, "agg" | "req" | "incomplete">): 0 | 2 | 3 {
-  const highRisk = result.agg.inline.filter((f) => f.severity === "critical" || f.severity === "high");
-  const unmet = result.req ? unmetCriteria(result.req) : [];
-  return highRisk.length > 0 || unmet.length > 0 ? 2 : result.incomplete.length > 0 ? 3 : 0;
+  // Delegated rather than duplicated: publish() decides the branch-policy status from the
+  // same function over the same list, so the two cannot say different things about one run.
+  // They used to, and a merge policy can only see the status.
+  return reviewOutcome({
+    unmet: result.req ? unmetCriteria(result.req).length : 0,
+    highRisk: result.agg.inline.filter((f) => f.severity === "critical" || f.severity === "high").length,
+    incomplete: result.incomplete,
+    filesReviewed: 0,
+  }).exitCode;
+}
+
+/**
+ * A tick over a pull request nothing can be written to: harvest what humans did, record why
+ * the tick did nothing, spend no model call.
+ *
+ * It does not return bare, and the reads-only pass is the reason. listThreads is a GET and
+ * works fine on a merged PR, and the window right after a merge is exactly when people go
+ * through a bot's comments in bulk — dismissing the ones they disagreed with, marking the
+ * ones they fixed. Returning early without reading them would quietly delete the richest
+ * source the suppression feature has (PROPOSAL §10 makes that store the basis of the whole
+ * thing), and unlike the thread writes it is not something ADO was refusing anyway.
+ */
+async function skipTerminalPr(
+  ref: PrRef,
+  ctx: ReviewContext,
+  reason: string,
+  started: number,
+): Promise<ReviewRunResult> {
+  log(`${reason} — no review will be posted, so none is computed`);
+  const run = createSkipDir(ref);
+  const harvest = await harvestClosedThreads(ref).catch((e): { dismissals: number; outcomes: number } => {
+    // Best effort by design: a tick that could not read a merged PR has still correctly done
+    // nothing, and turning that into a failure would redden a cron over a list of PRs that
+    // are all finished.
+    log(`[WARN] could not read this PR's comments: ${e instanceof Error ? e.message : String(e)}`);
+    return { dismissals: 0, outcomes: 0 };
+  });
+  const durationSec = Math.round((Date.now() - started) / 1000);
+  run.saveJson("skipped.json", { ref, reason, prStatus: ctx.pr.status, iteration: ctx.iteration.id, ...harvest, durationSec });
+  if (harvest.dismissals > 0 || harvest.outcomes > 0) {
+    log(`Recorded ${harvest.dismissals} dismissals and ${harvest.outcomes} findings the author acted on`);
+  }
+  const agg: AggregateResult = {
+    inline: [],
+    belowBar: [],
+    degraded: [],
+    stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
+  };
+  return {
+    ctx,
+    agg,
+    req: { workItems: [], criteria: [], extras: [], skipped: reason },
+    reqFindings: [],
+    runDir: run.dir,
+    durationSec,
+    // Nothing was left unreviewed that a re-run could fix, so this is a clean exit 0 rather
+    // than the exit 3 the failing thread POSTs used to produce on every tick.
+    incomplete: [],
+    skippedReason: reason,
+  };
 }
 
 export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult> {
   const started = Date.now();
 
   banner("Step 1/4: fetch PR changes");
-  const ctx = await buildReviewContext(opts.ref, opts.compareTo);
+  const ctx = await (opts.intake ?? buildReviewContext)(opts.ref, opts.compareTo);
+
+  // A merged pull request refuses every write, so a review of one buys nothing and costs
+  // everything: the README's cron loop kept paying for the finders, the skeptic and triage on
+  // PRs that had merged weeks ago, then watched every createThread fail with "the pull
+  // request is completed" and exit 3 — on every tick, for as long as the URL stayed in
+  // prs.txt. That also poisoned the exit-3 signal, which is supposed to mean a stage failed.
+  //
+  // --dry-run still reviews it, and that is the escape hatch rather than a knob: reviewing
+  // historical PRs is exactly what PROPOSAL §12's golden set is built from, and a dry run
+  // already means "compute everything, write nothing".
+  //
+  // The honest cost note: intake has already fetched the PR, its iterations and two blobs
+  // per changed file by the time we get here. What this saves is the model budget, which is
+  // the part that is measured in money. Skipping before the REST spend would need a status
+  // probe of its own alongside the intake seam, and is a different change.
+  const terminal = terminalPrStatus(ctx.pr.status);
+  if (terminal && !isDryRun()) {
+    return skipTerminalPr(opts.ref, ctx, terminal, started);
+  }
+
   const run = createRunDir(opts.ref, ctx.iteration.id);
   log(`artifacts: ${run.dir}`);
 
@@ -126,6 +231,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
     };
     const durationSec = Math.round((Date.now() - started) / 1000);
+    // "No reviewable code changes" can also mean "the only changed file was too large to
+    // fetch" — that is not a clean PR, and the status must say so too, not just the exit
+    // code. Computed before publishing for the same reason as on the main path.
+    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
     const publishResult = await publish(
       opts.ref,
       { requirement: [], code: [] },
@@ -150,13 +259,9 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
         durationSec,
         runDir: run.dir,
       },
+      { unreviewed: [], incomplete },
     );
-    // "No reviewable code changes" can also mean "the only changed file was too large to
-    // fetch" — that is not a clean PR, and strict coverage says so.
-    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
-    if (publishResult.summaryThreadId === undefined && !isDryRun()) {
-      incomplete.push("summary comment failed to post");
-    }
+    incomplete.push(...publishResult.gaps);
     return { ctx, agg, reqFindings: [], publishResult, runDir: run.dir, durationSec, incomplete };
   }
 
@@ -204,6 +309,31 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // Stages that threw outright (vs returning their own error fields); reported as
   // incomplete so the run exits 3 instead of pretending the stage passed.
   const stageFailures: string[] = [];
+  // Kept apart from stageFailures on purpose. Only a stage that PRODUCES the review can
+  // hold the `--since auto` resume point (publish/lifecycle.ts watermarkFor), and reading
+  // that set back out of stageFailures by matching its strings would quietly enrol the next
+  // stage somebody adds to it — including the linters, whose crash is explicitly not a
+  // missing review.
+  const unreviewed: string[] = [];
+
+  // The code on disk for the static gate. With PRR_WORKTREE_REPO set, prloop cuts its own
+  // worktree detached at this iteration's commit — which is the only way to be sure the
+  // files analysed are the files under review, since a branch checked out by name moves the
+  // moment the author pushes again. Failing to get one skips the gate with the reason
+  // named; it never fails the run, because a missing linter is not a missing review.
+  let worktree: PreparedWorktree | undefined;
+  let worktreeError: string | undefined;
+  if (WORKTREE_REPO && !SKIP_STATIC) {
+    const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, opts.ref.prId).catch(
+      (e): { error: string } => ({ error: `worktree preparation failed: ${e instanceof Error ? e.message : String(e)}` }),
+    );
+    if (isWorktreeFailure(prepared)) {
+      worktreeError = prepared.error;
+      log(`[WARN] static: ${prepared.error}`);
+    } else {
+      worktree = prepared;
+    }
+  }
   const [staticResult, finderOut] = await Promise.all([
     (SKIP_STATIC
       ? Promise.resolve<StaticResult>({
@@ -216,11 +346,22 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           unresolved: 0,
           skippedReason: "static analysis skipped by config",
         })
-      : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit)
-    ).catch((e): StaticResult => {
-      stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
-      return { facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason: "crashed" };
-    }),
+      : worktreeError !== undefined
+        ? Promise.resolve<StaticResult>({
+            facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0,
+            skippedReason: worktreeError,
+          })
+        : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir)
+    )
+      .catch((e): StaticResult => {
+        stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
+        return { facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason: "crashed" };
+      })
+      // The worktree's whole life is this gate. Triage reads its source windows out of the
+      // FileIndex (intake's bytes), not off disk, so nothing after this needs the tree —
+      // and `finally` rather than a line after the await means a crashed gate does not
+      // leave one behind, which on a cron over a PR list would accumulate every day.
+      .finally(() => worktree?.cleanup()),
     runFinders(opts.runner, {
       pr: ctx.pr,
       files: ctx.files,
@@ -228,7 +369,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       compareTo: ctx.compareTo,
       conventions,
     }).catch((e): Awaited<ReturnType<typeof runFinders>> => {
-      stageFailures.push(`finder stage (${e instanceof Error ? e.message : String(e)})`);
+      const why = `finder stage (${e instanceof Error ? e.message : String(e)})`;
+      stageFailures.push(why);
+      // Nothing read the diff, so nothing about this push is known.
+      unreviewed.push(why);
       return { outputs: [], prompt: "", omitted: [], rules: [] };
     }),
   ]);
@@ -268,9 +412,13 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // over-report; this is the stage that does the killing. A skeptic stage that throws must
   // degrade to "nothing verified" (recorded as incomplete below), not abort a run that has
   // already paid for its finder calls.
-  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.files).catch(
+  const outcomes = await runSkeptic(opts.runner, freshCandidates, ctx.fileIndex).catch(
     (e): import("./gates/skeptic").SkepticOutcome[] => {
-      stageFailures.push(`skeptic stage (${e instanceof Error ? e.message : String(e)})`);
+      const why = `skeptic stage (${e instanceof Error ? e.message : String(e)})`;
+      stageFailures.push(why);
+      // Fails open, so the findings survive — but unverified, which is not the review the
+      // run was configured to produce, and a re-run can still produce it.
+      unreviewed.push(why);
       return freshCandidates.map((f) => ({ finding: f, verdicts: [], killed: false }));
     },
   );
@@ -282,6 +430,18 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       line: o.finding.anchor?.startLine,
       claim: o.finding.claim,
       killed: o.killed,
+      // The finding's identity, so a refuted one can be counted at all. applyVerdicts drops
+      // a killed finding before finalize sees it, so it reaches neither `inline`, `belowBar`
+      // nor `degraded` in findings.json — it exists only as this row. Without a fingerprint
+      // to join on and a category and sources to group by, the skeptic is the pipeline's
+      // main precision mechanism and the one stage nothing could measure per finder or per
+      // category: scripts/calibrate.ts could only report a kill rate per skeptic MODEL, and
+      // its byFinder table counted a finder's killed findings as if they had never existed.
+      fingerprint: o.finding.fingerprint,
+      category: o.finding.category,
+      severity: o.finding.severity,
+      confidence: o.finding.confidence,
+      sources: o.finding.sources,
       verdicts: o.verdicts,
       // The prompt is the audit trail for a wrong refutation — without it, a killed real
       // finding cannot be debugged.
@@ -327,6 +487,13 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     f.changeTrackingId = ctx.changeTrackingIds.get(f.file);
   }
   run.saveJson("requirement-findings.json", reqFindings);
+  // Written here, while ctx.files is still in memory: context.json records per-file hunk and
+  // changed-line COUNTS, not the lines, so nothing on disk can reconstruct the diff after the
+  // run ends. Through run.save, which is what puts it through redactSecrets.
+  run.save(
+    "review.html",
+    renderReviewHtml({ ctx, agg, reqFindings, req, durationSec: Math.round((Date.now() - started) / 1000), dryRun: isDryRun() }),
+  );
   run.saveJson("findings.json", {
     inline: agg.inline,
     belowBar: agg.belowBar,
@@ -339,6 +506,30 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const finderErrors = outputs
     .filter((o) => o.error)
     .map((o) => ({ model: o.model, error: o.error! }));
+
+  // The last two named sources for the watermark decision, both "nobody produced this half
+  // of the review". A PARTLY degraded fleet is not here: the finders that answered did read
+  // the diff, and holding the resume point because one model out of three timed out would
+  // widen every subsequent run's range on a routine failure. Exit 3 already names it.
+  if (outputs.length > 0 && finderErrors.length === outputs.length) {
+    unreviewed.push(`all ${outputs.length} finders failed`);
+  }
+  if (req.error) unreviewed.push(`requirement axis (${req.error})`);
+
+  // Assembled BEFORE publishing, because the branch-policy status is decided in there and a
+  // status that says "no blockers" about a run whose finder fleet died is the one artifact
+  // a merge policy can see. publish() appends its own half and hands it back, so the list
+  // the status saw and the list the exit code sees are the same list rather than two
+  // derivations that have to be kept in step by hand.
+  const incomplete: string[] = [...stageFailures];
+  if (req.error) incomplete.push(`requirement axis (${req.error})`);
+  for (const e of finderErrors) incomplete.push(`finder ${e.model} (${e.error})`);
+  const deadSkeptics = outcomes.reduce(
+    (n, o) => n + (o.verdicts.length > 0 && o.verdicts.every((v) => v.error) ? 1 : 0),
+    0,
+  );
+  if (deadSkeptics > 0) incomplete.push(`${deadSkeptics} findings whose verifier failed`);
+  incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
 
   const publishResult = await publish(
     opts.ref,
@@ -355,35 +546,27 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       durationSec,
       runDir: run.dir,
     },
+    { unreviewed, incomplete },
   );
+  // The publish-side half, produced once by publish() rather than read back off its result
+  // here. Appending after the coverage gaps reorders the list against older runs: when the
+  // only two reasons are a coverage gap and a refused comment, the first-named reason — and
+  // so the status description's headline — is now the coverage gap.
+  incomplete.push(...publishResult.gaps);
   const tokens = tokenTotals();
   log(`model usage: ${tokens.calls} calls, ${tokens.promptTokens} in / ${tokens.completionTokens} out tokens`);
   run.saveJson("publish.json", {
     summaryThreadId: publishResult.summaryThreadId,
+    // Absent on a dry run, which decides nothing — the answer to "did this run move the
+    // resume point" is then "it never got that far", not "no".
+    watermark: publishResult.watermark,
     posted: publishResult.posted.map((f) => ({ fp: f.fingerprint, file: f.file, line: f.anchor?.startLine })),
     alreadyPosted: publishResult.alreadyPosted.map((f) => f.fingerprint),
-    failed: publishResult.failed.map((x) => ({ fp: x.finding.fingerprint, error: x.error })),
+    failed: publishResult.failed.map((x) => ({ fp: x.finding.fingerprint, error: x.error, status: x.status })),
     resolved: publishResult.resolved,
     dismissals: publishResult.dismissals,
     tokenUsage: tokens,
   });
-
-  const incomplete: string[] = [...stageFailures];
-  if (req.error) incomplete.push(`requirement axis (${req.error})`);
-  for (const e of finderErrors) incomplete.push(`finder ${e.model} (${e.error})`);
-  const deadSkeptics = outcomes.reduce(
-    (n, o) => n + (o.verdicts.length > 0 && o.verdicts.every((v) => v.error) ? 1 : 0),
-    0,
-  );
-  if (deadSkeptics > 0) incomplete.push(`${deadSkeptics} findings whose verifier failed`);
-  // A run that computed findings and could not post them must not look like a clean PR.
-  if (publishResult.failed.length > 0) {
-    incomplete.push(`${publishResult.failed.length} comments failed to post`);
-  }
-  if (publishResult.summaryThreadId === undefined && !isDryRun()) {
-    incomplete.push("summary comment failed to post");
-  }
-  incomplete.push(...coverageGaps(omitted, ctx.skipped, STRICT_COVERAGE));
 
   return { ctx, agg, req, reqFindings, publishResult, runDir: run.dir, durationSec, incomplete };
 }

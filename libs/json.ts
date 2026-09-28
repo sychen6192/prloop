@@ -12,39 +12,48 @@ export interface ParseFail {
 }
 export type ParseResult<T> = ParseOk<T> | ParseFail;
 
-/** Finds the first balanced JSON object/array in a string, ignoring braces inside strings. */
-function extractBalanced(raw: string): string | undefined {
-  const startIdx = (() => {
-    const o = raw.indexOf("{");
-    const a = raw.indexOf("[");
-    if (o < 0) return a;
-    if (a < 0) return o;
-    return Math.min(o, a);
-  })();
-  if (startIdx < 0) return undefined;
-
-  const open = raw[startIdx]!;
-  const close = open === "{" ? "}" : "]";
-  let depth = 0;
-  let inStr = false;
-  let escaped = false;
-
-  for (let i = startIdx; i < raw.length; i++) {
-    const c = raw[i]!;
-    if (inStr) {
-      if (escaped) escaped = false;
-      else if (c === "\\") escaped = true;
-      else if (c === '"') inStr = false;
-      continue;
-    }
-    if (c === '"') inStr = true;
-    else if (c === open) depth++;
-    else if (c === close) {
-      depth--;
-      if (depth === 0) return raw.slice(startIdx, i + 1);
+/**
+ * Balanced JSON regions in `raw`, in document order, each starting at a `{` or `[`.
+ *
+ * Every candidate, not just the first, because the first bracket in a model's answer is
+ * very often not the answer. Two live cases from a single run: the requirement prompt
+ * numbers its criteria `[4711-AC1]`, and a skeptic explaining a refutation quoted the regex
+ * `[a-zA-Z]`. Each sat in a sentence BEFORE the JSON, each was extracted and parsed instead
+ * of it, and each failed a whole stage over a reply that had a perfectly good object two
+ * lines further down. The caller tries candidates until one parses.
+ *
+ * Capped: scanning a region is O(region), and a reply that is mostly prose full of brackets
+ * must not become an O(n^2) walk. Ten is far past any real preamble.
+ */
+function* balancedCandidates(raw: string, limit = 10): Generator<string> {
+  let found = 0;
+  for (let i = 0; i < raw.length && found < limit; i++) {
+    const open = raw[i];
+    if (open !== "{" && open !== "[") continue;
+    const close = open === "{" ? "}" : "]";
+    let depth = 0;
+    let inStr = false;
+    let escaped = false;
+    for (let j = i; j < raw.length; j++) {
+      const c = raw[j]!;
+      if (inStr) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (depth === 0) {
+          found++;
+          yield raw.slice(i, j + 1);
+          break;
+        }
+      }
     }
   }
-  return undefined;
 }
 
 /**
@@ -172,9 +181,13 @@ export function parseJsonObject<T = unknown>(raw: string): ParseResult<T> {
   const repairedDirect = tryParse<T>(repaired);
   if (repairedDirect.ok) return repairedDirect;
 
-  const balanced = extractBalanced(repaired);
-  if (!balanced) return { ok: false, error: "no complete JSON object found in output" };
-  return tryParse<T>(balanced);
+  let lastError: string | undefined;
+  for (const candidate of balancedCandidates(repaired)) {
+    const r = tryParse<T>(candidate);
+    if (r.ok) return r;
+    lastError ??= r.error;
+  }
+  return { ok: false, error: lastError ?? "no complete JSON object found in output" };
 }
 
 function tryParse<T>(s: string): ParseResult<T> {

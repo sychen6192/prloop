@@ -2,7 +2,7 @@
 // real additions, fit the budget, and name-list the overflow rather than truncating
 // mid-hunk. Two things differ from PR-Agent, both because of what went wrong here:
 //
-//  - Order is by added lines, not language prevalence (see `ordered` below).
+//  - Order is by added lines, not language prevalence (see `orderByValue` below).
 //  - The budget can be counted in TOKENS against the model's context window, not only in
 //    characters of the diff (see `estimateTokens`). Characters of the diff were never the
 //    quantity that overruns.
@@ -104,30 +104,17 @@ function addedLineCount(f: FileDiff): number {
 }
 
 /**
- * Selection is by budget and never depends on `seed`; the seed only permutes the order in
- * which the SELECTED files are rendered. The two steps are kept apart on purpose: a
- * per-finder shuffle must never change what a finder sees, or "two finders agreed" could
- * mean "two finders were shown the same subset". No seed = selection order.
+ * Order by how much NEW code a file carries, biggest first, tests last.
  *
- * `budget` is the char ceiling (PRR_MAX_DIFF_CHARS). `ctx` adds the model's context window
- * as a second, token-denominated ceiling; whichever binds first decides. Omit it and the
- * behaviour is exactly the char-only one this function has always had.
+ * It used to be language prevalence, after PR-Agent — and on a real PR that dropped the one
+ * file that most needed reading: a 3000-line Java service was omitted while three 20-line
+ * TypeScript files stayed in, because TypeScript was the repo's majority language.
+ * Prevalence is a census of the repo, not a measure of this change. Tests sort last for the
+ * same reason: a generated 900-line test file must not evict the service it exercises. Ties
+ * break on path, so the order is total and reproducible.
  */
-export function buildDiffPayload(
-  files: FileDiff[],
-  budget = MAX_DIFF_CHARS,
-  seed?: number,
-  ctx?: ContextBudget,
-): DiffPayload {
-  // Order by how much NEW code a file carries, biggest first, tests last.
-  //
-  // It used to be language prevalence, after PR-Agent — and on a real PR that dropped the
-  // one file that most needed reading: a 3000-line Java service was omitted while three
-  // 20-line TypeScript files stayed in, because TypeScript was the repo's majority
-  // language. Prevalence is a census of the repo, not a measure of this change. Tests sort
-  // last for the same reason: a generated 900-line test file must not evict the service it
-  // exercises. Ties break on path, so the order is total and reproducible.
-  const ordered = [...files].sort((a, b) => {
+function orderByValue(files: FileDiff[]): FileDiff[] {
+  return [...files].sort((a, b) => {
     const ta = isTestPath(a.path) ? 1 : 0;
     const tb = isTestPath(b.path) ? 1 : 0;
     if (ta !== tb) return ta - tb;
@@ -136,21 +123,31 @@ export function buildDiffPayload(
     if (aa !== ab) return ab - aa;
     return a.path.localeCompare(b.path);
   });
+}
 
-  const tokenBudget = diffTokenBudget(ctx);
+function renderFile(f: FileDiff): string {
+  return `### ${f.path}${f.originalPath && f.originalPath !== f.path ? ` (renamed from ${f.originalPath})` : ""} [${f.changeType}, ${f.language}]\n\`\`\`diff\n${renderUnifiedDiff(f.path, f.hunks)}\n\`\`\``;
+}
+
+/** One request's worth of files off the front of `ordered`, and what did not fit. */
+function pack(
+  ordered: readonly FileDiff[],
+  budget: number,
+  tokenBudget: number,
+): { selected: Array<{ path: string; rendered: string }>; rest: FileDiff[]; bound?: "chars" | "tokens" } {
   const selected: Array<{ path: string; rendered: string }> = [];
-  const omittedFiles: string[] = [];
+  const rest: FileDiff[] = [];
   let usedChars = 0;
   let usedTokens = 0;
   let bound: "chars" | "tokens" | undefined;
 
   for (const f of ordered) {
-    const rendered = `### ${f.path}${f.originalPath && f.originalPath !== f.path ? ` (renamed from ${f.originalPath})` : ""} [${f.changeType}, ${f.language}]\n\`\`\`diff\n${renderUnifiedDiff(f.path, f.hunks)}\n\`\`\``;
+    const rendered = renderFile(f);
     const tokens = tokenBudget > 0 ? estimateTokens(rendered) : 0;
     const overChars = usedChars + rendered.length > budget;
     const overTokens = tokenBudget > 0 && usedTokens + tokens > tokenBudget;
     if ((overChars || overTokens) && selected.length > 0) {
-      omittedFiles.push(f.path);
+      rest.push(f);
       // Which one bound FIRST is the actionable fact; a later file can exceed both.
       if (!bound) bound = overTokens ? "tokens" : "chars";
       continue;
@@ -169,11 +166,86 @@ export function buildDiffPayload(
     usedChars += rendered.length;
     usedTokens += tokens;
   }
+  return { selected, rest, ...(bound === undefined ? {} : { bound }) };
+}
 
-  const shown = seed === undefined ? selected : shuffle(selected, mulberry32(seed));
-  let text = shown.map((s) => s.rendered).join("\n\n");
-  if (omittedFiles.length > 0) {
-    text += `\n\n### Changed files omitted for size (${omittedFiles.length})\n${omittedFiles.map((p) => `- ${p}`).join("\n")}`;
+/**
+ * Selection is by budget and never depends on `seed`; the seed only permutes the order in
+ * which the SELECTED files are rendered. The two steps are kept apart on purpose: a
+ * per-finder shuffle must never change what a finder sees, or "two finders agreed" could
+ * mean "two finders were shown the same subset". No seed = selection order.
+ *
+ * `budget` is the char ceiling (PRR_MAX_DIFF_CHARS). `ctx` adds the model's context window
+ * as a second, token-denominated ceiling; whichever binds first decides. Omit it and the
+ * behaviour is exactly the char-only one this function has always had.
+ */
+export function buildDiffPayload(
+  files: FileDiff[],
+  budget = MAX_DIFF_CHARS,
+  seed?: number,
+  ctx?: ContextBudget,
+): DiffPayload {
+  return buildDiffPayloads(files, budget, seed, ctx, 1)[0]!;
+}
+
+/**
+ * The same selection, continued into further requests instead of stopping at the first one.
+ *
+ * A diff that does not fit is not a smaller diff: the files past the budget were dropped
+ * from every finder's context and reported as a coverage gap, so on a large PR the tool
+ * exited 3 and told you the part most likely to contain the defect had not been read. The
+ * only honest way to read it was to pay for another request.
+ *
+ * So the packing loop simply keeps going: chunk 2 is what chunk 1 could not hold, packed
+ * against the same budget, up to `maxChunks`. `maxChunks` of 1 is the behaviour above, byte
+ * for byte, which is why the default knob value leaves every existing run untouched.
+ *
+ * Three properties the callers depend on:
+ *
+ *  - **The split does not depend on the seed.** Packing runs over `orderByValue` alone, so
+ *    every finder gets the same chunk boundaries and the seed still only permutes the order
+ *    WITHIN a chunk. Two finders that agree agreed about the same file in the same chunk.
+ *  - **Every chunk reports the same omissions**, which are the files that fit in NO chunk.
+ *    That is what a coverage gap has always meant, and it must not come to mean "files the
+ *    other request is carrying".
+ *  - **Chunks are not context.** Each is its own request with its own model; nothing here
+ *    pretends the model saw the previous one. The prompt says which part it is holding
+ *    (prompts/finder.ts) so it does not reason about files it cannot see.
+ */
+export function buildDiffPayloads(
+  files: FileDiff[],
+  budget = MAX_DIFF_CHARS,
+  seed?: number,
+  ctx?: ContextBudget,
+  maxChunks = 1,
+): DiffPayload[] {
+  const tokenBudget = diffTokenBudget(ctx);
+  const chunks: Array<Array<{ path: string; rendered: string }>> = [];
+  let rest = orderByValue(files);
+  let bound: "chars" | "tokens" | undefined;
+
+  while (chunks.length < Math.max(1, maxChunks)) {
+    const packed = pack(rest, budget, tokenBudget);
+    chunks.push(packed.selected);
+    bound ??= packed.bound;
+    rest = packed.rest;
+    // An empty first chunk means there were no files at all; anything else is done.
+    if (rest.length === 0) break;
   }
-  return { text, includedFiles: shown.map((s) => s.path), omittedFiles, bound };
+
+  const omittedFiles = rest.map((f) => f.path);
+  const note =
+    omittedFiles.length > 0
+      ? `\n\n### Changed files omitted for size (${omittedFiles.length})\n${omittedFiles.map((p) => `- ${p}`).join("\n")}`
+      : "";
+
+  return chunks.map((selected) => {
+    const shown = seed === undefined ? selected : shuffle(selected, mulberry32(seed));
+    return {
+      text: shown.map((s) => s.rendered).join("\n\n") + note,
+      includedFiles: shown.map((s) => s.path),
+      omittedFiles,
+      ...(bound === undefined ? {} : { bound }),
+    };
+  });
 }

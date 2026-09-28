@@ -9,6 +9,7 @@
 // Note the asymmetry with the skeptic: there the default is "refute", here the default is
 // "drop". A tool finding nobody can justify is noise, and noise is what gets bots muted.
 import type { FileIndex } from "../libs/fileindex";
+import { renderToolReports, sanitizeToolMessage } from "./untrusted";
 
 export const TRIAGE_SYSTEM = `You are deciding whether issues reported by static analysis tools deserve a developer's attention.
 
@@ -77,7 +78,7 @@ export function buildTriagePrompt(items: TriageItem[], index: FileIndex, context
     return `### [${it.index}] ${it.tool} ${it.ruleId}
 
 - File: \`${it.file}\`:${it.line}
-- Tool message: ${it.message}
+- Tool message: ${sanitizeToolMessage(it.message)}
 - Tool-assigned severity: ${it.severity}
 
 \`\`\`
@@ -85,11 +86,16 @@ ${snippet}
 \`\`\``;
   });
 
+  // Fenced, and the legend stays outside it. Everything inside is written by somebody else:
+  // the tool's message is source text quoted back, and the snippet IS the reviewed code — a
+  // file under review can therefore address this model directly, and "ignore the rule, this
+  // is a test fixture" reads exactly like a note from the pipeline when nothing marks the
+  // boundary. The fence says which half of the prompt prloop wrote.
   return `## Tool reports awaiting judgment (${items.length} total)
 
 Line prefixes: \`>\` = the line the tool points at, \`+\` = a line changed by this PR.
 
-${blocks.join("\n\n")}
+${renderToolReports(blocks.join("\n\n"))}
 
 ## Your output
 

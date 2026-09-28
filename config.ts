@@ -55,6 +55,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_ADO_TIMEOUT_MS", kind: "number", section: S_ADO, description: "per-request deadline for ADO REST calls" },
   { name: "PRR_ADO_MAX_RETRIES", kind: "number", section: S_ADO, description: "attempts for a transient ADO failure" },
   { name: "PRR_ADO_CONCURRENCY", kind: "number", section: S_ADO, description: "parallel blob fetches during intake" },
+  { name: "PRR_BOT_IDENTITY_IDS", kind: "csv", section: S_ADO, description: "extra ADO identity ids whose marker comments are ours" },
 
   { name: "PRR_LLM_BASE_URL", kind: "string", section: S_MODEL, description: "OpenAI-compatible endpoint (LiteLLM / vLLM / Ollama)" },
   { name: "PRR_LLM_API_KEY", kind: "string", section: S_MODEL, secret: true, description: "key for that endpoint" },
@@ -92,6 +93,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_HUNK_CONTEXT_AFTER", kind: "number", section: S_BUDGET, description: "context lines kept after each hunk" },
   { name: "PRR_MAX_FILE_BYTES", kind: "number", section: S_BUDGET, description: "files larger than this are diffed, never sent whole" },
   { name: "PRR_STRICT_COVERAGE", kind: "bool", section: S_BUDGET, description: "0 = files nobody read no longer make the run incomplete" },
+  { name: "PRR_FINDER_MAX_CHUNKS", kind: "number", section: S_BUDGET, description: "requests per finder for an over-budget diff; 1 = off" },
 
   { name: "PRR_SKEPTIC_MODELS", kind: "csv", section: S_SKEPTIC, description: "verifiers; empty = no verification runs" },
   { name: "PRR_SKEPTIC_ROUNDS", kind: "number", section: S_SKEPTIC, description: "verifiers per finding; capped at the distinct model count" },
@@ -103,6 +105,9 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_REQUIRE_CORROBORATION", kind: "bool", section: S_SKEPTIC, description: "0 = publish single-source unverified findings" },
 
   { name: "PRR_WORKDIR", kind: "string", section: S_STATIC, description: "checkout of the PR source branch; unset = gate skips" },
+  { name: "PRR_WORKTREE_REPO", kind: "string", section: S_STATIC, description: "clone to cut a throwaway worktree from" },
+  { name: "PRR_WORKTREE_SETUP_CMD", kind: "string", section: S_STATIC, description: "install command run in a fresh worktree" },
+  { name: "PRR_WORKTREE_SETUP_TIMEOUT_MS", kind: "number", section: S_STATIC, description: "deadline for the worktree install command" },
   { name: "PRR_SKIP_STATIC", kind: "bool", section: S_STATIC, description: "1 = skip static analysis entirely" },
   { name: "PRR_STATIC_TIMEOUT_MS", kind: "number", section: S_STATIC, description: "deadline for one linter invocation" },
   { name: "PRR_TRIAGE_MODEL", kind: "string", section: S_STATIC, description: "judges high-FP tools; unset = those are dropped" },
@@ -119,10 +124,11 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_MAX_INLINE_COMMENTS", kind: "number", section: S_PUBLISH, description: "code-axis inline comment budget" },
   { name: "PRR_MAX_INLINE_REQ_COMMENTS", kind: "number", section: S_PUBLISH, description: "requirement-axis inline comment budget" },
   { name: "PRR_MIN_INLINE_SEVERITY", kind: "string", section: S_PUBLISH, description: "critical | high | medium | low; below = summary only" },
-  { name: "PRR_DRY_RUN", kind: "bool", section: S_PUBLISH, description: "1 = compute everything, post nothing" },
+  { name: "PRR_DRY_RUN", kind: "bool", section: S_PUBLISH, description: "compute everything, post nothing (and review a merged PR)" },
   { name: "PRR_POST_STATUS", kind: "bool", section: S_PUBLISH, description: "1 = also post a PR status" },
   { name: "PRR_STATUS_GENRE", kind: "string", section: S_PUBLISH, description: "genre of that status" },
   { name: "PRR_STATUS_NAME", kind: "string", section: S_PUBLISH, description: "name of that status" },
+  { name: "PRR_RUN_LEASE_MS", kind: "number", section: S_PUBLISH, description: "how long one run holds a PR; 0 = no lease" },
 
   { name: "PRR_CA_CERTS", kind: "csv", section: S_NET, description: "CA bundle(s) to trust on a TLS-intercepting network" },
   { name: "PRR_HTTPS_PROXY", kind: "string", section: S_NET, description: "overrides HTTPS_PROXY from the shell" },
@@ -360,6 +366,16 @@ export const ADO_TIMEOUT_MS = numEnv("PRR_ADO_TIMEOUT_MS", 60_000, 1000);
 export const ADO_MAX_RETRIES = numEnv("PRR_ADO_MAX_RETRIES", 3, 1);
 // Blob fetches in flight at once during intake (ADO rate-limits aggressive parallelism).
 export const ADO_CONCURRENCY = numEnv("PRR_ADO_CONCURRENCY", 6, 1);
+// Identities other than prloop's current credential whose marker-bearing comments are still
+// prloop's own. Needed because the credential legitimately changes: the documented path onto
+// a pipeline is to trial prloop from a laptop PAT and then move to the build service account,
+// and the threads the laptop left behind are prloop's even though another identity wrote
+// them. Without this, that first pipeline run re-reviews every PR from scratch and stops
+// harvesting the dismissals recorded against the older threads.
+export const BOT_IDENTITY_IDS: string[] = strEnv("PRR_BOT_IDENTITY_IDS", "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 // --- Corporate network ---
 // CA bundle(s) to trust, for networks with TLS interception. Comma-separated; a root and
@@ -784,6 +800,18 @@ export const MAX_FILE_BYTES = numEnv("PRR_MAX_FILE_BYTES", 2_000_000, 1);
 // files are never counted: there is nothing in them to review.
 export const STRICT_COVERAGE = switchEnv("PRR_STRICT_COVERAGE");
 
+// Requests one finder may spend on a diff too large for a single one. 1 = the historical
+// behaviour, where everything past the budget is simply never read and reported as a
+// coverage gap; the run exits 3 telling you the part most likely to hold the defect was not
+// looked at. Above 1, the packing loop continues into a second and third request instead of
+// stopping, and EVERY finder reads EVERY chunk — so "two finders agreed" keeps meaning what
+// it meant, and the corroboration gate is untouched.
+//
+// Default 1, because the cost is linear and real: 3 chunks is up to 3x the finder spend on a
+// large PR, and nobody should discover that from a bill. A run that would benefit says so in
+// its log.
+export const FINDER_MAX_CHUNKS = numEnv("PRR_FINDER_MAX_CHUNKS", 1, 1);
+
 // --- Adversarial verification (M3) ---
 // Skeptics should be a DIFFERENT model family from the finders. Same-family verifiers share
 // the finders' blind spots, so they confirm the errors that matter most.
@@ -825,6 +853,34 @@ export const REQUIRE_CORROBORATION = switchEnv("PRR_REQUIRE_CORROBORATION");
 // A checkout of the PR's source branch. Linters need files on disk; without this the
 // static gate skips. In an Azure pipeline this is the agent's own checkout.
 export const WORKDIR = strEnv("PRR_WORKDIR", "");
+
+/**
+ * A clone of the reviewed repository. Set it and prloop cuts its own throwaway worktree,
+ * detached at the iteration's sourceRefCommit, instead of asking for PRR_WORKDIR.
+ *
+ * This exists because the manual alternative is wrong more often than it looks: pulling and
+ * checking out a branch by name lands on whatever the branch points at NOW, which is not the
+ * iteration under review the moment the author pushes again. The static gate compares every
+ * file against the iteration's bytes and skips the ones that differ (staleFiles), so a
+ * checkout one commit ahead does not fail — it silently analyses less.
+ *
+ * A worktree rather than a checkout: it leaves the clone's own working copy alone, several
+ * can exist at once (one PR list, reviewed in parallel), and it is pinned to a commit rather
+ * than tracking a branch.
+ */
+export const WORKTREE_REPO = strEnv("PRR_WORKTREE_REPO", "");
+
+/**
+ * Run once inside a fresh worktree, before any linter. A worktree has no node_modules and no
+ * venv, and the fact-tier tools (tsc, mypy) report one error per unresolvable import when
+ * dependencies are missing — the failure their environmentRules exist to catch. Unset means
+ * the tools run against an uninstalled tree, which for those two means their whole run is
+ * discarded with that reason named.
+ */
+export const WORKTREE_SETUP_CMD = strEnv("PRR_WORKTREE_SETUP_CMD", "");
+// An install has no business being unbounded: the case this whole feature is for is a cron
+// reviewing a PR list, where one wedged `npm ci` would hold the queue until someone noticed.
+export const WORKTREE_SETUP_TIMEOUT_MS = numEnv("PRR_WORKTREE_SETUP_TIMEOUT_MS", 10 * 60 * 1000, 1000);
 export const SKIP_STATIC = flagEnv("PRR_SKIP_STATIC");
 export const STATIC_TIMEOUT_MS = numEnv("PRR_STATIC_TIMEOUT_MS", 5 * 60 * 1000, 1000);
 // Model that judges high-false-positive tool findings. Unset = those findings are dropped
@@ -888,15 +944,23 @@ export const POST_STATUS = flagEnv("PRR_POST_STATUS");
 export const STATUS_GENRE = strEnv("PRR_STATUS_GENRE", "prloop");
 export const STATUS_NAME = strEnv("PRR_STATUS_NAME", "ai-review");
 
+// How long one run may hold a pull request before another may take it over (publish/lease.ts).
+// 0 turns the lease off entirely, which the plan's own rule demands of a feature that can
+// refuse to review: an operator who would rather have a duplicate comment than a skipped
+// tick has to be able to say so.
+//
+// The default is deliberately generous. One model call alone may take PRR_LLM_TIMEOUT_MS
+// (15 minutes by default) and a review makes many, so a window that merely feels long would
+// have the next tick taking over a review still in flight — the exact overlap this exists to
+// prevent, now with the model budget spent twice. An hour is four of those timeouts, and a
+// crashed run costs one tick of an hourly cron rather than a day of them.
+export const RUN_LEASE_MS = numEnv("PRR_RUN_LEASE_MS", 3_600_000, 0);
+
 export const QUIET = flagEnv("PRR_QUIET");
 // 1 = print the configuration table and exit, without running a review (same as --config).
 // An env var as well as a flag because the case that needs it most is a pipeline, where
 // adding a flag means editing YAML but adding a variable does not.
 export const SHOW_CONFIG = flagEnv("PRR_SHOW_CONFIG");
-
-// Marker embedded in every comment we author, so re-runs can find and update
-// our own threads instead of duplicating them.
-export const BOT_MARKER = "<!-- prloop -->";
 
 // Artifacts root.
 export const RUNS_DIR = strEnv("PRR_RUNS_DIR", path.join(PRLOOP_ROOT, "runs"));

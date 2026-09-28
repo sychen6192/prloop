@@ -14,8 +14,9 @@ npx tsx scripts/selftest-publish.ts  # what publish() writes to the PR
 npx tsx scripts/selftest-ado.ts      # ADO intake edges: paging, parent PBIs, conventions
 npx tsx scripts/selftest-cli.ts      # argument grammar and exit codes
 npx tsx scripts/selftest-docs.ts     # claims the docs make about the code
-npx tsx scripts/demo.ts              # render comments from fake data, no network
+npx tsx scripts/demo.ts              # render comments + review.html from fake data, no network
 npx tsx scripts/calibrate.ts         # dismissal / kill rates from runs/ + dismissals.jsonl
+npx tsx scripts/evaluate.ts          # golden-set recall: which stage lost each known defect
 ```
 
 Everything is offline-testable; no test needs ADO credentials or a model endpoint. The four
@@ -49,13 +50,14 @@ and closes its server in a `finally`.
 | --- | --- |
 | `orchestrator.ts` | the one control flow: intake → gates → publish |
 | `ado/` | Azure DevOps REST (auth, blobs, threads, work items, conventions) |
+| `git/` | local intake from a working tree, and the throwaway worktree the static gate runs in |
 | `gates/` | finder, skeptic, requirement, static analysis, aggregation |
 | `anchoring/` | quote → line resolution (the reason this tool exists) |
 | `models/` | runner adapters (OpenAI-compatible HTTP, opencode CLI) + JSON schemas |
 | `prompts/` | every prompt, one file per stage |
 | `rules/` | reviewer rules as markdown with `applyTo` globs |
-| `publish/` | comment rendering, dedup (fingerprint + position), lifecycle |
-| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types (SSOT) |
+| `publish/` | comment rendering, the hidden marker protocol, dedup (fingerprint + position), lifecycle |
+| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types and the ReviewContext contract (SSOT) |
 | `scripts/` | selftests (+ `fakes/`), doctor/probe/tlsfix diagnostics, local-review |
 
 ## Conventions

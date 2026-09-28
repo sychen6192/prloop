@@ -210,5 +210,15 @@ probe flags this.
 - **Too many comments.** Lower `PRR_MAX_INLINE_COMMENTS`, or raise `PRR_MIN_INLINE_SEVERITY` to `high`.
 - **Want to block merge.** Set `PRR_POST_STATUS=1` and add a status check with genre `prloop` / name
   `ai-review` to the branch policy. Don't have a bot cast a -10 vote — it fights the reviewer policy.
+  The check has three states, not two: `failed` for unmet criteria or high-risk findings, **`error`
+  for a review that did not fully run** (a crashed stage, a comment ADO refused, files left out of
+  the finder context with `PRR_STRICT_COVERAGE` on), and `succeeded` otherwise. `error` blocks the
+  policy the same way `failed` does, which is the point — a green check over a review that never
+  happened is the failure this state exists to prevent.
 - **Big PR, some files not reviewed.** The summary lists what was left out. Raise `PRR_MAX_DIFF_CHARS`
-  or the model's context limit.
+  or the model's context limit. Note that with `PRR_STRICT_COVERAGE` on (the default) this run is
+  incomplete, so it exits `3` and — if you gate merges on the status above — posts `error` and blocks.
+  That is the same signal in two places, not a new one. `PRR_STRICT_COVERAGE=0` removes both at once:
+  it takes the coverage gaps out of the incompleteness list entirely, so CI stops seeing exit `3` as
+  well. There is no setting that keeps the exit code and lets the gate go green; making those two
+  disagree is the bug the three-state check fixed.

@@ -10,18 +10,25 @@ import {
   LLM_BASE_URL,
   MIN_CONSENSUS_SOURCES,
   REQUIRE_CORROBORATION,
+  REQ_MODEL,
   SHOW_CONFIG,
   SKEPTIC_MODELS,
+  TRIAGE_MODEL,
+  POST_STATUS,
   excludedCategories,
   isDryRun,
 } from "./config";
 import { parsePrUrl } from "./ado/client";
+import { postStatus } from "./ado/statuses";
 import { unmetCriteria } from "./gates/requirement";
+import { claimRunLease, releaseRunLease, runId } from "./publish/lease";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
-import { buildResultSummary, openRunDir } from "./libs/artifacts";
+import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir } from "./libs/artifacts";
+import { batchExitCode, forwardedArgs, readBatchList, renderBatchReport, runBatch } from "./libs/batch";
 import { parseArgs } from "./libs/cli";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
+import type { PrRef } from "./libs/types";
 import { createRunner, tokenTotals } from "./models/runner";
 import { exitCodeFor, runReview } from "./orchestrator";
 
@@ -33,6 +40,8 @@ const USAGE = `Usage: prloop <PR URL> [options]
 Options:
   --since <iteration>   review only changes after that iteration (incremental)
   --since auto          resume from the last reviewed iteration
+  --batch <file>        review every PR URL in the file, one per line (# comments allowed),
+                        one after another; exits with the worst outcome in the list
   --dry-run             compute everything, post nothing
   --config              print every setting, its value and its source, then exit
   -h, --help            show this help
@@ -53,6 +62,36 @@ function usage(): never {
   process.exit(1);
 }
 
+/** Set once the PR URL parses, so every exit path can say which run this was. */
+let fatalRef: PrRef | undefined;
+const startedAt = new Date().toISOString();
+
+/**
+ * Who this run was, for result.json. Shared by all three exit paths — clean, skipped and
+ * fatal — because the file is only useful across runs if it identifies itself: without this
+ * a morning digest over a list of PRs had to parse directory names, or open context.json and
+ * config.json beside it, to learn which pull request a result belonged to.
+ */
+function runIdentity(iteration?: number, compareTo?: number) {
+  if (!fatalRef) return undefined;
+  return {
+    ref: fatalRef,
+    ...(iteration === undefined ? {} : { iteration }),
+    ...(compareTo === undefined ? {} : { compareTo }),
+    dryRun: isDryRun(),
+    // How a lease nobody released is traced back to the run that left it: the id in the
+    // marker on the PR is this one, and it is on disk for every run the fleet made.
+    runId: runId(),
+    startedAt,
+    models: {
+      finders: FINDER_MODELS,
+      skeptics: SKEPTIC_MODELS,
+      ...(REQ_MODEL ? { req: REQ_MODEL } : {}),
+      ...(TRIAGE_MODEL ? { triage: TRIAGE_MODEL } : {}),
+    },
+  };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const cli = parseArgs(args, SHOW_CONFIG);
@@ -68,6 +107,26 @@ async function main() {
   if (args.length === 0) usage();
   if (cli.error) die(cli.error);
 
+  // Before anything that needs a PR: a batch reviews a list of them, one child process each,
+  // and this process only tallies the results (libs/batch.ts says why a child rather than a
+  // loop in here). The whole file is validated first, so a typo on line 40 of a 60-line list
+  // surfaces now rather than two hours in.
+  if (cli.batch) {
+    const urls = readBatchList(cli.batch);
+    banner(`prloop: ${urls.length} pull requests from ${cli.batch}`);
+    const started = Date.now();
+    const outcomes = await runBatch(urls, forwardedArgs(args));
+    const codes = outcomes.map((o) => o.exitCode).filter((c): c is number => c !== undefined);
+    banner(`Done: ${outcomes.length} pull requests in ${Math.round((Date.now() - started) / 60000)}m`);
+    console.log(renderBatchReport(outcomes));
+    const exit = batchExitCode(codes);
+    // The one thing the documented shell loop cannot do. `|| true` throws every exit code
+    // away because without it the first blocking finding stops the loop; this reviews all of
+    // them AND still reports the worst.
+    log(`Exiting ${exit}: the worst outcome in the list`);
+    process.exit(exit);
+  }
+
   let compareTo = typeof cli.since === "number" ? cli.since : 0;
   const sinceAuto = cli.since === "auto";
 
@@ -76,6 +135,10 @@ async function main() {
   if (cli.dryRun) process.env["PRR_DRY_RUN"] = "1";
 
   const ref = parsePrUrl(url);
+  // Kept where the fatal handler can reach it: a run that dies before publish() posts no
+  // status at all, so whatever an earlier run left on the PR still stands — and on a re-run
+  // of the same iteration that is quite possibly a green one gating the merge.
+  fatalRef = ref;
   banner(`prloop: ${ref.org}/${ref.project}/${ref.repoId} PR !${ref.prId}`);
   // Said once, before anything is spent: an edit to .env that a shell export is quietly
   // discarding, and a setting name that configures nothing. Both used to be visible only to
@@ -106,6 +169,34 @@ async function main() {
     }
     log(`Excluded categories: ${excluded.join(", ")}`);
   }
+  // Before `--since auto`, and long before the model budget: standing down has to be the
+  // cheap path, or the lease costs more than the overlap it prevents. A dry run skips it
+  // entirely — it writes nothing, so it cannot collide with anything, and taking a lease it
+  // would then have to release is the opposite of "compute everything, post nothing".
+  if (!isDryRun()) {
+    const lease = await claimRunLease(ref);
+    if (!lease.acquired) {
+      const reason = lease.reason ?? "another run holds this pull request";
+      log(`No review: ${reason}. Nothing was posted and no model call was made.`);
+      // The same shape a merged PR produces, for the same reason: this tick correctly did
+      // nothing, and a cron over a list of PRs must not redden because one of them was
+      // already being reviewed.
+      createSkipDir(ref).saveJson(
+        "result.json",
+        buildResultSummary({
+          exitCode: 0,
+          skippedReason: reason,
+          identity: runIdentity(undefined, compareTo),
+          incomplete: [],
+          counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+          tokens: tokenTotals(),
+          durationSec: Math.round((Date.now() - Date.parse(startedAt)) / 1000),
+        }),
+      );
+      process.exit(0);
+    }
+  }
+
   if (sinceAuto) {
     const last = await resolveLastReviewedIteration(ref);
     if (last === undefined) log("--since auto: no prior review found, doing a full review");
@@ -118,8 +209,32 @@ async function main() {
 
   const result = await runReview({ ref, runner: await createRunner(), compareTo });
 
+  // Here rather than in a `finally`, because every exit below is a process.exit() and those
+  // do not run one. A normal review has already released it — publish() rewrites the summary
+  // and the new body carries no marker — so on that path this costs one GET and no write.
+  await releaseRunLease(ref);
+
   banner("Done");
   log(`Elapsed ${result.durationSec}s, artifacts: ${result.runDir}`);
+
+  // Nothing below applies to a tick that reviewed nothing, and printing "0 inline comments"
+  // over a merged PR reads as a clean review rather than an absent one.
+  if (result.skippedReason) {
+    log(`No review: ${result.skippedReason}. Re-run with --dry-run to review it anyway.`);
+    openRunDir(result.runDir).saveJson(
+      "result.json",
+      buildResultSummary({
+        exitCode: 0,
+        skippedReason: result.skippedReason,
+        identity: runIdentity(result.ctx.iteration.id, compareTo),
+        incomplete: [],
+        counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+        tokens: tokenTotals(),
+        durationSec: result.durationSec,
+      }),
+    );
+    process.exit(0);
+  }
 
   const unmet = result.req ? unmetCriteria(result.req) : [];
   if (result.req?.skipped) log(`Requirement axis: ${result.req.skipped}`);
@@ -157,6 +272,7 @@ async function main() {
     "result.json",
     buildResultSummary({
       exitCode,
+      identity: runIdentity(result.ctx.iteration.id, compareTo),
       incomplete: result.incomplete,
       counts: {
         raw: result.agg.stats.raw,
@@ -172,6 +288,53 @@ async function main() {
   process.exit(exitCode);
 }
 
-main().catch((e) => {
-  die(e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e));
+main().catch(async (e) => {
+  const msg = e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e);
+  // A crash leaves the branch-policy status showing whatever the last run posted. Exit 1 is
+  // invisible to a policy, so without this a run that died on its second iteration merges
+  // behind the first one's green check. Best effort and never allowed to replace the real
+  // error: if ADO is what just failed, this will fail too, and the fatal message is the one
+  // worth keeping.
+  // Released before anything else: the next tick of a cron should be able to retry
+  // immediately, not wait out an hour of a lease held by a process that is already dead.
+  if (fatalRef) await releaseRunLease(fatalRef).catch(() => undefined);
+
+  if (POST_STATUS && fatalRef && !isDryRun()) {
+    try {
+      await postStatus(fatalRef, "error", `Review crashed: ${String(e instanceof Error ? e.message : e)}`);
+    } catch (inner) {
+      log(`[WARN] could not report the crash as a PR status: ${inner instanceof Error ? inner.message : String(inner)}`);
+    }
+  }
+
+  // On a cron over a list of PRs, the ones that FAILED were the only ones leaving no artifact
+  // at all: result.json was written after runReview returned, so a throw inside it left a run
+  // directory holding findings and nothing saying the run had ended, and a throw before intake
+  // left nothing on disk whatsoever — the auth and proxy lines existed only on a terminal
+  // nobody was watching. Written into this run's own directory when it got one, so the
+  // forensics sit beside the prompts that produced them.
+  if (fatalRef) {
+    try {
+      const dir = currentRunDir();
+      // tee on the fallback: attachLogSink replays the backlog, so the [WARN] lines printed
+      // before intake land in run.log rather than being lost with the terminal.
+      const run = dir ? openRunDir(dir) : createFatalRunDir(fatalRef);
+      run.saveJson(
+        "result.json",
+        buildResultSummary({
+          exitCode: 1,
+          fatal: e instanceof Error ? e.message : String(e),
+          identity: runIdentity(),
+          incomplete: [],
+          counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+          tokens: tokenTotals(),
+          durationSec: Math.round((Date.now() - Date.parse(startedAt)) / 1000),
+        }),
+      );
+      log(`artifacts: ${run.dir}`);
+    } catch (inner) {
+      log(`[WARN] could not record the failure: ${inner instanceof Error ? inner.message : String(inner)}`);
+    }
+  }
+  die(msg);
 });
