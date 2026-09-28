@@ -29,29 +29,7 @@ import {
 } from "../config";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
+import { check, eq, report, section } from "./selftest/harness";
 
 section("SSE stream assembly (streaming keeps gateways from 504ing long generations)");
 {
@@ -402,5 +380,4 @@ section("retry discipline: jittered backoff, and Retry-After when the endpoint s
   eq("...but never shortens the backoff", backoffMs(5, 1000, () => 1), 60_000);
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

@@ -17,8 +17,12 @@ npm run check     # typecheck + every offline selftest
 No test needs ADO credentials or a model endpoint; everything is offline. Several nets run, and
 they fail for different reasons:
 
-- `scripts/selftest.ts` — anchoring and the pipeline. If you touched `libs/diff.ts` or
-  `anchoring/locate.ts`, a failure here is a comment landing on the wrong line in production.
+- `scripts/selftest.ts` — anchoring and the pipeline's pure halves, one module per area under
+  `scripts/selftest/` (anchoring, finder, skeptic, aggregate, requirement, static, rules,
+  publish, models, security, config, measure). Name areas to run a subset:
+  `npx tsx scripts/selftest.ts anchoring`. If you touched `libs/diff.ts` or
+  `anchoring/locate.ts`, a failure in `anchoring` is a comment landing on the wrong line in
+  production.
 - `scripts/selftest-stream.ts` — SSE assembly and the failure taxonomy around it.
 - `scripts/selftest-runner.ts` — the HTTP model transport, against a fake OpenAI-compatible
   endpoint: which failures earn a retry, the buffered fallback sticking for the rest of a run,
@@ -44,9 +48,11 @@ they fail for different reasons:
 
 The runner, publish, ADO and end-to-end nets drive the real code against fake servers in `scripts/fakes/`,
 built from `node:http` and plain objects — test infrastructure, never a dependency. If you add
-one: bind port 0, never a fixed port, and close the server in a `finally`. Add new test files
-rather than growing `selftest.ts`, and wire them into `npm run check` (`selftest-docs.ts` fails
-if you forget).
+one: bind port 0, never a fixed port, and close the server in a `finally`. A test of a pure
+function goes in the area module it belongs to; a new area is a file in `scripts/selftest/`
+and one line in `selftest.ts`'s list. A new net is a new `scripts/selftest-*.ts` wired into
+`npm run check` (`selftest-docs.ts` fails if you forget). Every net takes `check`, `eq`,
+`section`, `skip`, `capture` and `report` from `scripts/selftest/harness.ts`.
 
 There is no build step. `tsx` runs the TypeScript directly and `tsc --noEmit` is typecheck
 only, so nothing is compiled and nothing is published.

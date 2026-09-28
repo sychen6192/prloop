@@ -13,42 +13,7 @@
 // Shares the fake ADO with selftest-publish.ts and keeps its own file: that one is about
 // what prloop WRITES, this one about what it believes when it READS.
 import { fakeAdo, type FakeAdoState } from "./fakes/ado";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
-
-async function capture<T>(fn: () => Promise<T>): Promise<{ value: T; lines: string[] }> {
-  const lines: string[] = [];
-  const real = console.log;
-  console.log = (...a: unknown[]) => {
-    lines.push(a.map(String).join(" "));
-  };
-  try {
-    return { value: await fn(), lines };
-  } finally {
-    console.log = real;
-  }
-}
+import { capture, check, eq, report, section } from "./selftest/harness";
 
 const ado = await fakeAdo();
 try {
@@ -275,5 +240,4 @@ try {
   await ado.close();
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

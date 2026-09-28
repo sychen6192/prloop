@@ -27,29 +27,7 @@ import { parseArgs } from "../libs/cli";
 import { exitCodeFor } from "../orchestrator";
 import type { AnchoredFinding, CriterionCheck, ReqVerdict, RequirementResult } from "../libs/types";
 import type { AggregateResult } from "../gates/aggregate";
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
-
-function eq<T>(name: string, actual: T, expected: T) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
-  check(name, a === e, `expected ${e}, got ${a}`);
-}
-
-function section(t: string) {
-  console.log(`\n${t}`);
-}
+import { check, eq, report, section } from "./selftest/harness";
 
 const URL_ARG = "https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4821";
 
@@ -164,7 +142,6 @@ section("exit status: the only part of a run that CI reads");
     exitCodeFor({ agg: agg([]), req: { workItems: [], criteria: [], extras: [], skipped: "no linked work item" }, incomplete: [] }), 0);
 }
 
-
 section("--batch: review a list of pull requests and keep the exit codes");
 {
   // The README's own daily job is `while read -r url; do prloop "$url" || true; done`, and
@@ -275,5 +252,4 @@ section("--batch: review a list of pull requests and keep the exit codes");
   }
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

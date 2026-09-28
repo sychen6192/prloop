@@ -15,22 +15,10 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
+import { check, report } from "./selftest/harness";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p: string) => readFileSync(path.join(root, p), "utf8");
-
-let passed = 0;
-let failed = 0;
-
-function check(name: string, cond: boolean, detail?: string) {
-  if (cond) {
-    passed++;
-    console.log(`  [OK]   ${name}`);
-  } else {
-    failed++;
-    console.log(`  [FAIL] ${name}${detail ? ` — ${detail}` : ""}`);
-  }
-}
 
 const readme = read("README.md");
 const workflow = read(".github/workflows/check.yml");
@@ -118,5 +106,4 @@ console.log("\nPaths documents point at");
   }
 }
 
-console.log(`\nResult: ${passed} passed, ${failed} failed`);
-process.exit(failed > 0 ? 1 : 0);
+report();

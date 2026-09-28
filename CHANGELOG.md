@@ -208,6 +208,11 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- `scripts/selftest.ts` is one module per area under `scripts/selftest/` — anchoring, finder,
+  skeptic, aggregate, requirement, static, rules, publish, models, security, config, measure —
+  and takes area names to run a subset (`npx tsx scripts/selftest.ts anchoring` runs in about a
+  second). The same 1,456 assertions, checked name for name before and after. Every net now
+  takes its assertion helpers from `scripts/selftest/harness.ts` instead of its own copy.
 - calibrate measures what comments led to, not only what was rejected: an **addressed rate**
   (a human fixed it, or the code it flagged changed under the open comment), comments still
   open when the PR merged (`ignored`) and ones closed without a verdict, ADO likes, a table by

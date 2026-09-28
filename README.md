@@ -714,7 +714,9 @@ base only GitHub's API knows; they are listed as unresolved until you set `base`
 the suite by hand.
 
 `scripts/selftest.ts` is the regression net for anchoring — **run it after touching
-`libs/diff.ts` or `anchoring/locate.ts`**. Its assertions map directly onto the causes of
+`libs/diff.ts` or `anchoring/locate.ts`** (`npx tsx scripts/selftest.ts anchoring` runs just
+that area; the others are finder, skeptic, aggregate, requirement, static, rules, publish,
+models, security, config and measure). Its assertions map directly onto the causes of
 "comment on the wrong line".
 
 `npm run check` runs it alongside the other nets: the SSE transport (`selftest-stream.ts`), the
