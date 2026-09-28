@@ -224,6 +224,12 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   change with no code (docs, config, only deletions) still runs the requirement axis, and the
   summary and status say no code was reviewed instead of "no issues found". A changed file of
   a type prloop does not know is named in the summary rather than dropped silently.
+- **The diff every model reads carries git's `a/` and `b/` prefixes.** The header was written
+  as `--- a${path}` for slash-prefixed paths; intake strips that slash, so every prompt read
+  `--- asrc/pay.ts`. A model that copied the header into a finding's `file` was then resolved
+  by basename alone, and on a PR where two changed files share a name the finding failed to
+  anchor — dropped without a word. Renames now name their old path on the left, and a path
+  copied from either side of the header resolves exactly.
 - **`--since auto` no longer fails a PR for acceptance criteria an earlier push delivered.** The
   requirement axis judged each incremental run's diff as if it were the whole PR, so a
   criterion implemented two pushes ago came back "missing", the dispute pass — shown the same

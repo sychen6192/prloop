@@ -226,9 +226,19 @@ export function buildHunks(a: string[], b: string[], edits: Edit[]): DiffResult 
   return { hunks, changedRightLines, changedLeftLines };
 }
 
-/** Renders hunks as a unified diff, with @@ headers carrying real file line numbers. */
-export function renderUnifiedDiff(path: string, hunks: Hunk[]): string {
-  const out: string[] = [`--- a${path}`, `+++ b${path}`];
+/**
+ * Renders hunks as a unified diff, with @@ headers carrying real file line numbers, and the
+ * `a/` and `b/` sides git writes — the rename's old name on the left.
+ *
+ * The header used to be `--- a${path}`, written for paths with a leading slash. Intake strips
+ * that slash, so every production prompt read `--- asrc/pay.ts`, while the selftest kept
+ * passing a slash-prefixed path production never produces. A model that copied the header
+ * into `file` then leaned on the basename to be resolved, and where two changed files share
+ * one, anchoring failed closed: a finding lost without a word.
+ */
+export function renderUnifiedDiff(path: string, hunks: Hunk[], originalPath?: string): string {
+  const rel = (p: string) => p.replace(/^\/+/, "");
+  const out: string[] = [`--- a/${rel(originalPath ?? path)}`, `+++ b/${rel(path)}`];
   for (const h of hunks) {
     out.push(`@@ -${h.leftStart},${h.leftCount} +${h.rightStart},${h.rightCount} @@`);
     out.push(h.body);

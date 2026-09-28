@@ -126,7 +126,7 @@ function orderByValue(files: FileDiff[]): FileDiff[] {
 }
 
 function renderFile(f: FileDiff): string {
-  return `### ${f.path}${f.originalPath && f.originalPath !== f.path ? ` (renamed from ${f.originalPath})` : ""} [${f.changeType}, ${f.language}]\n\`\`\`diff\n${renderUnifiedDiff(f.path, f.hunks)}\n\`\`\``;
+  return `### ${f.path}${f.originalPath && f.originalPath !== f.path ? ` (renamed from ${f.originalPath})` : ""} [${f.changeType}, ${f.language}]\n\`\`\`diff\n${renderUnifiedDiff(f.path, f.hunks, f.originalPath)}\n\`\`\``;
 }
 
 /** One request's worth of files off the front of `ordered`, and what did not fit. */

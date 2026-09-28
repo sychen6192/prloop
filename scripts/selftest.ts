@@ -261,6 +261,21 @@ section("diff and hunk line numbers");
   const rendered = renderUnifiedDiff("/f.ts", buildHunks(left, right, diffLines(left, right)).hunks);
   check("unified diff has @@ header", rendered.includes("@@ -"));
   check("unified diff has +/- lines", rendered.includes("+B") && rendered.includes("-b"));
+  // The shape production passes: intake strips the leading slash, and `--- a${path}` then
+  // rendered `--- asrc/pay.ts` into every prompt.
+  const hunks = buildHunks(left, right, diffLines(left, right)).hunks;
+  const header = (r: string) => r.split("\n").slice(0, 2);
+  eq("a canonical path gets git's side prefixes", header(renderUnifiedDiff("src/pay.ts", hunks)), ["--- a/src/pay.ts", "+++ b/src/pay.ts"]);
+  eq("...and a slash-prefixed one the same, not a double slash", header(renderUnifiedDiff("/src/pay.ts", hunks)), ["--- a/src/pay.ts", "+++ b/src/pay.ts"]);
+  eq("a rename names its old path on the left", header(renderUnifiedDiff("src/billing/pay.ts", hunks, "src/pay.ts")), ["--- a/src/pay.ts", "+++ b/src/billing/pay.ts"]);
+
+  // A model that copies the header into `file` must still anchor when the basename alone is
+  // ambiguous — which is exactly when the basename tier gives up.
+  const twins = new FileIndex([mkFile("api/index.ts", ["x"], [1]), mkFile("web/index.ts", ["y"], [1])]);
+  eq("a path copied from the header resolves", twins.resolve("b/web/index.ts").fd?.path, "web/index.ts");
+  eq("...from either side", twins.resolve("a/api/index.ts").fd?.path, "api/index.ts");
+  const realA = new FileIndex([mkFile("a/src/x.ts", ["x"], [1]), mkFile("src/x.ts", ["y"], [1])]);
+  eq("a real top-level a/ directory still wins", realA.resolve("a/src/x.ts").fd?.path, "a/src/x.ts");
 }
 
 // --- anchoring ---
