@@ -507,6 +507,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_SKEPTIC_TIMEOUT_MS` | `180000` | tighter than a finder's, and separate: a skeptic timeout fails open |
 | `PRR_MIN_CONSENSUS_SOURCES` | `2` | independent finders needed to publish without a skeptic |
 | `PRR_SKIP_STATIC` | — | `1` = skip static analysis |
+| `PRR_STATIC_BASELINE` | — | `1` = the fact tools (`tsc`, `mypy`) also run at the merge base, in a second worktree cut from `PRR_WORKTREE_REPO`, and only what is new at the head counts — matched on tool, rule, rename-aware path and the line's text, duplicates counted. An error that already existed is not posted even on a changed line; a new one in code the change did not touch (the caller it broke) is named in the summary. Doubles those tools' time and the worktree setup |
 | `PRR_STATIC_TIMEOUT_MS` | `300000` | deadline for one linter invocation |
 | `PRR_TRIAGE_CONTEXT_LINES` | `12` | source lines shown to the triage model |
 | `PRR_MAX_TRIAGE_ITEMS` | `40` | a PR tripping 200 lint rules has a lint config problem, not a review problem |

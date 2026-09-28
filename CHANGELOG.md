@@ -11,6 +11,16 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **`PRR_STATIC_BASELINE=1`: the fact tools run at the merge base too, and only what the change
+  caused counts.** `tsc` and `mypy` check the whole project, and the gate kept only what they
+  said about changed lines — so a caller the change broke, in a file it did not touch, was
+  filtered away with every pre-existing error. With the knob on, prloop cuts a second worktree
+  at the merge base, runs the fact-tier tools there as well, and subtracts Semgrep-style:
+  tool, rule, rename-aware path and the line's text, duplicates counted. An error the base
+  already had is no longer posted even on a line the change moved; one that is new outside
+  the changed lines is named in the summary as broken by this change. Doubles those tools'
+  time and the worktree setup, and needs `PRR_WORKTREE_REPO`; a tool that cannot run at the
+  base is reported and left uncompared.
 - **Claims a search can settle are settled by one, before any skeptic.** A finder may mark a
   finding's claim as `unused`, `undefined`, `missing-file` or `duplicate` and name the symbol
   or path (`claim_kind`, `claim_subject`); `gates/claims.ts` looks it up in the PR's files

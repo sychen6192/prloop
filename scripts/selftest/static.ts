@@ -10,11 +10,14 @@ import {
   untrustedNotice,
 } from "../../prompts/untrusted";
 import { type Verdict } from "../../gates/skeptic";
-import { environmentFailure, filterToChangedLines, rekeyToolFindings, runStaticGate, toolFingerprint } from "../../gates/static";
+import { baselineKey, environmentFailure, filterToChangedLines, newAtHead, rekeyToolFindings, runStaticGate, toolFingerprint } from "../../gates/static";
+import { buildHunks, diffLines } from "../../libs/diff";
+import { renderSummary } from "../../publish/format";
 import { parseToolOutput } from "../../profiles/parsers";
 import { selectProfiles, filesForProfile, PROFILES } from "../../profiles";
 import { categoryForRule, parseTriageVerdicts, triageAndConvert } from "../../gates/static";
 import type { ToolFinding } from "../../profiles/types";
+import type { FileDiff } from "../../libs/types";
 import { buildTriagePrompt } from "../../prompts/triage";
 import { killTree, scrubbedEnv } from "../../libs/shell";
 import { spawn as spawnChild } from "node:child_process";
@@ -849,6 +852,81 @@ section("what the tools established: the evidence a tool comment closes on");
         ],
         [true, true],
       );
+    } finally {
+      process.env["PATH"] = savedPath;
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  }
+}
+
+section("fact tools against the merge base: only what the change caused, including what it broke elsewhere");
+{
+  const k = (key: string) => ({ key });
+  const { fresh, existing } = newAtHead([k("a"), k("a"), k("b")], [k("a")]);
+  eq("one copy at the base cancels one at the head, not every one", [fresh.map((x) => x.key), existing.map((x) => x.key)], [["a", "b"], ["a"]]);
+  eq(
+    "the key is the tool, the rule, the path and the line's text — never its number",
+    baselineKey("tsc", "TS2345", "/src/a.ts", "  foo(  1 ) "),
+    baselineKey("tsc", "TS2345", "src/a.ts", "foo( 1 )"),
+  );
+
+  if (process.platform === "win32") {
+    skip("the static gate compares the head with the merge base", "a POSIX shell script stands in for mypy");
+  } else {
+    // A stand-in mypy that checks the whole project, as tsc and mypy do: every line saying
+    // BAD is an error, reported with its text so the two trees can differ.
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-baseline-"));
+    const bin = path.join(work, "bin");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(
+      path.join(bin, "mypy"),
+      "#!/bin/sh\n" +
+        "find . -name '*.py' | sed 's|^\\./||' | sort | while read -r f; do\n" +
+        "  grep -n 'BAD' \"$f\" | while IFS=: read -r n rest; do\n" +
+        "    printf '{\"file\": \"%s\", \"line\": %s, \"column\": 1, \"message\": \"bad value\", \"code\": \"bad\", \"severity\": \"error\"}\\n' \"$f\" \"$n\"\n" +
+        "  done\n" +
+        "done\n" +
+        "exit 1\n",
+      { mode: 0o755 },
+    );
+    const tree = (name: string, files: Record<string, string[]>) => {
+      const dir = path.join(work, name);
+      for (const [p, lines] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true });
+        fs.writeFileSync(path.join(dir, p), `${lines.join("\n")}\n`);
+      }
+      return dir;
+    };
+    // The change moves one pre-existing error, adds one on a changed line, and — without
+    // touching src/other.py — makes a second line there fail.
+    const baseApp = ["z = BAD_KEEP", "import os"];
+    const headApp = ["import os", "x = BAD_ONE", "z = BAD_KEEP"];
+    const head = tree("head", { "src/app.py": headApp, "src/other.py": ["BAD_OLD", "BAD_NEW"] });
+    const base = tree("base", { "src/app.py": baseApp, "src/other.py": ["BAD_OLD", "fine"] });
+    const built = buildHunks(baseApp, headApp, diffLines(baseApp, headApp));
+    const app: FileDiff = {
+      path: "src/app.py", changeType: "edit", hunks: built.hunks, rightLines: headApp, leftLines: baseApp,
+      changedRightLines: built.changedRightLines, changedLeftLines: built.changedLeftLines, binary: false, truncated: false, language: "python",
+    };
+    const savedPath = process.env["PATH"];
+    process.env["PATH"] = `${bin}${path.delimiter}${savedPath ?? ""}`;
+    try {
+      const without = await runStaticGate([app], new FileIndex([app]), "abc", head);
+      eq("without a baseline, both errors on changed lines are facts", without.facts.filter((f) => f.tool === "mypy").map((f) => f.line), [2, 3]);
+      const result = await runStaticGate([app], new FileIndex([app]), "abc", head, base);
+      eq("with one, the error the merge base already had is not this change's, even on a line it moved", result.facts.filter((f) => f.tool === "mypy").map((f) => f.line), [2]);
+      eq("...and is counted", result.baseline?.preExisting, 1);
+      eq(
+        "a new error in a file the change never touched is named, and an old one there is not",
+        result.broke?.map((f) => `${f.file}:${f.line}`),
+        ["src/other.py:2"],
+      );
+      const summary = renderSummary({
+        ctx: { ref: { baseUrl: "", org: "o", project: "p", repoId: "r", prId: 1 }, pr: { title: "t", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" }, iterations: [], iteration: { id: 1, sourceRefCommit: "", targetRefCommit: "", commonRefCommit: "", createdDate: "" }, compareTo: 0, files: [], skipped: [], changeTrackingIds: new Map() } as unknown as Parameters<typeof renderSummary>[0]["ctx"],
+        agg: { inline: [], belowBar: [], degraded: [], stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 } },
+        finderErrors: [], omittedFiles: [], appliedRules: [], durationSec: 1, runDir: "", staticResult: result,
+      });
+      check("the summary says what the change broke, and where", summary.includes("Broken outside the changed lines (1)") && summary.includes("`src/other.py:2` mypy bad: bad value"), summary.slice(0, 600));
     } finally {
       process.env["PATH"] = savedPath;
       fs.rmSync(work, { recursive: true, force: true });

@@ -10,6 +10,7 @@ import {
   SAVE_REPLAY,
   SKIP_REQUIREMENT,
   SKIP_STATIC,
+  STATIC_BASELINE,
   STRICT_COVERAGE,
   WORKTREE_REPO,
   excludedCategories,
@@ -332,6 +333,9 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // named; it never fails the run, because a missing linter is not a missing review.
   let worktree: PreparedWorktree | undefined;
   let worktreeError: string | undefined;
+  // PRR_STATIC_BASELINE: a second worktree at the merge base, where the fact tools run again
+  // (gates/static.ts). Failing to get one costs the comparison, never the gate.
+  let baseWorktree: PreparedWorktree | undefined;
   if (WORKTREE_REPO && !SKIP_STATIC && !noCode) {
     const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, opts.ref.prId).catch(
       (e): { error: string } => ({ error: `worktree preparation failed: ${e instanceof Error ? e.message : String(e)}` }),
@@ -342,6 +346,18 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     } else {
       worktree = prepared;
     }
+    if (worktree && STATIC_BASELINE) {
+      const mergeBase = ctx.iteration.commonRefCommit;
+      const base = mergeBase
+        ? await prepareWorktree(WORKTREE_REPO, mergeBase, opts.ref.prId).catch(
+            (e): { error: string } => ({ error: `${e instanceof Error ? e.message : String(e)}` }),
+          )
+        : { error: "the iteration names no merge base" };
+      if (isWorktreeFailure(base)) log(`[WARN] static baseline: no worktree at the merge base, so nothing is compared: ${base.error}`);
+      else baseWorktree = base;
+    }
+  } else if (STATIC_BASELINE && !SKIP_STATIC && !noCode) {
+    log(`[WARN] PRR_STATIC_BASELINE needs PRR_WORKTREE_REPO: a merge base cannot be checked out of a checkout prloop does not own`);
   }
   const [staticResult, finderOut] = await Promise.all([
     (SKIP_STATIC
@@ -365,7 +381,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0,
             skippedReason: worktreeError,
           })
-        : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir)
+        : runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir, baseWorktree?.dir)
     )
       .catch((e): StaticResult => {
         stageFailures.push(`static gate (${e instanceof Error ? e.message : String(e)})`);
@@ -375,7 +391,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       // FileIndex (intake's bytes), not off disk, so nothing after this needs the tree —
       // and `finally` rather than a line after the await means a crashed gate does not
       // leave one behind, which on a cron over a PR list would accumulate every day.
-      .finally(() => worktree?.cleanup()),
+      .finally(async () => {
+        await worktree?.cleanup();
+        await baseWorktree?.cleanup();
+      }),
     (noCode
       ? Promise.resolve<Awaited<ReturnType<typeof runFinders>>>({ outputs: [], prompt: "", omitted: [], rules: [] })
       : runFinders(opts.runner, {

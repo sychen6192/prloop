@@ -10,6 +10,7 @@ import type { CategoryHint } from "../libs/learnings";
 import type { ThreadTally, WatermarkDecision } from "./lifecycle";
 import type { ReviewContext } from "../ado/intake";
 import type { StaticResult } from "../gates/static";
+import { sanitizeToolMessage } from "../prompts/untrusted";
 
 const SEVERITY_LABEL: Record<string, string> = {
   critical: "🔴 Critical",
@@ -38,6 +39,9 @@ const SUPPRESSED_LABEL: Record<string, string> = {
   "no-corroboration": "single model, unverified - no corroboration",
   dismissed: "matches a finding a reviewer previously dismissed (wontFix/byDesign)",
 };
+
+// Enough to see what broke and where; the rest is one file away in the run directory.
+const BROKE_SHOWN = 20;
 
 const FAILURE_LABEL: Record<string, string> = {
   "quote-not-found": "quoted code not found in the file",
@@ -367,6 +371,23 @@ export function renderSummary(input: SummaryInput): string {
       const why = FAILURE_LABEL[f.anchorFailure ?? ""] ?? f.anchorFailure ?? "unknown reason";
       lines.push(`- **${f.severity}** \`${f.file}\` — ${f.claim}`, `  <sub>${why}</sub>`);
     }
+    lines.push("", "</details>", "");
+  }
+
+  // PRR_STATIC_BASELINE: what a fact tool reports at the head and not at the merge base,
+  // outside the lines this change touched — typically a caller it broke. Not inline: the
+  // lines are not this PR's to comment on, and the finding is still the PR author's to fix.
+  const broke = input.staticResult?.broke ?? [];
+  if (broke.length > 0) {
+    const tools = [...new Set(broke.map((b) => b.tool))].join(", ");
+    lines.push(
+      detailsOpen(`Broken outside the changed lines (${broke.length}) - new with this change, found by ${tools} against the merge base`),
+      "",
+    );
+    for (const b of broke.slice(0, BROKE_SHOWN)) {
+      lines.push(`- \`${b.file}:${b.line}\` ${b.tool}${b.ruleId ? ` ${b.ruleId}` : ""}: ${sanitizeToolMessage(b.message, 300)}`);
+    }
+    if (broke.length > BROKE_SHOWN) lines.push(`- … and ${broke.length - BROKE_SHOWN} more, in static.json`);
     lines.push("", "</details>", "");
   }
 

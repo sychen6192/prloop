@@ -58,6 +58,41 @@ export interface StaticResult {
   // finding it reported on them, on any line — before the changed-line filter, because a
   // comment an earlier push left is usually on a line this push did not touch.
   evidence?: { analysed: Record<string, string[]>; reported: string[] };
+  // PRR_STATIC_BASELINE: fact-tier findings that are new at the head and NOT on a changed
+  // line — in a file the change did not touch, or on an untouched line of one it did. The
+  // caller the change broke. Working-directory paths; reported in the summary, never inline.
+  broke?: ToolFinding[];
+  // What the merge-base comparison covered, when it ran.
+  baseline?: { tools: string[]; preExisting: number; skipped: Array<{ tool: string; reason: string }> };
+}
+
+/**
+ * What identifies "the same finding" across the head and the merge base: Semgrep's diff-scan
+ * key. The line's text rather than its number, because every line below an insertion moves;
+ * the path as the head names it, so a renamed file is still the same file.
+ */
+export function baselineKey(tool: string, ruleId: string, file: string, lineText: string): string {
+  return `${tool}\u0000${ruleId}\u0000${normalizePath(file)}\u0000${lineText.replace(/\s+/g, " ").trim()}`;
+}
+
+/**
+ * The head's findings that the merge base does not also have, duplicates counted: two copies
+ * of an error at the base cancel two at the head, not every one. A pure function over keys,
+ * for the selftest.
+ */
+export function newAtHead<T extends { key: string }>(head: readonly T[], base: readonly { key: string }[]): { fresh: T[]; existing: T[] } {
+  const left = new Map<string, number>();
+  for (const b of base) left.set(b.key, (left.get(b.key) ?? 0) + 1);
+  const fresh: T[] = [];
+  const existing: T[] = [];
+  for (const h of head) {
+    const n = left.get(h.key) ?? 0;
+    if (n > 0) {
+      left.set(h.key, n - 1);
+      existing.push(h);
+    } else fresh.push(h);
+  }
+  return { fresh, existing };
 }
 
 /** A tool finding's identity: the tool, the rule, the file and the line's own text — never the message. */
@@ -295,15 +330,19 @@ export function environmentFailure(
   );
 }
 
-async function runTool(
+/**
+ * One tool invocation, parsed, with the toolchain checked and ignored rules removed — paths
+ * still in the tool's own coordinate system (relative to `cwd`). Shared by the run under
+ * review and the merge-base run, which has no FileIndex to re-key onto.
+ */
+async function execTool(
   spec: ToolSpec,
   profile: Profile,
   files: string[],
   workdir: string,
   // Where the tool runs. Its own output is relative to this, not to the workdir.
   cwd: string,
-  index: FileIndex,
-): Promise<{ findings: ToolFinding[]; skipped?: string; unresolved: number }> {
+): Promise<{ parsed: ToolFinding[]; skipped?: string }> {
   // Tool arguments and tool output both live in the project's coordinate system.
   const args = spec.args(files.map((f) => slash(path.relative(cwd, path.resolve(workdir, f)))));
   logVerbose(`static: ${spec.name} (in ${slash(path.relative(workdir, cwd)) || "."}) ${args.slice(0, 6).join(" ")}…`);
@@ -318,7 +357,7 @@ async function runTool(
 
   // Linters conventionally exit non-zero when they find something; that's not a failure.
   if (res.code !== 0 && !spec.allowNonZeroExit) {
-    return { findings: [], skipped: `exit code ${res.code}: ${res.stderr.slice(0, 200)}`, unresolved: 0 };
+    return { parsed: [], skipped: `exit code ${res.code}: ${res.stderr.slice(0, 200)}` };
   }
 
   let raw: string;
@@ -327,11 +366,10 @@ async function runTool(
       // Not "no findings": the tool was asked to write a report and did not. Saying so beats
       // an empty result that reads exactly like a clean build.
       return {
-        findings: [],
+        parsed: [],
         skipped:
           `produced no ${spec.outputFile} in ${slash(path.relative(workdir, cwd)) || "."} ` +
           `(exit ${res.code})${res.stderr.trim() ? `: ${res.stderr.trim().slice(0, 160)}` : ""}`,
-        unresolved: 0,
       };
     }
     raw = fs.readFileSync(reportPath, "utf8");
@@ -343,13 +381,40 @@ async function runTool(
   const parsed = parseToolOutput(raw, spec, cwd);
 
   const broken = environmentFailure(spec, parsed, slash(path.relative(workdir, cwd)) || ".");
-  if (broken) return { findings: [], skipped: broken, unresolved: 0 };
+  if (broken) return { parsed: [], skipped: broken };
 
   // Ignored rules go first: a finding the profile suppresses must not be able to inflate
   // the unresolved count below — that count points readers at a coordinate problem, and
   // config-suppressed output is not one.
   const ignored = new Set(profile.ignoreRules ?? []);
-  const relevant = parsed.filter((f) => !ignored.has(f.ruleId));
+  return { parsed: parsed.filter((f) => !ignored.has(f.ruleId)) };
+}
+
+/** A finding's path relative to the working directory, from the tool's own coordinates. */
+function workdirPath(f: ToolFinding, workdir: string, cwd: string): string | undefined {
+  const p = normalizePath(slash(path.relative(workdir, path.resolve(cwd, f.file))));
+  return p && !p.startsWith("../") ? p : undefined;
+}
+
+interface ToolRun {
+  spec: ToolSpec;
+  files: string[];
+  findings: ToolFinding[];
+  skipped?: string;
+  unresolved: number;
+  outside: ToolFinding[];
+}
+
+async function runTool(
+  spec: ToolSpec,
+  profile: Profile,
+  files: string[],
+  workdir: string,
+  cwd: string,
+  index: FileIndex,
+): Promise<{ findings: ToolFinding[]; skipped?: string; unresolved: number; outside: ToolFinding[] }> {
+  const { parsed: relevant, skipped } = await execTool(spec, profile, files, workdir, cwd);
+  if (skipped !== undefined) return { findings: [], skipped, unresolved: 0, outside: [] };
 
   const prefix = slash(path.relative(workdir, cwd));
   const { kept, misses } = rekeyToolFindings(relevant, prefix, index);
@@ -359,7 +424,77 @@ async function runTool(
         `(e.g. ${misses[0]!.file})`,
     );
   }
-  return { findings: kept, unresolved: misses.length };
+  // Findings in files the change did not touch, kept with working-directory paths: the
+  // merge-base comparison (PRR_STATIC_BASELINE) is what can tell the ones this change caused.
+  const outside = misses.flatMap((f) => {
+    const p = workdirPath(f, workdir, cwd);
+    return p ? [{ ...f, file: p }] : [];
+  });
+  return { findings: kept, unresolved: misses.length, outside };
+}
+
+/**
+ * The fact-tier tools that ran at the head, run again in a worktree at the merge base, keyed
+ * as baselineKey keys them. A tool that could not run there is reported and left out: its
+ * head findings are then treated exactly as they are without a baseline.
+ */
+async function factsAtBase(
+  profiles: Profile[],
+  ranAtHead: ReadonlySet<string>,
+  files: readonly FileDiff[],
+  baseWorkdir: string,
+): Promise<{ byTool: Map<string, Array<{ key: string }>>; skipped: Array<{ tool: string; reason: string }> }> {
+  // Base path → the path the head calls it, so an error in a renamed file matches itself.
+  const renames = new Map(
+    files.filter((f) => f.originalPath && f.originalPath !== f.path).map((f) => [normalizePath(f.originalPath!), f.path]),
+  );
+  const targets = files
+    .filter((f) => f.changeType !== "add")
+    .map((f) => normalizePath(f.originalPath ?? f.path))
+    .filter((p) => fs.existsSync(path.join(baseWorkdir, p)));
+  const cache = new Map<string, string[]>();
+  const lineAt = (p: string, n: number) => {
+    let lines = cache.get(p);
+    if (!lines) {
+      lines = readLinesOrUndefined(path.join(baseWorkdir, p)) ?? [];
+      cache.set(p, lines);
+    }
+    return lines[n - 1] ?? "";
+  };
+  const byTool = new Map<string, Array<{ key: string }>>();
+  const skipped: Array<{ tool: string; reason: string }> = [];
+  for (const profile of profiles) {
+    const own = filesForProfile(profile, targets);
+    if (own.length === 0) continue;
+    for (const name of new Set(profile.tools.filter((t) => t.tier === "fact").map((t) => t.name))) {
+      if (!ranAtHead.has(name) || byTool.has(name)) continue;
+      // The same variant the head ran: the first one installed, in declaration order.
+      let spec: ToolSpec | undefined;
+      for (const t of profile.tools) {
+        if (t.name === name && (await commandExists(t.bin))) {
+          spec = t;
+          break;
+        }
+      }
+      if (!spec) continue;
+      const found: Array<{ key: string }> = [];
+      let failed: string | undefined;
+      for (const p of projectDirsFor(spec, own, baseWorkdir)) {
+        const r = await execTool(spec, profile, p.files, baseWorkdir, p.dir);
+        if (r.skipped !== undefined) {
+          failed = r.skipped;
+          break;
+        }
+        for (const f of r.parsed) {
+          const wp = workdirPath(f, baseWorkdir, p.dir);
+          if (wp) found.push({ key: baselineKey(f.tool, f.ruleId, renames.get(wp) ?? wp, lineAt(wp, f.line)) });
+        }
+      }
+      if (failed !== undefined) skipped.push({ tool: name, reason: `at the merge base: ${failed}` });
+      else byTool.set(name, found);
+    }
+  }
+  return { byTool, skipped };
 }
 
 export async function runStaticGate(
@@ -379,6 +514,9 @@ export async function runStaticGate(
   // from — the two sources need different skip messages, and only the caller knows which
   // one it tried.
   workdir: string = WORKDIR,
+  // PRR_STATIC_BASELINE: a checkout of the merge base, where the fact-tier tools run again
+  // so that only what is new at the head counts. Absent = no comparison, as before.
+  baseWorkdir?: string,
 ): Promise<StaticResult> {
   if (!workdir) {
     return {
@@ -401,6 +539,8 @@ export async function runStaticGate(
   }
 
   const all: ToolFinding[] = [];
+  // Fact-tier findings in files the change did not touch, for the merge-base comparison.
+  const outsideFacts: ToolFinding[] = [];
   const analysed: Record<string, string[]> = {};
   const ranTools: string[] = [];
   const skipped: Array<{ tool: string; reason: string }> = [];
@@ -467,12 +607,13 @@ export async function runStaticGate(
         if (i < 0) {
           const variants = profile.tools.filter((t) => t.name === name);
           return [
-            Promise.resolve({
+            Promise.resolve<ToolRun>({
               spec: variants[0]!,
-              files: [] as string[],
-              findings: [] as ToolFinding[],
+              files: [],
+              findings: [],
               skipped: `${[...new Set(variants.map((v) => v.bin))].join(" or ")} not found on PATH`,
               unresolved: 0,
+              outside: [],
             }),
           ];
         }
@@ -480,20 +621,23 @@ export async function runStaticGate(
         const projects = projectDirsFor(spec, targets, workdir);
         if (projects.length === 0) {
           return [
-            Promise.resolve({
+            Promise.resolve<ToolRun>({
               spec,
-              files: [] as string[],
-              findings: [] as ToolFinding[],
+              files: [],
+              findings: [],
               skipped: `no ${spec.requires} found above any changed file`,
               unresolved: 0,
+              outside: [],
             }),
           ];
         }
-        return projects.map(async (p) => ({
-          spec,
-          files: p.files,
-          ...(await runTool(spec, profile, p.files, workdir, p.dir, index)),
-        }));
+        return projects.map(
+          async (p): Promise<ToolRun> => ({
+            spec,
+            files: p.files,
+            ...(await runTool(spec, profile, p.files, workdir, p.dir, index)),
+          }),
+        );
       }),
     );
     for (const r of results) {
@@ -503,6 +647,7 @@ export async function runStaticGate(
       }
       ranTools.push(r.spec.name);
       all.push(...r.findings);
+      outsideFacts.push(...r.outside.filter((f) => f.tier === "fact"));
       unresolved += r.unresolved;
       analysed[r.spec.name] = [...new Set([...(analysed[r.spec.name] ?? []), ...r.files.map(normalizePath)])];
     }
@@ -534,7 +679,51 @@ export async function runStaticGate(
   }
 
   const { kept, dropped } = filterToChangedLines(all, index);
-  const facts = kept.filter((f) => f.tier === "fact");
+  let facts = kept.filter((f) => f.tier === "fact");
+
+  let broke: ToolFinding[] | undefined;
+  let baseline: StaticResult["baseline"];
+  if (baseWorkdir) {
+    const base = await factsAtBase(profiles, new Set(ranTools), files, baseWorkdir);
+    const headCache = new Map<string, string[]>();
+    const headLine = (f: ToolFinding) => {
+      const fd = index.exact(f.file);
+      if (fd) return fd.rightLines[f.line - 1] ?? "";
+      let lines = headCache.get(f.file);
+      if (!lines) {
+        lines = readLinesOrUndefined(path.join(workdir, f.file)) ?? [];
+        headCache.set(f.file, lines);
+      }
+      return lines[f.line - 1] ?? "";
+    };
+    const onChanged = new Set(facts);
+    const stale = new Set<ToolFinding>();
+    broke = [];
+    let preExisting = 0;
+    for (const [tool, baseKeys] of base.byTool) {
+      const head = [...all.filter((f) => f.tier === "fact" && f.tool === tool), ...outsideFacts.filter((f) => f.tool === tool)].map(
+        (f) => ({ f, key: baselineKey(f.tool, f.ruleId, f.file, headLine(f)) }),
+      );
+      const { fresh, existing } = newAtHead(head, baseKeys);
+      for (const x of existing) {
+        if (onChanged.has(x.f)) {
+          stale.add(x.f);
+          preExisting++;
+        }
+      }
+      for (const x of fresh) if (!onChanged.has(x.f)) broke.push(x.f);
+    }
+    // An error the merge base already had is not this change's, even on a line it touched.
+    facts = facts.filter((f) => !stale.has(f));
+    broke.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+    baseline = { tools: [...base.byTool.keys()], preExisting, skipped: base.skipped };
+    log(
+      `static baseline: ${baseline.tools.join(", ") || "no fact tool"} also ran at the merge base — ` +
+        `${preExisting} finding(s) on changed lines already existed there and are not posted; ` +
+        `${broke.length} new outside the changed lines, named in the summary` +
+        (base.skipped.length > 0 ? `; not compared: ${base.skipped.map((s) => `${s.tool} (${s.reason.slice(0, 120)})`).join("; ")}` : ""),
+    );
+  }
   const needsTriage = kept.filter((f) => f.tier === "triage");
   const suppressedCount = kept.filter((f) => f.tier === "suppress").length;
 
@@ -585,6 +774,8 @@ export async function runStaticGate(
     staleFiles: stale,
     unresolved,
     evidence: { analysed, reported: [...new Set(reported)] },
+    ...(broke === undefined ? {} : { broke }),
+    ...(baseline === undefined ? {} : { baseline }),
   };
 }
 
