@@ -261,6 +261,10 @@ export interface AnchoredFinding extends RawFinding {
   // Model findings only: the suppression marker on or just above the anchored lines, by name
   // (`# noqa`, `eslint-disable`, libs/suppression.ts) — a check the author already silenced.
   silencedBy?: string;
+  // Set by the fix check (gates/static.ts checkFixes): the fact-tier tool its suggested fix
+  // typechecked with, or — the fix removed — what the fix broke.
+  fixCheckedBy?: string;
+  fixDropped?: string;
   // Why this finding did not reach an inline comment, when it didn't.
   suppressedBy?: "severity" | "cap" | "no-corroboration" | "dismissed" | "pre-existing" | "silenced";
 }

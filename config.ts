@@ -116,6 +116,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_WORKTREE_SETUP_TIMEOUT_MS", kind: "number", section: S_STATIC, description: "deadline for the worktree install command" },
   { name: "PRR_SKIP_STATIC", kind: "bool", section: S_STATIC, description: "1 = skip static analysis entirely" },
   { name: "PRR_STATIC_BASELINE", kind: "bool", section: S_STATIC, description: "1 = fact tools also at the merge base; name breakage" },
+  { name: "PRR_FIX_CHECKS", kind: "number", section: S_STATIC, description: "suggested fixes typechecked per run in the worktree; 0 = off" },
   { name: "PRR_STATIC_TIMEOUT_MS", kind: "number", section: S_STATIC, description: "deadline for one linter invocation" },
   { name: "PRR_TRIAGE_MODEL", kind: "string", section: S_STATIC, description: "judges high-FP tools; unset = those are dropped" },
   { name: "PRR_TRIAGE_CONTEXT_LINES", kind: "number", section: S_STATIC, description: "source lines shown to the triage model" },
@@ -931,6 +932,11 @@ export const SKIP_STATIC = flagEnv("PRR_SKIP_STATIC");
 // pre-existing ones. Doubles the fact tools' time and the worktree setup; needs
 // PRR_WORKTREE_REPO.
 export const STATIC_BASELINE = flagEnv("PRR_STATIC_BASELINE");
+// How many inline findings' suggested fixes are applied in prloop's own worktree and
+// typechecked with the file's fact-tier tool (gates/static.ts checkFixes). Each check is a
+// project-wide tsc or mypy run, so it is capped; a fix that breaks the build is dropped and
+// its finding kept. Needs PRR_WORKTREE_REPO: prloop never edits a checkout it does not own.
+export const FIX_CHECKS = numEnv("PRR_FIX_CHECKS", 3, 0);
 export const STATIC_TIMEOUT_MS = numEnv("PRR_STATIC_TIMEOUT_MS", 5 * 60 * 1000, 1000);
 // Model that judges high-false-positive tool findings. Unset = those findings are dropped
 // rather than posted unjudged.

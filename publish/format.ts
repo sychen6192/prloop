@@ -81,7 +81,7 @@ export function toolOf(f: AnchoredFinding): string | undefined {
   return f.tier === undefined ? undefined : f.rule?.split(":")[0] || f.sources[0];
 }
 
-export function renderFindingComment(f: AnchoredFinding, span?: SpanMark): string {
+export function renderFindingComment(f: AnchoredFinding, span?: SpanMark, original?: readonly string[]): string {
   const parts: string[] = [
     `**${SEVERITY_LABEL[f.severity] ?? f.severity}** · ${CATEGORY_LABEL[f.category] ?? f.category}`,
     "",
@@ -98,8 +98,19 @@ export function renderFindingComment(f: AnchoredFinding, span?: SpanMark): strin
     // line against the left margin while every line below kept its indent, so a fix that is
     // contracted to be paste-ready arrived misaligned.
     const body = f.suggested_fix.replace(/^(?:[ \t]*\r?\n)+/, "").replace(/\s+$/, "");
-    const fence = codeFence(body);
-    fix = ["", "**Suggested fix**", "", `${fence}${lang === "other" ? "" : lang}`, body, fence];
+    // A fix that was applied and typechecked says so: that it compiles is the part a reader
+    // cannot see from the comment.
+    const heading = f.fixCheckedBy ? `**Suggested fix** (typechecks with ${f.fixCheckedBy})` : "**Suggested fix**";
+    if (original && original.length > 0) {
+      // As a diff against the lines it replaces. ADO renders no GitHub ```suggestion block, and
+      // a bare block of new code left the reader to work out which lines it was meant to replace.
+      const lines = [...original.map((l) => `-${l.replace(/\r$/, "")}`), ...body.split(/\r?\n/).map((l) => `+${l}`)].join("\n");
+      const fence = codeFence(lines);
+      fix = ["", heading, "", `${fence}diff`, lines, fence];
+    } else {
+      const fence = codeFence(body);
+      fix = ["", heading, "", `${fence}${lang === "other" ? "" : lang}`, body, fence];
+    }
   }
   const conf = Math.round(f.confidence * 100);
   const bits: string[] = [`confidence ${conf}%`];

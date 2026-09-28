@@ -42,7 +42,10 @@ no source, no quote — and neither is ever read into a model prompt.
   profile that exports `OPENAI_API_KEY` or `GITHUB_TOKEN` puts back every name the scrub just
   removed. `HOME` itself is passed through by design, so files under it (`~/.npmrc`,
   `~/.git-credentials`, the `~/.azure` token cache) remain readable by the setup command and by
-  the linters.
+  the linters. The fix check (`PRR_FIX_CHECKS`) writes a model's suggested fix into a file and
+  runs the same fact-tier tool again, under the same scrub; it adds no program to what runs —
+  `tsc` and `mypy` type-check a file, they do not execute it — and it only ever edits prloop's
+  own worktree, never a `PRR_WORKDIR` checkout somebody else owns.
 - **prloop's own state on the PR is bound to the identity that wrote it.** prloop keeps its
   cross-run state in hidden HTML comments inside its own comments (`publish/markers.ts`): the
   `--since auto` resume point, a finding's fingerprint, its category. Those markers are text

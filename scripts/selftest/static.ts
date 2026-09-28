@@ -1,6 +1,6 @@
 // Static analysis: tool output parsing, the changed-line filter, triage, broken toolchains,
 // the worktree the gate runs in, and the subprocesses the tools run as.
-import { isWorktreeFailure, planSetupShell, prepareWorktree } from "../../git/worktree";
+import { cleanupAllWorktrees, isWorktreeFailure, planSetupShell, prepareWorktree } from "../../git/worktree";
 import { FileIndex } from "../../libs/fileindex";
 import { fingerprint } from "../../gates/aggregate";
 import {
@@ -10,14 +10,14 @@ import {
   untrustedNotice,
 } from "../../prompts/untrusted";
 import { type Verdict } from "../../gates/skeptic";
-import { baselineKey, environmentFailure, filterToChangedLines, newAtHead, rekeyToolFindings, runStaticGate, toolFingerprint } from "../../gates/static";
+import { baselineKey, checkFixes, environmentFailure, filterToChangedLines, newAtHead, rekeyToolFindings, runStaticGate, toolFingerprint } from "../../gates/static";
 import { buildHunks, diffLines } from "../../libs/diff";
 import { renderSummary } from "../../publish/format";
 import { parseToolOutput } from "../../profiles/parsers";
 import { selectProfiles, filesForProfile, PROFILES } from "../../profiles";
 import { categoryForRule, parseTriageVerdicts, triageAndConvert } from "../../gates/static";
 import type { ToolFinding } from "../../profiles/types";
-import type { FileDiff } from "../../libs/types";
+import type { AnchoredFinding, FileDiff } from "../../libs/types";
 import { buildTriagePrompt } from "../../prompts/triage";
 import { killTree, scrubbedEnv } from "../../libs/shell";
 import { spawn as spawnChild } from "node:child_process";
@@ -599,6 +599,15 @@ section("worktree: the static gate gets the commit under review, not whatever th
       const listed = (await g("worktree", "list")).stdout;
       check("...and git no longer lists it", !listed.includes(prepared.dir), listed);
       await prepared.cleanup(); // idempotent: a finally that already ran must not throw
+
+      // A run that dies between cutting a worktree and removing it — the head worktree is kept
+      // for the fix check — leaves it to loop.ts's fatal path, which removes every one standing.
+      const orphan = await prepareWorktree(repo, reviewed, 43);
+      if (!isWorktreeFailure(orphan)) {
+        await cleanupAllWorktrees();
+        check("a worktree nobody removed is removed on the way out", !fs.existsSync(orphan.dir));
+        await cleanupAllWorktrees(); // and a second sweep finds nothing left to do
+      }
     }
 
     // Failures are named and returned, never thrown: a review whose static gate could not
@@ -927,6 +936,69 @@ section("fact tools against the merge base: only what the change caused, includi
         finderErrors: [], omittedFiles: [], appliedRules: [], durationSec: 1, runDir: "", staticResult: result,
       });
       check("the summary says what the change broke, and where", summary.includes("Broken outside the changed lines (1)") && summary.includes("`src/other.py:2` mypy bad: bad value"), summary.slice(0, 600));
+    } finally {
+      process.env["PATH"] = savedPath;
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  }
+}
+
+section("suggested fixes that compile: applied in the worktree, checked by the fact-tier tool");
+{
+  if (process.platform === "win32") {
+    skip("a suggested fix is typechecked before it is posted", "a POSIX shell script stands in for mypy");
+  } else {
+    // The stand-in reports every line saying BAD, with the line's text, project-wide.
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-fixes-"));
+    const bin = path.join(work, "bin");
+    const tree = path.join(work, "tree");
+    fs.mkdirSync(bin);
+    fs.mkdirSync(path.join(tree, "src"), { recursive: true });
+    fs.writeFileSync(
+      path.join(bin, "mypy"),
+      "#!/bin/sh\n" +
+        "find . -name '*.py' | sed 's|^\\./||' | sort | while read -r f; do\n" +
+        "  grep -n 'BAD' \"$f\" | while IFS=: read -r n rest; do\n" +
+        "    printf '{\"file\": \"%s\", \"line\": %s, \"column\": 1, \"message\": \"bad value\", \"code\": \"bad\", \"severity\": \"error\"}\\n' \"$f\" \"$n\"\n" +
+        "  done\n" +
+        "done\n" +
+        "exit 1\n",
+      { mode: 0o755 },
+    );
+    const lines = ["rate = 1", "total = rate * 2", "other = BAD_OLD", "done = True"];
+    const file = path.join(tree, "src", "pay.py");
+    const written = `${lines.join("\r\n")}\r\n`;
+    fs.writeFileSync(file, written);
+    const fd = mkFile("src/pay.py", lines, [2, 3]);
+    const at = (line: number, fix: string, over: Partial<AnchoredFinding> = {}): AnchoredFinding => ({
+      category: "correctness", severity: "high", confidence: 0.9, file: "src/pay.py", quote: lines[line - 1]!, claim: `fix at ${line}: ${fix}`,
+      sources: ["m1", "m2"], fingerprint: `fx${line}${fix.length}`, suggested_fix: fix,
+      anchor: { side: "right", startLine: line, endLine: line, startOffset: 1, endOffset: 2 }, ...over,
+    });
+    const clean = at(2, "total = rate * 3");
+    const keepsOldError = at(3, "other = BAD_OLD + 1");
+    const breaks = at(2, "total = BAD_NEW");
+    const addsALine = at(1, "rate = 1\nextra = 2");
+    const fromATool = at(2, "total = BAD_TOOL", { tier: "fact", rule: "mypy:bad" });
+    const savedPath = process.env["PATH"];
+    process.env["PATH"] = `${bin}${path.delimiter}${savedPath ?? ""}`;
+    try {
+      const checks = await checkFixes([clean, keepsOldError, breaks, addsALine, fromATool], new FileIndex([fd]), tree, 10);
+      const verdict = (f: AnchoredFinding) => {
+        const c = checks.find((x) => x.finding === f);
+        return c === undefined ? "unchecked" : c.broke === undefined ? "compiles" : "breaks";
+      };
+      eq("a fix the tool has nothing against compiles", verdict(clean), "compiles");
+      eq("...and one that keeps an error its line already had is not blamed for it", verdict(keepsOldError), "compiles");
+      eq("...but one that brings a new error breaks the build", verdict(breaks), "breaks");
+      check("...said with the rule, the place and the message", (checks.find((c) => c.finding === breaks)?.broke ?? "").includes("bad at src/pay.py:2: bad value"), JSON.stringify(checks.map((c) => c.broke)));
+      eq("a fix that adds a line shifts nothing that was already there into a new error", verdict(addsALine), "compiles");
+      eq("a tool's own finding is not checked by the tool", verdict(fromATool), "unchecked");
+      eq("the file is put back exactly as it was, line endings and all", fs.readFileSync(file, "utf8"), written);
+      eq("at most the number asked for are checked", (await checkFixes([clean, breaks, addsALine], new FileIndex([fd]), tree, 2)).length, 2);
+
+      fs.writeFileSync(file, "rate = 2\n");
+      eq("a worktree that does not hold the reviewed bytes checks nothing", (await checkFixes([clean], new FileIndex([fd]), tree, 10)).length, 0);
     } finally {
       process.env["PATH"] = savedPath;
       fs.rmSync(work, { recursive: true, force: true });

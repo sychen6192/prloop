@@ -38,6 +38,7 @@ import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
 import type { PrRef } from "./libs/types";
 import { createRunner, tokenTotals } from "./models/runner";
+import { cleanupAllWorktrees } from "./git/worktree";
 import { exitCodeFor, runReview } from "./orchestrator";
 
 const USAGE = `Usage: prloop <PR URL> [options]
@@ -336,6 +337,8 @@ main().catch(async (e) => {
   // Released before anything else: the next tick of a cron should be able to retry
   // immediately, not wait out an hour of a lease held by a process that is already dead.
   if (fatalRef) await releaseRunLease(fatalRef).catch(() => undefined);
+  // And the worktrees a crash left standing: one per dead tick would pile up on a cron box.
+  await cleanupAllWorktrees();
 
   if (POST_STATUS && fatalRef && !isDryRun()) {
     try {

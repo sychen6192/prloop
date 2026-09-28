@@ -405,6 +405,11 @@ no model endpoint at all.
   "comments must be resolved" policy.
 - **A few inline threads**, active, carrying `changeTrackingId` + `iterationContext` so ADO
   tracks their position across new commits.
+- **Fixes you can apply.** A suggested fix is shown as a diff against the lines it replaces
+  (Azure DevOps renders no GitHub ```` ```suggestion ```` block). With `PRR_WORKTREE_REPO` set,
+  the first `PRR_FIX_CHECKS` of them are applied in prloop's own worktree and typechecked with
+  the file's fact-tier tool: one that makes `tsc` or `mypy` report something new is dropped
+  and the finding posted without it, and one that passes says so on the comment.
 - **No duplicates on re-run** — each comment embeds a finding fingerprint.
 - **Stale threads auto-close** when their target code is gone. The criteria are narrow on
   purpose: wrongly closing a live issue is worse than leaving a stale comment. Each comment
@@ -563,6 +568,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_MIN_CONSENSUS_SOURCES` | `2` | independent finders needed to publish without a skeptic |
 | `PRR_SKIP_STATIC` | — | `1` = skip static analysis |
 | `PRR_STATIC_BASELINE` | — | `1` = the fact tools (`tsc`, `mypy`) also run at the merge base, in a second worktree cut from `PRR_WORKTREE_REPO`, and only what is new at the head counts — matched on tool, rule, rename-aware path and the line's text, duplicates counted. An error that already existed is not posted even on a changed line; a new one in code the change did not touch (the caller it broke) is named in the summary. Doubles those tools' time and the worktree setup |
+| `PRR_FIX_CHECKS` | `3` | inline findings whose suggested fix is applied in prloop's own worktree and typechecked with the file's fact-tier tool (`tsc`, `mypy`) before it is posted; a fix that makes the tool report something new is dropped and its finding kept, and one that passes says so on the comment. Each check is a whole-project run. `0` = off; needs `PRR_WORKTREE_REPO` — prloop never edits a checkout it does not own |
 | `PRR_STATIC_TIMEOUT_MS` | `300000` | deadline for one linter invocation |
 | `PRR_TRIAGE_CONTEXT_LINES` | `12` | source lines shown to the triage model |
 | `PRR_MAX_TRIAGE_ITEMS` | `40` | a PR tripping 200 lint rules has a lint config problem, not a review problem |

@@ -497,6 +497,117 @@ async function factsAtBase(
   return { byTool, skipped };
 }
 
+export interface FixCheck {
+  finding: AnchoredFinding;
+  /** The fact-tier tool that checked it. */
+  tool: string;
+  /** What the fix broke, when it broke something, worded for the log. Absent = it typechecks. */
+  broke?: string;
+}
+
+// Marks a diagnostic inside the edited lines: their text is the fix's after the edit and the
+// original's before, so keying on it would call an error the original already had "new".
+const EDITED = "\u0000edited";
+
+/**
+ * Whether each finding's suggested fix typechecks — arXiv 2607.21997's strongest predictor that
+ * a comment is acted on is a fix that can be applied, and a fix that does not compile is worse
+ * than none. The fix replaces the anchored lines in prloop's worktree, the fact-tier tool of
+ * the file's language runs over its project, and whatever it reports that it did not report
+ * before the edit is what the fix broke. The file is restored after every check. At most `max`
+ * checks: each is a whole-project tsc or mypy run. A finding no tool can check — no fact-tier
+ * tool for its language, a worktree that does not hold the reviewed bytes, a toolchain that
+ * cannot run — is not in the result.
+ */
+export async function checkFixes(
+  findings: readonly AnchoredFinding[],
+  index: FileIndex,
+  workdir: string,
+  max: number,
+): Promise<FixCheck[]> {
+  const out: FixCheck[] = [];
+  // Per tool and project, what the tool reports with no fix applied. Raw, not keyed: which
+  // lines count as edited differs per finding.
+  const baselines = new Map<string, ToolFinding[]>();
+  const candidates = findings.filter((f) => f.tier === undefined && f.suggested_fix?.trim() && f.anchor?.side === "right").slice(0, max);
+  for (const f of candidates) {
+    const fd = index.exact(f.file);
+    const anchor = f.anchor!;
+    if (!fd) continue;
+    const abs = path.join(workdir, fd.path);
+    const original = readLinesOrUndefined(abs);
+    // An edit to other bytes than the ones reviewed checks nothing about this fix.
+    if (!original || classifyWorkdirContent(original, fd.rightLines) !== "match") continue;
+    const profile = selectProfiles([fd.path])[0];
+    if (!profile) continue;
+    let spec: ToolSpec | undefined;
+    for (const t of profile.tools) {
+      if (t.tier === "fact" && (await commandExists(t.bin))) {
+        spec = t;
+        break;
+      }
+    }
+    const project = spec ? projectDirsFor(spec, [fd.path], workdir)[0] : undefined;
+    if (!spec || !project) continue;
+
+    const fixLines = f.suggested_fix!.replace(/^(?:[ \t]*\r?\n)+/, "").replace(/\s+$/, "").split(/\r?\n/);
+    // Keyed as baselineKey keys them, except inside the edited lines (EDITED).
+    const keyed = (parsed: ToolFinding[], edited: [number, number]) => {
+      const cache = new Map<string, string[]>();
+      return parsed.flatMap((t) => {
+        const wp = workdirPath(t, workdir, project.dir);
+        if (!wp) return [];
+        let lines = cache.get(wp);
+        if (!lines) cache.set(wp, (lines = readLinesOrUndefined(path.join(workdir, wp)) ?? []));
+        const inEdit = wp === normalizePath(fd.path) && t.line >= edited[0] && t.line <= edited[1];
+        return [{ key: baselineKey(t.tool, t.ruleId, wp, inEdit ? EDITED : (lines[t.line - 1] ?? "")), t, wp }];
+      });
+    };
+    const runOnce = async () => {
+      const r = await execTool(spec!, profile, project.files, workdir, project.dir);
+      if (r.skipped !== undefined) throw new Error(r.skipped);
+      return r.parsed;
+    };
+    try {
+      const cacheKey = `${spec.name}\u0000${project.dir}`;
+      let unfixed = baselines.get(cacheKey);
+      if (!unfixed) {
+        unfixed = await runOnce();
+        baselines.set(cacheKey, unfixed);
+      }
+      // Keyed now, with the file as reviewed on disk.
+      const before = keyed(unfixed, [anchor.startLine, anchor.endLine]);
+      const raw = fs.readFileSync(abs, "utf8");
+      const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+      // splitLines keeps a CRLF file's `\r` on each line; the join puts the file's own ending back.
+      const bare = original.map((l) => l.replace(/\r$/, ""));
+      const edited = [...bare.slice(0, anchor.startLine - 1), ...fixLines, ...bare.slice(anchor.endLine)];
+      fs.writeFileSync(abs, edited.join(eol) + (/\r?\n$/.test(raw) ? eol : ""));
+      let after: ReturnType<typeof keyed>;
+      try {
+        // Keyed before the file is put back: the line text of the edit is what it reported on.
+        after = keyed(await runOnce(), [anchor.startLine, anchor.startLine + fixLines.length - 1]);
+      } finally {
+        fs.writeFileSync(abs, raw);
+      }
+      const fresh = newAtHead(after, before).fresh;
+      const first = fresh[0];
+      out.push({
+        finding: f,
+        tool: spec.name,
+        ...(first ? { broke: `${first.t.ruleId || spec.name} at ${first.wp}:${first.t.line}: ${sanitizeToolMessage(first.t.message, 160)}` } : {}),
+      });
+    } catch (e) {
+      logVerbose(`static: could not check the fix for ${f.file}:${anchor.startLine} with ${spec.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (out.length > 0) {
+    const broke = out.filter((c) => c.broke).length;
+    log(`static: ${out.length} suggested fix${out.length === 1 ? "" : "es"} typechecked, ${broke} dropped for breaking the build`);
+  }
+  return out;
+}
+
 export async function runStaticGate(
   files: FileDiff[],
   // The FileIndex built at intake — tool-reported paths are resolved through it, once, at

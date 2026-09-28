@@ -11,6 +11,17 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **Suggested fixes are checked before they are posted, and shown as diffs.** An inline
+  code suggestion is the strongest predictor that a comment is acted on (arXiv 2607.21997),
+  and a fix that does not compile is worse than none. With `PRR_WORKTREE_REPO` set, the first
+  `PRR_FIX_CHECKS` (3) fixes about to be posted are applied to their anchored lines in
+  prloop's own worktree and the file's fact-tier tool (`tsc`, `mypy`) runs over its project;
+  anything it reports that it did not report before the edit — an error the edited lines
+  already had is not blamed on the fix — drops the fix, never the finding, and is logged and
+  kept in `findings.json`. A fix that passes is headed "typechecks with tsc". The worktree
+  is kept for the check and removed right after it, or by the fatal exit path if the run dies
+  first. Every posted fix is now a `diff` block against the lines it replaces, since Azure
+  DevOps renders no GitHub `suggestion` block.
 - **The unattended mode, packaged for Azure DevOps.** `--active <project or repository URL>`
   asks Azure DevOps for the active, non-draft pull requests and reviews them as `--batch` would
   a file, so a scheduled sweep no longer depends on a list somebody keeps up to date.

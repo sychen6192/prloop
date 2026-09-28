@@ -10,6 +10,7 @@ import {
   SAVE_REPLAY,
   SKIP_REQUIREMENT,
   SKIP_STATIC,
+  FIX_CHECKS,
   RISK_TIERS,
   STATIC_BASELINE,
   STRICT_COVERAGE,
@@ -30,7 +31,7 @@ import { runFinders } from "./gates/finder";
 import { checkClaims, contradictionOutcome } from "./gates/claims";
 import { runRequirementGate, toRequirementFindings, unmetCriteria } from "./gates/requirement";
 import { applyVerdicts, runSkeptic } from "./gates/skeptic";
-import { runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
+import { checkFixes, runStaticGate, triageAndConvert, type StaticResult } from "./gates/static";
 import { isWorktreeFailure, prepareWorktree, type PreparedWorktree } from "./git/worktree";
 import { createRunDir, createSkipDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
@@ -381,6 +382,10 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // and a setup command, up to ten minutes each — used to finish before any finder started;
   // inside this branch it runs beside them. Failing to get a worktree skips the gate with the
   // reason named; it never fails the run, because a missing linter is not a missing review.
+  // The head worktree outlives the static branch when the suggested fixes are to be checked
+  // in it after the verdicts (PRR_FIX_CHECKS); removed right after that check, or by
+  // loop.ts's fatal path if the run dies first (git/worktree.ts keeps the list).
+  const kept: { worktree?: PreparedWorktree } = {};
   const staticBranch = async (): Promise<StaticResult> => {
     const skipped = (skippedReason: string): StaticResult => ({
       facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0, skippedReason,
@@ -418,7 +423,12 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       } else if (STATIC_BASELINE) {
         log(`[WARN] PRR_STATIC_BASELINE needs PRR_WORKTREE_REPO: a merge base cannot be checked out of a checkout prloop does not own`);
       }
-      return await runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir, baseWorktree?.dir);
+      const result = await runStaticGate(ctx.files, ctx.fileIndex, ctx.iteration.sourceRefCommit, worktree?.dir, baseWorktree?.dir);
+      if (worktree && FIX_CHECKS > 0) {
+        kept.worktree = worktree;
+        worktree = undefined;
+      }
+      return result;
     } finally {
       await worktree?.cleanup();
       await baseWorktree?.cleanup();
@@ -579,6 +589,33 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       return undefined;
     });
     if (whole) markEarlierPushes(agg.belowBar, new FileIndex(whole.files));
+  }
+
+  // The suggested fixes about to be posted, applied in the worktree and typechecked: one that
+  // breaks the build is dropped, and its finding posted without it. Only fixes that would
+  // actually be posted — a finding already on the PR is not posted again.
+  if (kept.worktree) {
+    const worktreeDir = kept.worktree.dir;
+    try {
+      const checks = await timed(
+        "fix checks",
+        checkFixes(agg.inline.filter((f) => !postedFps.has(f.fingerprint)), ctx.fileIndex, worktreeDir, FIX_CHECKS),
+      ).catch((e): Awaited<ReturnType<typeof checkFixes>> => {
+        log(`[WARN] suggested fixes were not checked: ${e instanceof Error ? e.message : String(e)}`);
+        return [];
+      });
+      for (const c of checks) {
+        if (c.broke === undefined) {
+          c.finding.fixCheckedBy = c.tool;
+        } else {
+          log(`  suggested fix dropped from ${c.finding.file}:${c.finding.anchor?.startLine} — with it, ${c.tool} reports ${c.broke}`);
+          c.finding.fixDropped = `${c.tool}: ${c.broke}`;
+          delete c.finding.suggested_fix;
+        }
+      }
+    } finally {
+      await kept.worktree.cleanup();
+    }
   }
 
   // Collect the requirement axis now — everything that could run without it has run.

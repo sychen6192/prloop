@@ -151,6 +151,14 @@ export function postedPositions(threads: Thread[], index: FileIndex): PostedPosi
   return out;
 }
 
+/** The lines a right-side finding is anchored to, as the file has them: what a fix replaces. */
+function anchoredLines(f: AnchoredFinding, index: FileIndex): string[] | undefined {
+  const a = f.anchor;
+  if (!a || a.side !== "right") return undefined;
+  const lines = index.exact(f.file)?.rightLines.slice(a.startLine - 1, a.endLine) ?? [];
+  return lines.length > 0 ? lines : undefined;
+}
+
 /** The span mark of the lines a right-side finding is anchored to, for its comment. */
 function spanOf(f: AnchoredFinding, index: FileIndex): SpanMark | undefined {
   const a = f.anchor;
@@ -386,7 +394,7 @@ export async function publish(
     }
     try {
       await createThread(ref, {
-        content: renderFindingComment(f, spanOf(f, ctx.fileIndex)),
+        content: renderFindingComment(f, spanOf(f, ctx.fileIndex), anchoredLines(f, ctx.fileIndex)),
         status: "active",
         filePath: f.file,
         anchor: f.anchor,

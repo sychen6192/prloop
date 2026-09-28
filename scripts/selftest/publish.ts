@@ -39,6 +39,14 @@ section("suggested fix rendering");
   const unknown = renderFindingComment({ ...base, file: "/x/build.zig", suggested_fix: "all:" });
   check("an unknown language gets a bare fence", unknown.includes("```\nall:"));
 
+  // Posted, a fix is a diff against the lines it replaces: ADO renders no ```suggestion block,
+  // and a bare block of new code left the reader to work out what it was meant to replace.
+  const asDiff = renderFindingComment({ ...base, suggested_fix: "    db.commit()\n    flush()" }, undefined, ["    db.save()\r"]);
+  check("a fix is shown as a diff against the anchored lines", asDiff.includes("```diff\n-    db.save()\n+    db.commit()\n+    flush()\n```"), asDiff);
+  const checked = renderFindingComment({ ...base, suggested_fix: "x = 1", fixCheckedBy: "mypy" }, undefined, ["x = 0"]);
+  check("...and one that was typechecked says with what", checked.includes("**Suggested fix** (typechecks with mypy)"), checked);
+  check("...while an unchecked one claims nothing", !asDiff.includes("typechecks"), asDiff);
+
   check("no fix means no section", !renderFindingComment(base).includes("Suggested fix"));
 
   // Only the summary used to be redacted. An inline comment quotes the model's claim,
