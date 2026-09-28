@@ -1,7 +1,7 @@
 // Comment rendering. Every comment carries hidden markers so re-runs can recognise their
 // own threads: the bot marker identifies authorship, the fingerprint identifies the issue.
 import { MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "../config";
-import { findingMarkers, summaryMarkers } from "./markers";
+import { defuseHtmlComments, findingMarkers, summaryMarkers } from "./markers";
 import { detectLanguage } from "../libs/lang";
 import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
@@ -51,14 +51,25 @@ const FAILURE_LABEL: Record<string, string> = {
 // one line, so the whole opening tag has to be emitted as a single string.
 const detailsOpen = (title: string) => `<details><summary>${title}</summary>`;
 
+/**
+ * A backtick fence longer than any backtick run inside `code`, so nothing in it can close
+ * the block. A fix carrying ``` of its own — a markdown file, a template literal — ended a
+ * fixed three-backtick block early, and everything after rendered as markdown, live markup
+ * included, in a comment prloop signed.
+ */
+function codeFence(code: string): string {
+  const longest = Math.max(0, ...(code.match(/`+/g) ?? []).map((run) => run.length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
 export function renderFindingComment(f: AnchoredFinding): string {
   const parts: string[] = [
-    findingMarkers(f),
     `**${SEVERITY_LABEL[f.severity] ?? f.severity}** · ${CATEGORY_LABEL[f.category] ?? f.category}`,
     "",
     f.claim,
   ];
   if (f.evidence) parts.push("", f.evidence);
+  let fix: string[] = [];
   if (f.suggested_fix) {
     // Tag the fence with the file's language: the field is contracted to be code, and an
     // untagged block renders it as flat grey text right where a reviewer is comparing it
@@ -68,7 +79,8 @@ export function renderFindingComment(f: AnchoredFinding): string {
     // line against the left margin while every line below kept its indent, so a fix that is
     // contracted to be paste-ready arrived misaligned.
     const body = f.suggested_fix.replace(/^(?:[ \t]*\r?\n)+/, "").replace(/\s+$/, "");
-    parts.push("", "**Suggested fix**", "", `\`\`\`${lang === "other" ? "" : lang}`, body, "```");
+    const fence = codeFence(body);
+    fix = ["", "**Suggested fix**", "", `${fence}${lang === "other" ? "" : lang}`, body, fence];
   }
   const conf = Math.round(f.confidence * 100);
   const bits: string[] = [`confidence ${conf}%`];
@@ -92,8 +104,10 @@ export function renderFindingComment(f: AnchoredFinding): string {
         : `cleared by ${f.skepticVerdicts} of its verifiers (${caveats.join("; ")})`,
     );
   }
-  parts.push("", `<sub>${bits.filter(Boolean).join(" | ")}</sub>`);
-  return parts.join("\n");
+  const footer = `<sub>${bits.filter(Boolean).join(" | ")}</sub>`;
+  // The prose is defused and the fix is not: inside a fence nothing can close, an HTML
+  // comment is literal text, and a fix is contracted to be pasted as it stands.
+  return [findingMarkers(f), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n");
 }
 
 export interface SummaryInput {
@@ -266,7 +280,6 @@ function postingClaim(input: SummaryInput, inline: AnchoredFinding[]): string {
 export function renderSummary(input: SummaryInput): string {
   const { ctx, agg } = input;
   const lines: string[] = [
-    summaryMarkers(),
     `## 🔍 prloop automated review`,
     "",
   ];
@@ -429,11 +442,15 @@ export function renderSummary(input: SummaryInput): string {
     lines.push("", "</details>", "");
   }
 
+  // The last line of every summary, and load-bearing: publish() and the lease append their
+  // markers after it, and markers.ts reads the resume point and the lease from there alone.
   lines.push(`<sub>prloop · this comment updates on every push</sub>`);
   // The summary is posted to the PR: the run notes quote finder and requirement errors,
   // which relay gateway bodies — "Model X produced no result: HTTP 401: …" once carried the
-  // rejected key to everyone who could read the repository.
-  return redactSecrets(lines.join("\n"));
+  // rejected key to everyone who could read the repository. Defused as a whole rather than
+  // field by field: nearly every line quotes something prloop did not write, and a field
+  // added later is covered without anyone remembering to.
+  return redactSecrets(`${summaryMarkers()}\n${defuseHtmlComments(lines.join("\n"))}`);
 }
 
 function escapeCell(s: string): string {

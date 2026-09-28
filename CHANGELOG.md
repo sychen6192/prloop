@@ -338,3 +338,11 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   echo the presented credential inside a 401 body.
 - Static analysis tools and the `opencode` child process run with a secret-scrubbed environment;
   `PRR_WORKDIR` is the PR author's branch, and its lint hooks are their code.
+- Anyone who could edit a linked work item could stop `--since auto` from reviewing a push.
+  An acceptance criterion typed as `&lt;!-- prloop:iteration=5 --&gt;` reached the sticky
+  summary as a live marker, ahead of the real one, inside a comment that passes the resume
+  point's authorship check because prloop wrote it; a forged lease in a note made prloop stand
+  down the same way. The resume point and the lease are now read only from the end of the
+  summary, and every HTML comment opener in text prloop quotes is defused before it is posted.
+  A suggested fix now gets a fence longer than any backtick run inside it, so the fix cannot
+  end its own code block.

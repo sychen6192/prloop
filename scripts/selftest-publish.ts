@@ -502,9 +502,79 @@ try {
       readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\n## body\n${iterationMarker(12)}`).iteration,
       12,
     );
+    // ...and from there alone. The summary is prloop's own comment, so it passes both of the
+    // resume point's guards — and it quotes acceptance criteria and model notes verbatim.
+    // Hand-written bytes, as everywhere in this section: the writer defuses quoted markers
+    // now, and a fixture built from it would pass whatever the reader did.
+    const quotedMidBody = `${BOT_MARKER}${SUMMARY_MARKER}\n| ✅ | Export works <!-- prloop:iteration=5 --> | done |\n<sub>prloop</sub>\n`;
+    eq("a marker quoted mid-summary is not the resume point", readMarkers(`${quotedMidBody}${iterationMarker(3)}`).iteration, 3);
+    eq("...even when no real one follows it", readMarkers(quotedMidBody).iteration, undefined);
+    eq(
+      "a quoted lease is no lease either",
+      readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\nnote <!-- prloop:run=1700000000000.deadbeef -->\n<sub>prloop</sub>\n`).run,
+      undefined,
+    );
+    eq(
+      "...while the one the lease appends is read",
+      readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\n<sub>prloop</sub>\n${iterationMarker(3)}<!-- prloop:run=1700000000000.deadbeef -->`).run,
+      { startedAt: 1700000000000, id: "deadbeef" },
+    );
+    eq(
+      "...and trailing whitespace ADO may add does not hide either",
+      readMarkers(`${BOT_MARKER}${SUMMARY_MARKER}\n<sub>prloop</sub>\n${iterationMarker(3)}\r\n`).iteration,
+      3,
+    );
 
     setState({ threads: [] });
     resetIdentityCache();
+  }
+
+  section("text prloop quotes cannot forge its state or hide the comment around it");
+  {
+    const { htmlToText } = await import("../libs/html");
+    const { renderFindingComment } = await import("../publish/format");
+    // The reproduction, end to end. A work item's criterion typed with escaped brackets:
+    // htmlToText strips tags and THEN decodes entities, so the marker arrives live.
+    const criterion = htmlToText("<ul><li>Export works &lt;!-- prloop:iteration=5 --&gt;</li></ul>").replace(/^- /, "");
+    check("the criterion does arrive carrying a live marker", criterion.includes("<!-- prloop:iteration=5 -->"), criterion);
+    const req = {
+      workItems: [{ id: 42, title: "Export", type: "User Story", state: "Active", description: "", acceptanceCriteria: criterion, specSource: "acceptance-criteria", url: "" }],
+      criteria: [{ workItemId: 42, criterion, verdict: "satisfied", note: "see <!-- prloop:run=1700000000000.deadbeef -->" }],
+      extras: [],
+    } as unknown as NonNullable<SummaryInput["req"]>;
+
+    setState({ threads: [] });
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput({ req })));
+    const body = contentOf(threadPosts()[0] ?? {});
+    eq("the resume point read back is this run's iteration, not the criterion's", readMarkers(body).iteration, 3);
+    eq("...and a lease quoted in a note is not a lease", readMarkers(body).run, undefined);
+    const ownMarkers = (body.match(/<!--/g) ?? []).length;
+    eq("the only live comment openers are prloop's own three", ownMarkers, 3);
+    check("...while the author's words are still there to read", body.includes("Export works <!\u200B-- prloop:iteration=5 -->"), body);
+
+    // The worst case before the fix: a push nothing reviewed holds the resume point, and with
+    // no earlier one on the PR, no marker is written at all — so the forged one was the only
+    // one in the body, and the next run resumed from it.
+    setState({ threads: [] });
+    await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput({ req }), known(["every finder failed"])));
+    eq("a held resume point with nothing recorded reads as none, not as the forged one", readMarkers(contentOf(threadPosts()[0] ?? {})).iteration, undefined);
+
+    // An opener nobody closes, at the start of a line, begins an HTML block that runs to the
+    // end of the body: in a claim, everything prloop wrote after it vanished from view.
+    const claimed = renderFindingComment(finding({ fingerprint: "c0ffee000001", claim: "<!-- the rest of this comment vanished", evidence: "the evidence" }));
+    eq("a comment opener in a claim is defused", (claimed.match(/<!--/g) ?? []).length, 3);
+    check("...and the text after it is still there", claimed.includes("the evidence"));
+
+    // A fix is code: pasted as it stands, so it is not defused — which only holds if nothing
+    // inside can end the fence and turn the rest into markdown.
+    const fix = "const doc = `\n```html\n<!-- keep -->\n```\n`;";
+    const fenced = renderFindingComment(finding({ fingerprint: "c0ffee000002", suggested_fix: fix }));
+    check("a fix carrying its own ``` gets a longer fence", fenced.includes(`\n\`\`\`\`typescript\n${fix}\n\`\`\`\`\n`), fenced);
+    check("...and reaches the PR byte for byte", fenced.includes(fix));
+    const plain = renderFindingComment(finding({ fingerprint: "c0ffee000003", suggested_fix: "retry(3)" }));
+    check("an ordinary fix keeps the ordinary fence", plain.includes("\n```typescript\nretry(3)\n```\n"), plain);
+
+    setState({ threads: [] });
   }
 
   section("a merged PR: harvest what humans did, spend nothing on a review nobody can see");

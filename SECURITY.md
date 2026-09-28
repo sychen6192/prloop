@@ -52,10 +52,16 @@ no source, no quote — and neither is ever read into a model prompt.
   `<!-- prloop:run=... -->` refreshed often enough would make prloop stand down from that PR
   for good. The dedupe readers deliberately stay on markers alone — forging
   those costs one missing comment, while requiring identity there would double-post whenever
-  prloop's credential differs between a laptop and a pipeline. Markers are read only from the
-  start of a comment body, so model-written text that quotes one is not mistaken for the
-  protocol. Where `connectionData` is unavailable (some on-prem Server versions) prloop falls
-  back to trusting the markers alone and says so, once, in the run log.
+  prloop's credential differs between a laptop and a pipeline. Identity, fingerprint and
+  category are read only from the markers at the start of a comment body, and the resume point
+  and the lease only from those at its end, after prloop's own closing line. Everything in
+  between may quote text prloop did not write — acceptance criteria, model claims and notes —
+  and passing the identity check does not make that text prloop's: a criterion typed as
+  `&lt;!-- prloop:iteration=5 --&gt;` reached the summary as a live marker once the work item
+  was flattened to text. So every HTML comment opener in the quoted text is also defused on
+  its way to the PR (`defuseHtmlComments`), which keeps it readable and keeps it from hiding
+  the rest of the comment. Where `connectionData` is unavailable (some on-prem Server
+  versions) prloop falls back to trusting the markers alone and says so, once, in the run log.
 - **Text prloop did not write is fenced before it reaches a model.** The PR description, the
   reviewed repository's own convention documents, the linked work items (title, description
   and every acceptance criterion) and the static-analysis reports each go into their prompt
