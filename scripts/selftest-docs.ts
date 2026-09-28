@@ -70,8 +70,8 @@ console.log("\nStated versions match the ones that ship");
   check(`.node-version (${pinned}) is one the CI matrix runs`, versions.includes(pinned), versions.join(","));
 
   // engines.node is a promise to whoever runs `npm ci` on the floor version. An untested
-  // floor is a promise nobody checked: undici's dispatcher is handed to Node's own fetch,
-  // and that seam moves between majors.
+  // floor is a promise nobody checked: undici 8 does not even load on Node 20, and Node's
+  // own bundled undici, which the global dispatcher still meets, moves between majors.
   const floor = /(\d+)/.exec(pkg.engines?.node ?? "")?.[1];
   check("package.json declares a Node floor", floor !== undefined, pkg.engines?.node);
   if (floor) check(`the declared floor (${floor}) is in the CI matrix`, versions.includes(floor), versions.join(","));

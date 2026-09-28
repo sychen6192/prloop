@@ -23,10 +23,11 @@ jobs:
         # windows included deliberately: libs/shell.ts is Windows-specific spawn/kill code
         # that platform-parameterized unit tests cannot fully exercise.
         os: [ubuntu-latest, windows-latest]
-        # 20 is the floor package.json declares, 22 is what .node-version pins. The undici-7
-        # dispatcher prloop hands to Node's own bundled fetch is exactly the coupling that
-        # moves between Node majors — testing only the newer one leaves the floor unproven.
-        node: [20, 22]
+        # 22 is the floor package.json declares (undici 8 needs 22.19 and does not even load
+        # on 20) and what .node-version pins; 24 is the newer LTS. Node's own bundled undici
+        # differs between them and prloop's global dispatcher still meets it, so testing only
+        # one major leaves the other unproven.
+        node: [22, 24]
     runs-on: ${{ matrix.os }}
     # The whole suite is offline and takes seconds; ten minutes means something hung.
     timeout-minutes: 10
@@ -44,7 +45,7 @@ jobs:
       - run: npm run prloop -- --help
       - run: npm run prloop -- --config
 
-  # Separate job so a vulnerable dependency is reported as itself, not as "the Windows/Node 20
+  # Separate job so a vulnerable dependency is reported as itself, not as "the Windows/Node 24
   # cell went red". Runtime deps only: undici is the only thing that reaches a user's machine.
   audit:
     runs-on: ubuntu-latest

@@ -6,7 +6,7 @@
 // failure to diagnose from the outside.
 //
 // So we read the standard variables ourselves and hand fetch an explicit dispatcher.
-import { Agent, ProxyAgent, setGlobalDispatcher, type Dispatcher } from "undici";
+import { Agent, ProxyAgent, fetch as undiciFetch, setGlobalDispatcher, type Dispatcher } from "undici";
 import { HTTP_PROXY, HTTPS_PROXY, NO_PROXY, USER_AGENT_OVERRIDE } from "../config";
 import { logVerbose } from "./log";
 import { caBundle, caSummary } from "./tls";
@@ -85,6 +85,15 @@ const directAgent: Dispatcher = new Agent({
 });
 setGlobalDispatcher(directAgent);
 if (CA) logVerbose(`Extra CA trust: ${caSummary()}`);
+
+/**
+ * The fetch the dispatchers in this file must be handed to. Node's global fetch is Node's own
+ * bundled undici, whose major follows Node's, not package.json's: undici 8's Agent rejects
+ * the handler Node 22's bundled undici 6 passes it ("invalid onRequestStart method"), so
+ * every request carrying a dispatcher failed with a bare "fetch failed". Taking fetch from
+ * the same package as the dispatcher keeps the pair on one handler API on every Node.
+ */
+export const fetch = undiciFetch;
 
 const cache = new Map<string, Dispatcher | undefined>();
 

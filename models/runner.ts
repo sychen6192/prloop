@@ -24,7 +24,7 @@ import {
 import { recordCall } from "../libs/artifacts";
 import { Semaphore } from "../libs/limit";
 import { log, logVerbose } from "../libs/log";
-import { USER_AGENT, dispatcherFor } from "../libs/proxy";
+import { USER_AGENT, dispatcherFor, fetch } from "../libs/proxy";
 import { redactSecrets } from "../libs/redact";
 import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
 import { inlineSchema } from "./schemas";
@@ -434,7 +434,7 @@ export class OpenAICompatRunner implements ModelRunner {
         // An internal model endpoint usually must NOT go through the external proxy;
         // list its host in NO_PROXY and dispatcherFor returns undefined for it.
         dispatcher: dispatcherFor(url),
-      } as RequestInit);
+      });
       if (!res.ok) {
         const text = await res.text();
         // A 429/503 usually says when to come back. Discarding it meant the backoff below

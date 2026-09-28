@@ -54,9 +54,11 @@ async function main() {
   const smoke = args.includes("--smoke");
 
   console.log("\nEnvironment");
-  const major = Number(process.versions.node.split(".")[0]);
-  if (major >= 20) ok("Node.js", `v${process.versions.node}`);
-  else bad(`Node.js v${process.versions.node} too old`, "needs v20+ (this tool uses built-in fetch)");
+  // The floor is undici 8's own (package.json engines): below it the HTTP client every
+  // request goes through fails to load or misbehaves.
+  const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
+  if (major > 22 || (major === 22 && minor >= 19)) ok("Node.js", `v${process.versions.node}`);
+  else bad(`Node.js v${process.versions.node} too old`, "needs v22.19+ (undici 8, the HTTP client, requires it)");
   // Report what actually got loaded, not what was merely configured: a path that is
   // misspelled or in DER form is the failure mode that looks identical to no CA at all.
   const broken = CA_SOURCES.filter((s) => s.error);

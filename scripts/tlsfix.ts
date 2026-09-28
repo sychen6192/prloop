@@ -10,7 +10,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import * as tls from "node:tls";
 import { parsePrUrl } from "../ado/client";
-import { HTTPS_PROXY, HTTP_PROXY, USER_AGENT, bypassesProxy, dispatcherFor } from "../libs/proxy";
+import { HTTPS_PROXY, HTTP_PROXY, USER_AGENT, bypassesProxy, dispatcherFor, fetch } from "../libs/proxy";
 import { PRLOOP_ROOT } from "../config";
 
 interface Candidate {
@@ -173,7 +173,7 @@ async function chaseAia(host: string, port: number): Promise<string | undefined>
   for (const url of urls) {
     console.log(`  Downloading intermediate certificate: ${url}`);
     try {
-      const res = await fetch(url, { dispatcher: dispatcherFor(url) } as RequestInit);
+      const res = await fetch(url, { dispatcher: dispatcherFor(url) });
       if (!res.ok) {
         console.log(`     HTTP ${res.status}, skipped`);
         continue;
