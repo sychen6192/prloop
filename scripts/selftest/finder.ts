@@ -43,6 +43,8 @@ import { run } from "../../libs/shell";
 import { MIN_DIFF_TOKENS, diffTokenBudget, estimateTokens } from "../../libs/payload";
 import { isTestPath } from "../../libs/lang";
 import { MAX_DIFF_CHARS, parseContextTokensByModel } from "../../config";
+import { buildHunks, diffLines, renderUnifiedDiff } from "../../libs/diff";
+import { enclosingScope, hunkScope } from "../../libs/scope";
 import { check, eq, section, skip } from "./harness";
 import { mkFile } from "./fixtures";
 
@@ -857,4 +859,115 @@ section("chunked finder output: three requests are still one opinion");
   const partial = mergeChunkOutputs([part(), part({ error: "read ECONNRESET" }), part()]);
   check("a failed part makes the finder an error", (partial.error ?? "").includes("part 2/3: read ECONNRESET"), partial.error);
   eq("...and a run where every part answered is not", mergeChunkOutputs([part(), part()]).error, undefined);
+}
+
+section("what a finder sees around a change: the declaration it sits in, and a short file whole");
+{
+  // Six lines above a change and three below arrived without the method's name, its
+  // parameters or its class. The header now names the enclosing declaration, as git does.
+  const at = (src: string, marker: string, language: string) => {
+    const lines = src.split("\n");
+    return enclosingScope(lines, lines.findIndex((l) => l.includes(marker)) + 1, language)?.text;
+  };
+  const java = [
+    "public class Invoices {",
+    "    private final Repo repo;",
+    "",
+    "    public void first() {",
+    "        a();",
+    "    }",
+    "",
+    "    @Transactional",
+    "    public BigDecimal total(List<Line> lines,",
+    "            Currency currency) {",
+    "        BigDecimal sum = BigDecimal.ZERO;",
+    "        for (Line line : lines) {",
+    "            if (line.active()) {",
+    "// debug output, flush left",
+    "                sum = sum.add(line.price());",
+    "            }",
+    "        }",
+    "        return sum;",
+    "    }",
+    "}",
+  ].join("\n");
+  eq("a change deep in a method names the method, not the if or the for", at(java, "sum.add", "java"), "public BigDecimal total(List<Line> lines,");
+  eq("...and not the sibling method above it", at(java, "return sum", "java"), "public BigDecimal total(List<Line> lines,");
+  eq("a change on a method's own signature names its class", at(java, "public void first()", "java"), "public class Invoices {");
+  eq("a field names its class", at(java, "private final Repo", "java"), "public class Invoices {");
+
+  const csharp = ["namespace Billing", "{", "    public class Invoice", "    {", "        public decimal Total()", "        {", "            return Lines.Sum(l => l.Price);", "        }", "    }", "}"].join("\n");
+  eq("Allman braces: the lone { is skipped, the signature above it is the scope", at(csharp, "Lines.Sum", "csharp"), "public decimal Total()");
+
+  const python = ["class Cart:", "    def total(self):", "        if self.items:", "            return sum(i.price for i in self.items)", "        return 0", "", "TAX = 0.2"].join("\n");
+  eq("Python: the def, through the if", at(python, "return sum", "python"), "def total(self):");
+  eq("...and module-level code after a function has no scope, not the function above it", at(python, "TAX = 0.2", "python"), undefined);
+
+  const go = ["func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {", "\tif r == nil {", "\t\treturn", "\t}", "\ts.count++", "}"].join("\n");
+  eq("Go, indented with tabs", at(go, "s.count++", "go"), "func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {");
+
+  const ts = [
+    "export const handler = async (event: Event) => {",
+    "  const result = compute(",
+    "    event.body,",
+    "  );",
+    "  this.client.send(",
+    "    result,",
+    "  );",
+    "};",
+    "describe(\"parser\", () => {",
+    "  it(\"reads a line\", () => {",
+    "    expect(parse(\"x\")).toBe(1);",
+    "  });",
+    "});",
+  ].join("\n");
+  eq("an assigned arrow function is a declaration", at(ts, "event.body", "typescript"), "export const handler = async (event: Event) => {");
+  eq("...a member call spanning lines is not", at(ts, "    result,", "typescript"), "export const handler = async (event: Event) => {");
+  eq("a callback block names the test it is in", at(ts, "expect(parse", "typescript"), "it(\"reads a line\", () => {");
+  eq("C++: an out-of-class definition", at(["void Parser::reset() const {", "    pos_ = 0;", "}"].join("\n"), "pos_ = 0", "cpp"), "void Parser::reset() const {");
+  eq("a synchronized block is a statement, a synchronized method a declaration",
+    [at(["class A {", "    synchronized void run() {", "        synchronized (lock) {", "            go();", "        }", "    }", "}"].join("\n"), "go();", "java")],
+    ["synchronized void run() {"]);
+  eq("...and a void method with no modifier in front", at(["class A {", "    void run() {", "        go();", "    }", "}"].join("\n"), "go();", "java"), "void run() {");
+  eq("a language with no rules names nothing", at(python, "return sum", "cobol"), undefined);
+  const long = `    public static Map<String, List<Map<String, Integer>>> aggregateEverythingByRegion(${"String a, ".repeat(8)}String z) {`;
+  check("a long signature is cut, and says so", (at(["class A {", long, "        x();", "    }", "}"].join("\n"), "x();", "java") ?? "").endsWith("…"));
+
+  // The header, and only when the declaration is out of sight.
+  const edit = (path: string, left: string[], right: string[], language = "java"): FileDiff => {
+    const { hunks, changedRightLines, changedLeftLines } = buildHunks(left, right, diffLines(left, right));
+    return { path, changeType: "edit", hunks, rightLines: right, leftLines: left, changedRightLines, changedLeftLines, binary: false, truncated: false, language };
+  };
+  const bodyLines = (n: number) => Array.from({ length: n }, (_, i) => `        int v${i} = ${i};`);
+  const leftJava = ["public class Big {", "    public void run() {", ...bodyLines(30), "    }", "}"];
+  const rightJava = [...leftJava];
+  rightJava[25] = "        int v23 = 23 * 2;";
+  const far = edit("src/Big.java", leftJava, rightJava);
+  eq("a hunk far into a method names the method in its header", hunkScope(far, far.hunks[0]!), "public void run() {");
+  check("...after the closing @@, as git writes it", renderUnifiedDiff(far.path, far.hunks, undefined, (h) => hunkScope(far, h)).includes("@@ public void run() {"));
+  const nearTop = [...leftJava];
+  nearTop[3] = "        int v1 = 1 * 2;";
+  const near = edit("src/Big.java", leftJava, nearTop);
+  eq("...and a hunk that shows the declaration itself needs no name", hunkScope(near, near.hunks[0]!), undefined);
+  const deleted = leftJava.filter((_, i) => i !== 25);
+  const del = edit("src/Big.java", leftJava, deleted);
+  eq("a pure deletion is placed by the side it deleted from", hunkScope(del, del.hunks[0]!), "public void run() {");
+
+  // Whole files: only with room left after selection, never at another file's expense.
+  const shortFile = edit("src/Short.java", ["class S {", ...bodyLines(20), "    void a() {}", "}"], ["class S {", ...bodyLines(20), "    void a() { b(); }", "}"]);
+  const roomy = buildDiffPayloads([shortFile], 100_000, undefined, undefined, 1, 300)[0]!;
+  check("a short file with room to spare is shown whole", roomy.text.includes("### src/Short.java [edit, java, whole file]") && roomy.text.includes("int v0 = 0;"), roomy.text.slice(0, 300));
+  eq("...and listed as such", roomy.wholeFiles, ["src/Short.java"]);
+  eq("...as one hunk from the first line", roomy.text.match(/@@ -1,\d+ \+1,\d+ @@/g)?.length, 1);
+  const capped = buildDiffPayloads([shortFile], 100_000, undefined, undefined, 1, 10)[0]!;
+  eq("a file over the line limit keeps its hunks", capped.wholeFiles, []);
+  eq("the requirement axis's payload never takes whole files", buildDiffPayload([shortFile], 100_000).wholeFiles, []);
+  const added: FileDiff = { ...edit("src/New.java", [], ["class N {", "}"]), changeType: "add" };
+  eq("an added file is not called whole: its hunks already are", buildDiffPayloads([added], 100_000, undefined, undefined, 1, 300)[0]!.wholeFiles, []);
+  // Budget room for both files' hunks and no more: showing the first whole first would have
+  // pushed the second out of the request.
+  const other = edit("src/Other.java", ["class O {", ...bodyLines(20), "    int x;", "}"], ["class O {", ...bodyLines(20), "    int x = 1;", "}"]);
+  const hunksOnly = buildDiffPayloads([shortFile, other], 100_000, undefined, undefined, 1, 0)[0]!;
+  const tight = buildDiffPayloads([shortFile, other], hunksOnly.text.length + 20, undefined, undefined, 1, 300)[0]!;
+  eq("with no room to spare, both files still go, as hunks", [tight.includedFiles.slice().sort(), tight.wholeFiles], [["src/Other.java", "src/Short.java"], []]);
 }

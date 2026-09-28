@@ -488,8 +488,9 @@ answer to "why did editing `.env` change nothing".
 | `PRR_CONTEXT_TOKENS` | `0` (off) | the model's context window in tokens. Set it and the diff is budgeted as `window − PRR_LLM_MAX_TOKENS − (system prompt + rules + conventions + PR description + inlined schema)`, so the backend never truncates a prompt mid-hunk and corrupts the quotes anchoring depends on. Token counts are an estimate (±20%) |
 | `PRR_CONTEXT_TOKENS_BY_MODEL` | — | JSON `model → tokens`: a fleet of different families is also a fleet of different context sizes, and one number either wastes the largest or truncates the smallest |
 | `PRR_HUNK_CONTEXT_BEFORE` | `6` | context lines before each hunk (asymmetric: what precedes a change means more) |
-| `PRR_HUNK_CONTEXT_AFTER` | `3` | context lines after each hunk |
+| `PRR_HUNK_CONTEXT_AFTER` | `3` | context lines after each hunk. Either way, a hunk whose function, method or class starts above the lines it shows names it after the `@@`, as `git diff` does |
 | `PRR_MAX_FILE_BYTES` | `2000000` | bigger files are diffed, never sent whole |
+| `PRR_WHOLE_FILE_MAX_LINES` | `300` | a changed file this short is shown to the finders whole, changes marked, when the request has room left after every selected file's hunks — it never pushes another file out. `0` = hunks only |
 | `PRR_SKEPTIC_CONTEXT_LINES` | `25` | source lines around the finding; a skeptic that needs the whole file is guessing |
 | `PRR_SKEPTIC_TIMEOUT_MS` | `180000` | tighter than a finder's, and separate: a skeptic timeout fails open |
 | `PRR_MIN_CONSENSUS_SOURCES` | `2` | independent finders needed to publish without a skeptic |

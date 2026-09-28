@@ -92,6 +92,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_HUNK_CONTEXT_BEFORE", kind: "number", section: S_BUDGET, description: "context lines kept before each hunk" },
   { name: "PRR_HUNK_CONTEXT_AFTER", kind: "number", section: S_BUDGET, description: "context lines kept after each hunk" },
   { name: "PRR_MAX_FILE_BYTES", kind: "number", section: S_BUDGET, description: "files larger than this are diffed, never sent whole" },
+  { name: "PRR_WHOLE_FILE_MAX_LINES", kind: "number", section: S_BUDGET, description: "a finder sees a file this short whole; 0 = hunks only" },
   { name: "PRR_STRICT_COVERAGE", kind: "bool", section: S_BUDGET, description: "0 = files nobody read no longer make the run incomplete" },
   { name: "PRR_FINDER_MAX_CHUNKS", kind: "number", section: S_BUDGET, description: "requests per finder for an over-budget diff; 1 = off" },
 
@@ -800,6 +801,12 @@ export const HUNK_CONTEXT_BEFORE = numEnv("PRR_HUNK_CONTEXT_BEFORE", 6);
 export const HUNK_CONTEXT_AFTER = numEnv("PRR_HUNK_CONTEXT_AFTER", 3);
 // Files bigger than this are diffed but never sent whole.
 export const MAX_FILE_BYTES = numEnv("PRR_MAX_FILE_BYTES", 2_000_000, 1);
+// A changed file up to this many lines goes to the finders whole, when the request has room
+// for it after every selected file's hunks (libs/payload.ts): room it would otherwise leave
+// unused, never a file it would push out. Hunks show six lines above a change and three below,
+// so "is this field ever reset?" or "does close() run on every path?" was unanswerable from
+// the diff even in a file of forty lines. 0 = hunks only.
+export const WHOLE_FILE_MAX_LINES = numEnv("PRR_WHOLE_FILE_MAX_LINES", 300, 0);
 // Files the finder never saw make the review incomplete (exit 3): one left out of the
 // finder context because the diff ran past PRR_MAX_DIFF_CHARS, or skipped by intake as
 // too large to fetch, was not reviewed — and a run that read 30 of 31 files used to exit

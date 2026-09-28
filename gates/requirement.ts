@@ -35,7 +35,7 @@ const VALID_VERDICT = new Set<string>(REQ_VERDICTS);
 
 // Stands in for the diff while measuring everything around it, so the real one can be packed
 // against what is left of the model's context window.
-const NO_DIFF: DiffPayload = { text: "", includedFiles: [], omittedFiles: [] };
+const NO_DIFF: DiffPayload = { text: "", includedFiles: [], omittedFiles: [], wholeFiles: [] };
 
 /**
  * How damning each verdict is, harshest first. Used only to settle a model that answered

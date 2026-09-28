@@ -392,6 +392,11 @@ try {
     const finderPrompts = stageCalls("findings").map(userPrompt);
     check("the finders see the pushed file", finderPrompts.every((p) => p.includes("src/pay.ts")));
     check("...and not the one push 2 left alone", finderPrompts.every((p) => !p.includes("src/export.ts")));
+    // Sixteen lines: short enough to be shown whole, so the finders also see code the push did
+    // not touch — and one of them reports the retry loop four lines above the change.
+    check("...shown whole, being short", finderPrompts.every((p) => p.includes("### src/pay.ts [edit, typescript, whole file]")), finderPrompts[0]?.slice(0, 200));
+    const outside = result.agg.degraded.find((f) => f.claim.includes("never terminates"));
+    eq("a finding on code the push did not change is kept off the lines", outside?.anchorFailure, "outside-changed-lines");
 
     const posted = inlinePosts();
     eq("one new comment: the bug push 2 introduced", posted.length, 1);

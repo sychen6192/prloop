@@ -11,6 +11,17 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **Finders see what a change sits in.** A hunk whose enclosing function, method or class
+  starts above the lines it shows names it after the `@@`, as `git diff` does — found by
+  per-language rules over the file's own lines and its indentation, no parser, and a hint
+  only: anchoring still reads the quote. And a changed file of at most
+  `PRR_WHOLE_FILE_MAX_LINES` lines (300) is shown whole, changes marked and headed `whole
+  file`, when the request has room left after every selected file's hunks: room it would
+  otherwise waste, never a file it would push out. Six lines above a change and three below
+  could not say whether a field is ever reset, or whether `close()` runs on every path, even
+  in a forty-line file. Finders only; the requirement axis keeps its hunks. A finding a finder
+  makes on code the change did not touch still anchors outside the change and stays off the
+  lines, as before.
 - `PRR_SAVE_REPLAY=1` saves `replay.json` — every finder's findings, every skeptic verdict, the
   triaged tool findings and the file contents they were about — and `scripts/replay.ts <run
   dir>` re-runs everything after the models offline under the current code and settings,

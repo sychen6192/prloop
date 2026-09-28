@@ -8,9 +8,10 @@
 //    quantity that overruns.
 import { log } from "./log";
 import { LLM_MAX_TOKENS, MAX_DIFF_CHARS, contextTokensFor } from "../config";
-import { renderUnifiedDiff } from "./diff";
+import { buildHunks, diffLines, renderUnifiedDiff } from "./diff";
 import { isTestPath } from "./lang";
 import { mulberry32, shuffle } from "./prng";
+import { hunkScope } from "./scope";
 import type { FileDiff } from "./types";
 
 export interface DiffPayload {
@@ -18,6 +19,8 @@ export interface DiffPayload {
   // In the order the files appear in `text`.
   includedFiles: string[];
   omittedFiles: string[];
+  // Included files shown whole rather than as hunks (`wholeFileLines` below), in `text` order.
+  wholeFiles: string[];
   // Which ceiling the selection ran into, for the log line and the summary. Undefined when
   // nothing was omitted. "Over budget" is not actionable until you know WHICH budget:
   // raising PRR_MAX_DIFF_CHARS does nothing when the model's context window is what bound.
@@ -125,17 +128,42 @@ function orderByValue(files: FileDiff[]): FileDiff[] {
   });
 }
 
-function renderFile(f: FileDiff): string {
-  return `### ${f.path}${f.originalPath && f.originalPath !== f.path ? ` (renamed from ${f.originalPath})` : ""} [${f.changeType}, ${f.language}]\n\`\`\`diff\n${renderUnifiedDiff(f.path, f.hunks, f.originalPath)}\n\`\`\``;
+/** The whole new file as one hunk, its changes marked: what `git diff -U<huge>` prints. */
+function wholeFileHunks(f: FileDiff) {
+  const all = { before: Number.POSITIVE_INFINITY, after: Number.POSITIVE_INFINITY };
+  return buildHunks(f.leftLines, f.rightLines, diffLines(f.leftLines, f.rightLines), all).hunks;
 }
 
-/** One request's worth of files off the front of `ordered`, and what did not fit. */
+function renderFile(f: FileDiff, whole = false): string {
+  const hunks = whole ? wholeFileHunks(f) : f.hunks;
+  const renamed = f.originalPath && f.originalPath !== f.path ? ` (renamed from ${f.originalPath})` : "";
+  // "whole file" is information, not decoration: with hunks alone a model cannot tell a field
+  // that is never reset from one reset forty lines further down.
+  return `### ${f.path}${renamed} [${f.changeType}, ${f.language}${whole ? ", whole file" : ""}]\n\`\`\`diff\n${renderUnifiedDiff(f.path, hunks, f.originalPath, (h) => hunkScope(f, h))}\n\`\`\``;
+}
+
+interface Packed {
+  file: FileDiff;
+  path: string;
+  rendered: string;
+  whole: boolean;
+}
+
+/**
+ * One request's worth of files off the front of `ordered`, and what did not fit.
+ *
+ * Selection first, exactly as it always ran; then what room is left goes to showing the
+ * selected files of at most `wholeFileLines` lines whole, in the order they were selected.
+ * In that order and never before selection: a whole file that cost another file its place
+ * would trade coverage — a file nobody reads — for context, and that trade is never worth it.
+ */
 function pack(
   ordered: readonly FileDiff[],
   budget: number,
   tokenBudget: number,
-): { selected: Array<{ path: string; rendered: string }>; rest: FileDiff[]; bound?: "chars" | "tokens" } {
-  const selected: Array<{ path: string; rendered: string }> = [];
+  wholeFileLines = 0,
+): { selected: Packed[]; rest: FileDiff[]; bound?: "chars" | "tokens" } {
+  const selected: Packed[] = [];
   const rest: FileDiff[] = [];
   let usedChars = 0;
   let usedTokens = 0;
@@ -162,9 +190,25 @@ function pack(
           `sent anyway — if the backend truncates, anchoring will degrade`,
       );
     }
-    selected.push({ path: f.path, rendered });
+    selected.push({ file: f, path: f.path, rendered, whole: false });
     usedChars += rendered.length;
     usedTokens += tokens;
+  }
+  if (wholeFileLines > 0) {
+    for (const s of selected) {
+      const f = s.file;
+      // An added file's hunks are already all of it; binary and truncated files have no whole to show.
+      if (f.binary || f.truncated || f.rightLines.length > wholeFileLines || f.leftLines.length === 0) continue;
+      const whole = renderFile(f, true);
+      if (whole === s.rendered) continue;
+      const extraChars = whole.length - s.rendered.length;
+      const extraTokens = tokenBudget > 0 ? estimateTokens(whole) - estimateTokens(s.rendered) : 0;
+      if (usedChars + extraChars > budget || (tokenBudget > 0 && usedTokens + extraTokens > tokenBudget)) continue;
+      s.rendered = whole;
+      s.whole = true;
+      usedChars += extraChars;
+      usedTokens += extraTokens;
+    }
   }
   return { selected, rest, ...(bound === undefined ? {} : { bound }) };
 }
@@ -218,14 +262,17 @@ export function buildDiffPayloads(
   seed?: number,
   ctx?: ContextBudget,
   maxChunks = 1,
+  // Only the finders take whole files (PRR_WHOLE_FILE_MAX_LINES). The requirement axis
+  // anchors its evidence against the change, and would be shown code it may not cite.
+  wholeFileLines = 0,
 ): DiffPayload[] {
   const tokenBudget = diffTokenBudget(ctx);
-  const chunks: Array<Array<{ path: string; rendered: string }>> = [];
+  const chunks: Packed[][] = [];
   let rest = orderByValue(files);
   let bound: "chars" | "tokens" | undefined;
 
   while (chunks.length < Math.max(1, maxChunks)) {
-    const packed = pack(rest, budget, tokenBudget);
+    const packed = pack(rest, budget, tokenBudget, wholeFileLines);
     chunks.push(packed.selected);
     bound ??= packed.bound;
     rest = packed.rest;
@@ -245,6 +292,7 @@ export function buildDiffPayloads(
       text: shown.map((s) => s.rendered).join("\n\n") + note,
       includedFiles: shown.map((s) => s.path),
       omittedFiles,
+      wholeFiles: shown.filter((s) => s.whole).map((s) => s.path),
       ...(bound === undefined ? {} : { bound }),
     };
   });

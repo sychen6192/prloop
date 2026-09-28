@@ -387,6 +387,9 @@ export async function runFinders(
     }
   }
   log(`finder file order: run seed ${runSeed}${models.length > 1 ? `, one permutation per finder` : ""}`);
+  if (first.wholeFiles.length > 0) {
+    log(`${first.wholeFiles.length} short file(s) shown whole, with room to spare (PRR_WHOLE_FILE_MAX_LINES): ${first.wholeFiles.join(", ")}`);
+  }
 
   // The cost, said before it is spent rather than found on a bill. Chunking is linear in
   // requests and the files it buys are the ones the budget was refusing, so the line names

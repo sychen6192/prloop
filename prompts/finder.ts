@@ -15,7 +15,7 @@
 //    than its middle. So the category list, the severity chain and the headings of the
 //    loaded rules are restated compactly after the diff, right where the model starts
 //    writing — and the rule headings double as the citations the validator accepts.
-import { FINDER_CATEGORIES, FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL } from "../config";
+import { FINDER_CATEGORIES, FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL, WHOLE_FILE_MAX_LINES } from "../config";
 import { buildDiffPayloads } from "../libs/payload";
 import type { FileDiff, PrInfo } from "../libs/types";
 import { neutralizeLine, renderPrDescription, renderRepositoryConventions } from "./untrusted";
@@ -188,6 +188,8 @@ export interface FinderPromptSet {
   chunks: string[];
   /** Files no chunk carried — the coverage gap, meaning exactly what it always did. */
   omitted: string[];
+  /** Files some chunk showed whole (PRR_WHOLE_FILE_MAX_LINES). */
+  wholeFiles: string[];
   bound?: "chars" | "tokens";
 }
 
@@ -278,8 +280,10 @@ ${rulesBlock}
 ## The change (unified diff)
 
 In the diff, the numbers in \`@@ -leftStart,leftCount +rightStart,rightCount @@\` are real
-file line numbers, given so you can orient yourself. Do not include any line number in your
-output — just copy the quote verbatim.
+file line numbers, given so you can orient yourself. Text after the closing \`@@\` names the
+function, method or class the hunk sits in, when it lies above the lines shown. A file whose
+heading says "whole file" is shown in full, its changes marked, so what is not in it is not in
+the file. Do not include any line number in your output — just copy the quote verbatim.
 
 `;
   const head = headFor("");
@@ -305,6 +309,7 @@ above (with the diff's +/- prefix stripped).`;
       fixed: `${input.system ?? ""}\n${input.schemaText ?? ""}\n${maxChunks > 1 ? headFor(chunkScope(0, maxChunks)) : head}${tail}`,
     },
     maxChunks,
+    WHOLE_FILE_MAX_LINES,
   );
 
   const first = payloads[0]!;
@@ -314,6 +319,7 @@ above (with the diff's +/- prefix stripped).`;
     ),
     // Identical on every chunk (libs/payload.ts), so reading it off the first is not a choice.
     omitted: first.omittedFiles,
+    wholeFiles: payloads.flatMap((p) => p.wholeFiles),
     ...(first.bound === undefined ? {} : { bound: first.bound }),
   };
 }
