@@ -29,11 +29,13 @@ try {
   process.env["PRR_LLM_STREAM"] = "1";
   process.env["PRR_QUIET"] = "1";
 
-  const { OpenAICompatRunner, createRunner, tokenTotals } = await import("../models/runner");
+  const { OpenAICompatRunner, createRunner, tokensOf } = await import("../models/runner");
   const { attachCallSink, detachCallSink } = await import("../libs/artifacts");
 
   const ask = { model: "m", system: "s", user: "u" };
-  /** Token totals are a process-wide accumulator; every assertion here is on the delta. */
+  /** A runner's totals accumulate over its calls; every assertion here is on the delta. */
+  let counting: import("../libs/types").ModelRunner | undefined;
+  const tokenTotals = () => tokensOf(counting);
   const since = (before: ReturnType<typeof tokenTotals>) => {
     const now = tokenTotals();
     return {
@@ -176,6 +178,7 @@ try {
   section("token accounting: one logical call, every attempt's usage");
   {
     const runner = await createRunner();
+    counting = runner;
 
     // A truncated completion is DETERMINISTIC, so it is not retried — and it is also the
     // most expensive kind of failure there is: the endpoint billed a full budget for it.
@@ -188,6 +191,11 @@ try {
     eq("...counted as one call", since(before).calls, 1);
     eq("...billed for the prompt it sent", since(before).promptTokens, 1200);
     eq("...and for the budget it burned", since(before).completionTokens, 8192);
+    // Totals belong to the runner a review was given, so a second review in the same process
+    // starts from nothing rather than from the first one's bill.
+    const another = await createRunner();
+    eq("another runner has spent nothing", tokensOf(another), { calls: 0, promptTokens: 0, completionTokens: 0 });
+    eq("...and a runner that does not count reads as having spent nothing", tokensOf({ chat: async () => ({ text: "", model: "m" }) }).calls, 0);
 
     // A retry sequence: the endpoint billed for BOTH attempts, so both must be counted,
     // while the caller still made one logical call.

@@ -27,7 +27,7 @@ import { FINDING_CATEGORIES } from "./libs/taxonomy";
 import { parsePrUrl } from "./ado/client";
 import { postStatus } from "./ado/statuses";
 import { unmetCriteria } from "./gates/requirement";
-import { claimRunLease, releaseRunLease, runId } from "./publish/lease";
+import { claimRunLease, releaseRunLease, runId, type LeaseHandle } from "./publish/lease";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
 import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir, runsDirWarning } from "./libs/artifacts";
 import { BATCH_CHILD_ENV, batchExitCode, forwardedArgs, parseRepoOverrides, readBatchList, renderBatchReport, runBatch } from "./libs/batch";
@@ -36,8 +36,8 @@ import { parseArgs } from "./libs/cli";
 import { runStamp } from "./libs/stamp";
 import { configWarnings, renderConfigTable } from "./libs/configreport";
 import { banner, die, log } from "./libs/log";
-import type { PrRef } from "./libs/types";
-import { createRunner, tokenTotals } from "./models/runner";
+import type { ModelRunner, PrRef } from "./libs/types";
+import { NO_TOKENS, createRunner, tokensOf } from "./models/runner";
 import { cleanupAllWorktrees } from "./git/worktree";
 import { exitCodeFor, runReview } from "./orchestrator";
 
@@ -85,6 +85,10 @@ function usage(): never {
 
 /** Set once the PR URL parses, so every exit path can say which run this was. */
 let fatalRef: PrRef | undefined;
+/** The run lease this process took, if any: the fatal path gives it back like the others do. */
+let heldLease: LeaseHandle | undefined;
+/** The review's runner, once it has one: what the run spent is read off it on every exit. */
+let reviewRunner: ModelRunner | undefined;
 const startedAt = new Date().toISOString();
 
 /**
@@ -210,6 +214,7 @@ async function main() {
   // would then have to release is the opposite of "compute everything, post nothing".
   if (!isDryRun()) {
     const lease = await claimRunLease(ref);
+    heldLease = lease.lease;
     if (!lease.acquired) {
       const reason = lease.reason ?? "another run holds this pull request";
       log(`No review: ${reason}. Nothing was posted and no model call was made.`);
@@ -225,7 +230,7 @@ async function main() {
           identity: runIdentity(undefined, compareTo),
           incomplete: [],
           counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
-          tokens: tokenTotals(),
+          tokens: { ...NO_TOKENS },
           durationSec: Math.round((Date.now() - Date.parse(startedAt)) / 1000),
         }),
       );
@@ -243,12 +248,13 @@ async function main() {
   }
   if (compareTo > 0) log(`Incremental mode: reviewing only changes after iteration ${compareTo}`);
 
-  const result = await runReview({ ref, runner: await createRunner(), compareTo });
+  reviewRunner = await createRunner();
+  const result = await runReview({ ref, runner: reviewRunner, compareTo, ...(heldLease ? { lease: heldLease } : {}) });
 
   // Here rather than in a `finally`, because every exit below is a process.exit() and those
   // do not run one. A normal review has already released it — publish() rewrites the summary
   // and the new body carries no marker — so on that path this costs one GET and no write.
-  await releaseRunLease(ref);
+  await releaseRunLease(ref, heldLease);
 
   banner("Done");
   log(`Elapsed ${result.durationSec}s, artifacts: ${result.runDir}`);
@@ -266,7 +272,7 @@ async function main() {
         identity: runIdentity(result.ctx.iteration.id, compareTo),
         incomplete: [],
         counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
-        tokens: tokenTotals(),
+        tokens: tokensOf(reviewRunner),
         durationSec: result.durationSec,
       }),
     );
@@ -319,7 +325,7 @@ async function main() {
         inline: result.agg.stats.inline,
         degraded: degraded.length,
       },
-      tokens: tokenTotals(),
+      tokens: tokensOf(reviewRunner),
       durationSec: result.durationSec,
       ...(result.timings === undefined ? {} : { timingsMs: result.timings }),
     }),
@@ -336,7 +342,7 @@ main().catch(async (e) => {
   // worth keeping.
   // Released before anything else: the next tick of a cron should be able to retry
   // immediately, not wait out an hour of a lease held by a process that is already dead.
-  if (fatalRef) await releaseRunLease(fatalRef).catch(() => undefined);
+  if (fatalRef) await releaseRunLease(fatalRef, heldLease).catch(() => undefined);
   // And the worktrees a crash left standing: one per dead tick would pile up on a cron box.
   await cleanupAllWorktrees();
 
@@ -369,7 +375,7 @@ main().catch(async (e) => {
           identity: runIdentity(),
           incomplete: [],
           counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
-          tokens: tokenTotals(),
+          tokens: tokensOf(reviewRunner),
           durationSec: Math.round((Date.now() - Date.parse(startedAt)) / 1000),
         }),
       );

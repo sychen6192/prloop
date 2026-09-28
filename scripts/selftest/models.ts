@@ -3,7 +3,7 @@
 // (selftest-runner.ts).
 import type { ChatRequest } from "../../libs/types";
 import { Semaphore } from "../../libs/limit";
-import { describeBadCompletion, isTransientModelError } from "../../models/runner";
+import { badCompletion, describeBadCompletion, isTransient } from "../../models/runner";
 import { explainSpawnError, planSpawn, planKill, killTree } from "../../libs/shell";
 import { spawn as spawnChild } from "node:child_process";
 import {
@@ -171,13 +171,13 @@ section("opencode: a killed or crashed run is a named failure, not an empty answ
   // unparseable" / "empty string" — the deterministic class the transient retry skips.
   const base = { timedOut: false, timeoutMs: 900_000, code: 0, signal: null, text: "" };
   eq("a timeout is named with the knob's value",
-    runFailure({ ...base, timedOut: true, code: null, signal: "SIGTERM", text: '{"findings":[' }), "timeout (900000ms)");
-  check("...and the transient retry fires on it", isTransientModelError(runFailure({ ...base, timedOut: true })!));
-  eq("a non-zero exit with no output is named", runFailure({ ...base, code: 1 }), "opencode exited 1");
+    runFailure({ ...base, timedOut: true, code: null, signal: "SIGTERM", text: '{"findings":[' })?.message, "timeout (900000ms)");
+  check("...and the transient retry fires on it", isTransient({ errorKind: runFailure({ ...base, timedOut: true })!.kind }));
+  eq("a non-zero exit with no output is named", runFailure({ ...base, code: 1 })?.message, "opencode exited 1");
   eq("...carrying the CLI's own error event",
-    runFailure({ ...base, code: 1, lastError: "ProviderAuthError: no API key" }), "opencode exited 1: ProviderAuthError: no API key");
-  eq("an error event with a clean exit and no output is the error", runFailure({ ...base, lastError: "rate limited" }), "rate limited");
-  eq("a signal death is named", runFailure({ ...base, code: null, signal: "SIGKILL" }), "opencode killed by SIGKILL");
+    runFailure({ ...base, code: 1, lastError: "ProviderAuthError: no API key" })?.message, "opencode exited 1: ProviderAuthError: no API key");
+  eq("an error event with a clean exit and no output is the error", runFailure({ ...base, lastError: "rate limited" }), { kind: "api", message: "rate limited" });
+  eq("a signal death is named", runFailure({ ...base, code: null, signal: "SIGKILL" }), { kind: "process", message: "opencode killed by SIGKILL" });
   eq("a completed run with output has no error", runFailure({ ...base, text: '{"findings":[]}' }), undefined);
   eq("a non-zero exit next to real output is left to the parser", runFailure({ ...base, code: 1, text: '{"findings":[]}' }), undefined);
   eq("a clean, silent exit is not this layer's error (the parser names the empty answer)", runFailure(base), undefined);
@@ -272,7 +272,7 @@ section("opencode runner: prloop's own agent, no tools, and nowhere near .env");
   eq("...but not its tools", own.permission?.["bash"], "deny");
   check("a fallback line is recognised", DEFAULT_AGENT_FALLBACK.test('! agent "prloop-reviewer" is a subagent, not a primary agent. Falling back to default agent'));
   check("...and turned into a refusal, whatever the run produced",
-    (runFailure({ timedOut: false, timeoutMs: 1, code: 0, signal: null, text: '{"findings":[]}', killedOn: "Falling back to default agent" }) ?? "").includes("fell back to its default one"));
+    (runFailure({ timedOut: false, timeoutMs: 1, code: 0, signal: null, text: '{"findings":[]}', killedOn: "Falling back to default agent" })?.message ?? "").includes("fell back to its default one"));
 
   if (process.platform !== "win32") {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-sandbox-"));
@@ -356,21 +356,36 @@ section("transient vs deterministic model failures");
   // Retrying a schema/auth rejection just burns endpoint time; retrying a timeout is free
   // recall. The live failure that motivated this was an HTTP 400 (never retry) sitting next
   // to timeouts (always retry) in the same run.
-  check("timeout retries", isTransientModelError("timeout (180s)"));
-  check("socket error retries", isTransientModelError("TypeError: fetch failed [UND_ERR_SOCKET]"));
-  check("500 retries", isTransientModelError("HTTP 500: upstream unavailable"));
-  check("502 retries", isTransientModelError("HTTP 502: bad gateway"));
-  check("429 retries", isTransientModelError("HTTP 429: rate limited"));
-  check("408 retries", isTransientModelError("HTTP 408: request timeout"));
-  check("400 does NOT retry", !isTransientModelError("HTTP 400: Invalid schema for response_format"));
-  check("401 does NOT retry", !isTransientModelError("HTTP 401: unauthorized"));
-  check("404 does NOT retry", !isTransientModelError("HTTP 404: model not found"));
+  // Decided on the kind the runner assigned where the failure happened, never on the words.
+  check("timeout retries", isTransient({ errorKind: "timeout" }));
+  check("socket error retries", isTransient({ errorKind: "transport" }));
+  check("500 retries", isTransient({ errorKind: "http", status: 500 }));
+  check("502 retries", isTransient({ errorKind: "http", status: 502 }));
+  check("429 retries", isTransient({ errorKind: "http", status: 429 }));
+  check("408 retries", isTransient({ errorKind: "http", status: 408 }));
+  check("400 does NOT retry", !isTransient({ errorKind: "http", status: 400 }));
+  check("401 does NOT retry", !isTransient({ errorKind: "http", status: 401 }));
+  check("404 does NOT retry", !isTransient({ errorKind: "http", status: 404 }));
+  // The refusals are the 4xx, not everything outside 5xx: the old message patterns only ever
+  // singled out `HTTP 4xx`, and a refactor is not the place to start refusing more.
+  check("a status outside 4xx and 5xx still retries", isTransient({ errorKind: "http", status: 302 }));
+  check("a failure with no kind retries, as an unrecognised message always did", isTransient({}));
   // Deterministic bad completions: the retry would burn a second full-length call to
   // reproduce the identical failure.
-  check("token-limit truncation does NOT retry", !isTransientModelError("response truncated at the token limit (8192); raise PRR_LLM_MAX_TOKENS"));
-  check("empty response does NOT retry", !isTransientModelError("model returned an empty response"));
-  check("reasoning-only response does NOT retry", !isTransientModelError("model returned only reasoning (5000 chars) and no answer; raise PRR_LLM_MAX_TOKENS"));
-  check("non-JSON body does NOT retry", !isTransientModelError("response is not JSON: <html>"));
+  check("token-limit truncation does NOT retry", !isTransient({ errorKind: "truncated" }));
+  check("empty response does NOT retry", !isTransient({ errorKind: "empty" }));
+  check("reasoning-only response does NOT retry", !isTransient({ errorKind: "reasoning-only" }));
+  check("non-JSON body does NOT retry", !isTransient({ errorKind: "not-json" }));
+  // And the kinds are what the checks that find these failures assign.
+  eq(
+    "a truncated, a reasoning-only and an empty completion are told apart",
+    [
+      badCompletion({ message: { content: "{" }, finish_reason: "length" }, 8192)?.kind,
+      badCompletion({ message: { content: "", reasoning: "hmm" }, finish_reason: "stop" }, 8192)?.kind,
+      badCompletion({ message: { content: "" }, finish_reason: "stop" }, 8192)?.kind,
+    ],
+    ["truncated", "reasoning-only", "empty"],
+  );
 }
 
 section("model call concurrency cap");

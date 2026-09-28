@@ -10,7 +10,7 @@
 // "asked for in the prompt". We compensate by injecting the schema as text (schemas.ts,
 // inlineSchema) — and by nothing else: a parse failure is NOT retried, here or anywhere.
 // models/runner.ts wraps this runner in withRetries like any other, but
-// isTransientModelError returns false for parse-shaped failures on purpose, because asking
+// isTransient returns false for parse-shaped failures on purpose, because asking
 // the same model the same question again is not a fix for an answer it was capable of
 // giving wrongly. So a weak model complies less reliably here than on the openai path, and
 // a non-conforming answer costs the whole call. Prefer the openai runner when the endpoint
@@ -28,6 +28,7 @@ import {
 } from "../config";
 import { log, logVerbose, startHeartbeat } from "../libs/log";
 import { inlineSchema } from "./schemas";
+import type { ModelFailure } from "./runner";
 import type { ChatRequest, ChatResponse, ModelRunner } from "../libs/types";
 
 export interface Acc {
@@ -130,20 +131,24 @@ export function runFailure(run: {
   lastError?: string;
   text: string;
   killedOn?: string;
-}): string | undefined {
+}): ModelFailure | undefined {
   // Whatever it produced, it produced it as an agent with tools, on a prompt an attacker
   // helped write: there is no answer here worth reading.
   if (run.killedOn !== undefined) {
-    return `opencode would not run the ${OPENCODE_AGENT} agent and fell back to its default one, which can use tools; killed before it could ("${run.killedOn}")`;
+    return {
+      kind: "process",
+      message: `opencode would not run the ${OPENCODE_AGENT} agent and fell back to its default one, which can use tools; killed before it could ("${run.killedOn}")`,
+    };
   }
   const detail = run.lastError ? `: ${run.lastError}` : "";
-  if (run.timedOut) return `timeout (${run.timeoutMs}ms)${detail}`;
+  if (run.timedOut) return { kind: "timeout", message: `timeout (${run.timeoutMs}ms)${detail}` };
   // The CLI produced an answer; a non-zero exit next to real output (a warning treated as
   // fatal at shutdown, say) is for the schema parse to judge, not for this to discard.
   if (run.text.trim()) return undefined;
-  if (run.code !== null && run.code !== 0) return `opencode exited ${run.code}${detail}`;
-  if (run.signal) return `opencode killed by ${run.signal}${detail}`;
-  return run.lastError;
+  if (run.code !== null && run.code !== 0) return { kind: "process", message: `opencode exited ${run.code}${detail}` };
+  if (run.signal) return { kind: "process", message: `opencode killed by ${run.signal}${detail}` };
+  // An error the CLI reported in-band, with nothing else to go on.
+  return run.lastError === undefined ? undefined : { kind: "api", message: run.lastError };
 }
 
 // Parses one JSONL event. The real event kind lives in part.type (hyphenated); the outer
@@ -270,14 +275,14 @@ async function runOnce(label: string, model: string, prompt: string, timeoutMs: 
     // line) and sends people to reinstall a CLI that is already there.
     const spawnError = `${res.stderr.trim()} — install the opencode CLI, or set PRR_OPENCODE_BIN`;
     log(`[${label}] [FAIL] ${spawnError}`);
-    return { text: "", model, error: spawnError };
+    return { text: "", model, error: spawnError, errorKind: "process" };
   }
 
   const text = OPENCODE_JSON_EVENTS ? (acc.text.trim() ? acc.text : acc.lastText) : res.stdout;
   // A killed or crashed run is not a completed one: it resolves WITH an error (so the
   // transient retry can fire and the stage is reported as failed) and still hands back what
   // arrived, for the artifacts.
-  const error = runFailure({
+  const failure = runFailure({
     timedOut: res.timedOut === true,
     timeoutMs,
     code: res.code,
@@ -286,6 +291,7 @@ async function runOnce(label: string, model: string, prompt: string, timeoutMs: 
     text,
     ...(res.killedOn === undefined ? {} : { killedOn: res.killedOn }),
   });
+  const error = failure?.message;
   log(
     res.timedOut
       ? `[${label}] timed out (elapsed ${secs}s, ${text.length} chars kept)`
@@ -297,7 +303,7 @@ async function runOnce(label: string, model: string, prompt: string, timeoutMs: 
     ...(acc.inputTokens === undefined ? {} : { promptTokens: acc.inputTokens }),
     ...(acc.outputTokens === undefined ? {} : { completionTokens: acc.outputTokens }),
   };
-  return error === undefined ? { text, model, ...usage } : { text, model, ...usage, error };
+  return failure === undefined ? { text, model, ...usage } : { text, model, ...usage, error: failure.message, errorKind: failure.kind };
 }
 
 // Said once per process, not per call: a fleet of finders would otherwise print the same

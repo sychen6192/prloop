@@ -14,7 +14,7 @@ import { recordOutcomes } from "../libs/outcomes";
 import { log } from "../libs/log";
 import { collectDismissals, collectFinalOutcomes, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
 import { iterationMarker, readMarkers, spanMark, type SpanMark } from "./markers";
-import { leaseTakenOver } from "./lease";
+import { leaseTakenOver, type LeaseHandle } from "./lease";
 import type { AnchoredFinding, PrRef } from "../libs/types";
 import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, ToolEvidence, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
@@ -251,6 +251,8 @@ export async function publish(
     incomplete: readonly string[];
     /** What the static tools established; decides whether a tool's comment may close. */
     toolEvidence?: ToolEvidence;
+    /** The run lease this run holds, if it took one: checked once more before anything is written. */
+    lease?: LeaseHandle;
   } = { unreviewed: [], incomplete: [] },
 ): Promise<PublishResult> {
   const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [], outcomes: [], gaps: [] };
@@ -329,7 +331,7 @@ export async function publish(
   }
   // The lease, once more, now that nothing has been written yet: a review that outlived it
   // and was taken over stands down here rather than posting beside the run that took over.
-  const lost = leaseTakenOver(threads, selfId);
+  const lost = leaseTakenOver(threads, selfId, known.lease);
   if (lost) {
     log(`[WARN] ${lost} — posting nothing, so the two reviews do not interleave`);
     for (const f of findings) result.failed.push({ finding: f, error: `not posted: ${lost}` });

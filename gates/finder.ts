@@ -14,7 +14,6 @@ import { log } from "../libs/log";
 import { newRunSeed, seedFor } from "../libs/prng";
 import { loadRules, renderRules, ruleHeadings, selectRules, type Rule } from "../libs/rules";
 import { CLAIM_KINDS, type ClaimKind, type ModelRunner, type RawFinding } from "../libs/types";
-import { isTruncation } from "../models/runner";
 import { FINDINGS_SCHEMA } from "../models/schemas";
 import { buildFinderPrompts, finderSystemFor, type FinderPromptInput, type RuleHeadingGroup } from "../prompts/finder";
 
@@ -286,7 +285,9 @@ async function runOne(
     log(`[FAIL] finder ${model} call failed: ${res.error}`);
     // The partial text is kept whatever the failure was: runs/ is where a failed call is
     // diagnosed, and an empty *-raw.txt says nothing about what the model was doing.
-    const salvaged = isTruncation(res.error)
+    // Only a completion cut at the token limit is worth reading: it usually holds a run of
+    // complete items before the cut (salvageArrayItems).
+    const salvaged = res.errorKind === "truncated"
       ? salvageFindings(model, res.text, "truncated", knownCites)
       : { findings: [], rejected: 0 };
     return { model, ...salvaged, error: res.error, raw: res.text, seed, prompt };

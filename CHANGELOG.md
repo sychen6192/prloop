@@ -307,6 +307,19 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- **Internals that other code depended on by accident, made explicit.** Every `PRR_*` knob is
+  declared by the `config.ts` reader that reads it — kind, section, one-line description — and
+  `KNOWN_KEYS` is built from those declarations, so the hand-kept second list of names, and the
+  knob read but never registered that it allowed, are gone; declaring a name twice throws.
+  Severities and finding categories moved to `libs/taxonomy.ts`: they are the review's
+  vocabulary, not settings. A model call's failure now carries its kind (`truncated`, `empty`,
+  `http` with its status, `timeout`, `stalled`, …) from where it happened, and retries, the
+  streaming fallback and the finder's truncation salvage decide on that instead of matching
+  the message with regexes — rewording a message could quietly change what was retried. The
+  run lease is a handle the run carries to the pre-post check and the release, not a flag in
+  the lease module, and token totals are counted per runner, so they are the run's: two reviews
+  in one process (every test that runs two) no longer share either. Nothing a user sees
+  changes; the hidden-marker bytes are untouched.
 - **The slow steps are off the critical path.** The static gate's worktree — a fetch and a
   setup command, up to ten minutes each — is now prepared inside the static branch, beside the
   finders, instead of before any finder starts. Triage runs beside the skeptic instead of after

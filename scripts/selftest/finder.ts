@@ -166,6 +166,7 @@ section("salvage: a response cut at the token limit still holds complete finding
       text: truncatedText,
       model: "m",
       error: "response truncated at the token limit (8192); raise PRR_LLM_MAX_TOKENS",
+      errorKind: "truncated" as const,
     }),
   };
   const salvaged = (await runFinders(truncated, input, ["m"])).outputs[0];
@@ -175,7 +176,10 @@ section("salvage: a response cut at the token limit still holds complete finding
 
   // Only failures with usable text are salvaged: a transport error has none, and asking
   // would be inventing findings.
-  const dead = { chat: async () => ({ text: "", model: "m", error: "timeout (900s)" }) };
+  const dead = { chat: async () => ({ text: "", model: "m", error: "timeout (900s)", errorKind: "timeout" as const }) };
+  // The kind decides, not the words: text that merely reads like a truncation is not one.
+  const lookalike = { chat: async () => ({ text: truncatedText, model: "m", error: "response truncated at the token limit, says the proxy", errorKind: "api" as const }) };
+  eq("a failure that only reads like a truncation salvages nothing", (await runFinders(lookalike, input, ["m"])).outputs[0]?.findings.length, 0);
   eq("a transport failure salvages nothing", (await runFinders(dead, input, ["m"])).outputs[0]?.findings.length, 0);
   eq("...and still records the empty text", (await runFinders(dead, input, ["m"])).outputs[0]?.raw, "");
 

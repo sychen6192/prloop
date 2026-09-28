@@ -57,18 +57,20 @@ and one line in `selftest.ts`'s list. A new net is a new `scripts/selftest-*.ts`
 There is no build step. `tsx` runs the TypeScript directly and `tsc --noEmit` is typecheck
 only, so nothing is compiled and nothing is published.
 
-## Adding a knob: four places or none
+## Adding a knob: three places or none
 
-Every setting is a `PRR_*` env var and lives in exactly four places:
+Every setting is a `PRR_*` env var and lives in exactly three places:
 
-1. read once in `config.ts` (nowhere else — a knob read elsewhere has no provenance, no
-   `--config` row and no typo warning),
-2. registered in `config.ts`'s `KNOWN_KEYS`,
-3. documented in `.env.example`,
-4. listed in the README settings table.
+1. read once in `config.ts`, by the reader that declares it — its kind, its section and a
+   one-line description (nowhere else: a knob read elsewhere has no provenance, no `--config`
+   row and no typo warning),
+2. documented in `.env.example`,
+3. listed in the README settings table.
 
-`scripts/selftest.ts` fails if any of the four is missing. Adding one and skipping the
-registry produces a variable that silently does nothing and warns the user it is unknown.
+`KNOWN_KEYS` is built from the declarations, so there is no second list to forget — the
+knob that used to be read and never registered, and so did nothing while warning the user it
+was unknown, cannot be written any more. `scripts/selftest.ts` fails if either document is
+missing a knob, or names one that does not exist.
 
 ## Comments
 

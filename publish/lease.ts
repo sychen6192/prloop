@@ -49,14 +49,24 @@ const RUN_ID = randomBytes(4).toString("hex");
 
 export const runId = (): string => RUN_ID;
 
-/** Set only by a claim that succeeded, so releasing can be a no-op that costs no request. */
-let held = false;
+/**
+ * What a claim that wrote a marker hands its run: the id the marker carries. The run passes it
+ * to the check before posting and to the release; it used to be a flag in this module, which
+ * made "does this run hold a lease" a fact about the process rather than about the run.
+ */
+export interface LeaseHandle {
+  readonly id: string;
+  /** Set by releaseRunLease, so releasing twice costs no second request. */
+  released?: boolean;
+}
 
 export interface LeaseDecision {
   /** False only when another run demonstrably holds this PR right now. */
   acquired: boolean;
   /** Why not, worded for the log and for result.json. Absent when acquired. */
   reason?: string;
+  /** Present when this run wrote its marker, and only then — nothing to check or release otherwise. */
+  lease?: LeaseHandle;
 }
 
 /** prloop's own sticky summary — ours, marked as the summary, and written by our identity. */
@@ -161,9 +171,8 @@ export async function claimRunLease(ref: PrRef, now: number = Date.now()): Promi
     logVerbose(`Could not confirm the run lease: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  held = true;
   logVerbose(`Holding the run lease as ${RUN_ID}`);
-  return { acquired: true };
+  return { acquired: true, lease: { id: RUN_ID } };
 }
 
 /**
@@ -173,11 +182,11 @@ export async function claimRunLease(ref: PrRef, now: number = Date.now()): Promi
  * put this run's comments beside the other run's, and whichever summary lands second would
  * overwrite the other's resume point.
  */
-export function leaseTakenOver(threads: Thread[], selfId?: string): string | undefined {
-  if (!held) return undefined;
+export function leaseTakenOver(threads: Thread[], selfId: string | undefined, lease: LeaseHandle | undefined): string | undefined {
+  if (!lease || lease.released) return undefined;
   const summary = ownSummary(threads, selfId);
   const current = summary ? readMarkers(summary.body).run : undefined;
-  return current && current.id !== RUN_ID
+  return current && current.id !== lease.id
     ? `run ${current.id} took this pull request over while this run was reviewing it (PRR_RUN_LEASE_MS ran out)`
     : undefined;
 }
@@ -195,16 +204,16 @@ export function leaseTakenOver(threads: Thread[], selfId?: string): string | und
  * buys two things: it never strips a marker another run has since written over ours, and a
  * publish that quietly failed to update the summary still gets the lease released.
  */
-export async function releaseRunLease(ref: PrRef): Promise<void> {
-  if (!held) return;
-  held = false;
+export async function releaseRunLease(ref: PrRef, lease: LeaseHandle | undefined): Promise<void> {
+  if (!lease || lease.released) return;
+  lease.released = true;
   try {
     const summary = ownSummary(await listThreads(ref), await selfIdentityId(ref));
     if (!summary) return;
     const current = readMarkers(summary.body).run;
-    if (!current || current.id !== RUN_ID) return;
+    if (!current || current.id !== lease.id) return;
     await updateComment(ref, summary.threadId, summary.commentId, setRunMarker(summary.body, ""));
-    logVerbose(`Released the run lease ${RUN_ID}`);
+    logVerbose(`Released the run lease ${lease.id}`);
   } catch (e) {
     // Best effort by design. A lease nobody released expires on its own, which is the
     // failure mode the window exists to bound; turning that into a failed run would redden
@@ -213,7 +222,3 @@ export async function releaseRunLease(ref: PrRef): Promise<void> {
   }
 }
 
-/** Test seam: forget that this process holds a lease. */
-export function resetLeaseState(): void {
-  held = false;
-}

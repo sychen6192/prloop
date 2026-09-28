@@ -1277,7 +1277,7 @@ try {
     // set and both post everything in it. A lock file cannot help — libs/learnings.ts states
     // that a laptop and a cron box do not share RUNS_DIR, and that is exactly the pair that
     // collides — so the lease is state on the PR, like the resume point beside it.
-    const { claimRunLease, releaseRunLease, leaseIsLive, resetLeaseState, runId } = await import("../publish/lease");
+    const { claimRunLease, releaseRunLease, leaseIsLive, runId } = await import("../publish/lease");
     const { runMarker, setRunMarker } = await import("../publish/markers");
     const { RUN_LEASE_MS } = await import("../config");
 
@@ -1293,7 +1293,6 @@ try {
     const fresh = (partial: Partial<FakeAdoState>) => {
       setState({ selfIdentityId: BOT, ...partial });
       resetIdentityCache();
-      resetLeaseState();
     };
 
     // The clock rule, before any wire. A marker from the future is far likelier to be a live
@@ -1368,35 +1367,41 @@ try {
     // scratch and the new body carries no marker — so what this covers is every other way a
     // run ends: a merged PR, a crash, a stage that threw.
     fresh({ threads: [withSummary()] });
-    await capture(() => claimRunLease(ref, NOW));
-    await capture(() => releaseRunLease(ref));
+    const held = (await capture(() => claimRunLease(ref, NOW))).value.lease;
+    eq("a claim that wrote its marker hands the run a lease to give back", held?.id, runId());
+    await capture(() => releaseRunLease(ref, held));
     eq("releasing gives the PR back", readMarkers(summaryNow()).run, undefined);
     eq("...without touching the rest of the summary", summaryNow(), summaryBody);
+    ado.reset();
+    await capture(() => releaseRunLease(ref, held));
+    eq("...once: a second release makes no request", ado.requests.length, 0);
 
     // Never steal: by the time this run finishes, an expired lease may already have been
     // taken over, and stripping that marker would hand the PR to a third run.
     fresh({ threads: [withSummary()] });
-    await capture(() => claimRunLease(ref, NOW));
+    const overtaken = (await capture(() => claimRunLease(ref, NOW))).value.lease;
     const rival = setRunMarker(summaryBody, runMarker(NOW, "deadbeef"));
     ado.state.threads[0]!.comments![0]!.content = rival;
-    await capture(() => releaseRunLease(ref));
+    await capture(() => releaseRunLease(ref, overtaken));
     eq("a lease another run has taken over is left alone", summaryNow(), rival);
 
     // And the release that costs nothing: a run that never held the lease makes no request
     // at all, which is what lets loop.ts call it unconditionally on every exit path.
     fresh({ threads: [withSummary()] });
-    await capture(() => releaseRunLease(ref));
+    await capture(() => releaseRunLease(ref, undefined));
     eq("a run that never claimed makes no request to release", ado.requests.length, 0);
+    fresh({ threads: [] });
+    eq("...and a claim with no summary to write into holds nothing", (await capture(() => claimRunLease(ref, NOW))).value.lease, undefined);
 
     // Taken over mid-review: this run's lease ran out, another run claimed the PR, and this
     // one is about to post. It must not — its comments would sit beside the other run's, and
     // whichever summary lands second overwrites the other's resume point.
     fresh({ threads: [withSummary()] });
-    await capture(() => claimRunLease(ref, NOW));
+    const outlived = (await capture(() => claimRunLease(ref, NOW))).value.lease;
     ado.state.threads[0]!.comments![0]!.content = setRunMarker(summaryBody, runMarker(NOW + 1, "deadbeef"));
     ado.reset();
     const late = await capture(() =>
-      publish(ref, { requirement: [], code: [finding({ fingerprint: "late0001" })] }, summaryInput(), known()),
+      publish(ref, { requirement: [], code: [finding({ fingerprint: "late0001" })] }, summaryInput(), { ...known(), ...(outlived ? { lease: outlived } : {}) }),
     );
     eq("a run taken over before it posted posts nothing", threadPosts().length + commentPatches().length, 0);
     check("...and says who took over, as a reason the review is incomplete", late.value.gaps.some((g) => g.includes("deadbeef") && g.includes("took this pull request over")), JSON.stringify(late.value.gaps));

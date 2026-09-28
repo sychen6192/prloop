@@ -305,12 +305,52 @@ export interface ChatResponse {
   // mid-output (a truncated completion, a timed-out CLI run) keeps what arrived so the
   // artifacts show it — the pair is still a failure, never an answer to parse.
   error?: string;
+  // What kind of failure `error` is. Retries, streaming fallback and truncation salvage decide
+  // on this, never on the message's wording, which is written for people and changes.
+  errorKind?: ModelErrorKind;
+  // The HTTP status of an "http" failure.
+  status?: number;
   // What the endpoint's `Retry-After` asked for on a 429/503, in ms. The retry layer waits
   // at least this long: without it the backoff guesses, and usually retries straight back
   // into the window the endpoint just told us was closed.
   retryAfterMs?: number;
 }
 
+/**
+ * Why a model call failed. Four of them are the model's answer being unusable — the same
+ * question would get the same answer, so they are never retried: truncated (cut at the token
+ * limit), reasoning-only (the budget went on thinking), empty, and not-json (a body that is not
+ * JSON at all). "http" is retried unless it is a 4xx other than 408 and 429: those are the
+ * request being refused. Everything else — the connection, the deadline, a stream that went silent or
+ * was cut, an error the API reported in-band, a CLI that could not start or died — may well
+ * succeed on a second attempt.
+ */
+export type ModelErrorKind =
+  | "truncated"
+  | "reasoning-only"
+  | "empty"
+  | "not-json"
+  | "http"
+  | "api"
+  | "transport"
+  | "timeout"
+  | "stalled"
+  | "stream-cut"
+  | "process";
+
+/** What a runner's calls cost: one logical call each, every attempt's usage added up. */
+export interface TokenTotals {
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+}
+
 export interface ModelRunner {
   chat(req: ChatRequest): Promise<ChatResponse>;
+  /**
+   * Everything this runner's calls have cost so far. The runner a review is given is that
+   * review's, so these are the run's totals; a test double may leave it out, and counts as
+   * having spent nothing.
+   */
+  tokens?(): TokenTotals;
 }

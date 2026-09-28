@@ -37,11 +37,12 @@ import { createRunDir, createSkipDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
 import { runStamp } from "./libs/stamp";
 import { toReplayBundle } from "./libs/replay";
-import { tokenTotals } from "./models/runner";
+import { tokensOf } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
 import type { AnchoredFinding, ModelRunner, PrRef, RequirementResult } from "./libs/types";
 import { harvestClosedThreads, postedFingerprintsOnPr, publish, type PublishResult } from "./publish/publish";
+import type { LeaseHandle } from "./publish/lease";
 import { renderReviewHtml } from "./publish/reviewhtml";
 import { reviewOutcome } from "./publish/status";
 
@@ -69,6 +70,8 @@ export interface ReviewRunOptions {
    * Defaults to reading the PR's threads; a local review has none.
    */
   posted?: () => Promise<ReadonlySet<string>>;
+  /** The run lease loop.ts took for this review, which publish() checks before writing. */
+  lease?: LeaseHandle;
   /**
    * A repository holding the commit under review, for a skeptic's second reading to
    * `git grep` (gates/lookup.ts). Defaults to PRR_WORKTREE_REPO, which the static gate has
@@ -702,14 +705,19 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       durationSec,
       runDir: run.dir,
     },
-    { unreviewed, incomplete, ...(staticResult.evidence ? { toolEvidence: staticResult.evidence } : {}) },
+    {
+      unreviewed,
+      incomplete,
+      ...(staticResult.evidence ? { toolEvidence: staticResult.evidence } : {}),
+      ...(opts.lease ? { lease: opts.lease } : {}),
+    },
   ));
   // The publish-side half, produced once by publish() rather than read back off its result
   // here. Appending after the coverage gaps reorders the list against older runs: when the
   // only two reasons are a coverage gap and a refused comment, the first-named reason — and
   // so the status description's headline — is now the coverage gap.
   incomplete.push(...publishResult.gaps);
-  const tokens = tokenTotals();
+  const tokens = tokensOf(opts.runner);
   log(`model usage: ${tokens.calls} calls, ${tokens.promptTokens} in / ${tokens.completionTokens} out tokens`);
   run.saveJson("publish.json", {
     summaryThreadId: publishResult.summaryThreadId,
