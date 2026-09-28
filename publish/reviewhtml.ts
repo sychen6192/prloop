@@ -48,6 +48,8 @@ const WHY_NOT_POSTED: Record<string, string> = {
   cap: "over the per-run comment cap",
   "no-corroboration": "single model, unverified",
   dismissed: "matches a finding a reviewer previously dismissed",
+  "pre-existing": "on lines this change did not touch",
+  silenced: "the line carries a suppression marker",
 };
 
 const FAILURE_LABEL: Record<string, string> = {
@@ -109,7 +111,12 @@ function verdictLine(f: AnchoredFinding): string {
         : `cleared by ${f.skepticVerdicts} verifiers`,
     );
   }
-  if (f.suppressedBy) bits.push(`not commented: ${WHY_NOT_POSTED[f.suppressedBy] ?? f.suppressedBy}`);
+  if (f.suppressedBy) {
+    bits.push(
+      `not commented: ${WHY_NOT_POSTED[f.suppressedBy] ?? f.suppressedBy}` +
+        (f.suppressedBy === "silenced" && f.silencedBy ? ` (${f.silencedBy})` : ""),
+    );
+  }
   return bits.join(" · ");
 }
 

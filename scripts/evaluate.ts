@@ -43,6 +43,8 @@ import { stampLabel, type RunStamp } from "../libs/stamp";
 export const STAGES = [
   "inline",
   "cap",
+  "pre-existing",
+  "silenced",
   "severity",
   "no-corroboration",
   "dismissed",
@@ -56,6 +58,8 @@ export type Stage = (typeof STAGES)[number];
 export const STAGE_FIX: Record<Stage, string> = {
   inline: "reported on the line",
   cap: "cut by PRR_MAX_INLINE_COMMENTS",
+  "pre-existing": "on lines the change did not touch — the summary's pre-existing list",
+  silenced: "the line carries a suppression marker — libs/suppression.ts",
   severity: "below PRR_MIN_INLINE_SEVERITY",
   "no-corroboration": "one finder only — add a finder, or a skeptic to clear it",
   dismissed: "a human dismissed this finding before; the golden entry may be wrong",
@@ -148,6 +152,8 @@ function overlaps(f: EvaluatedFinding, r: Region): boolean {
 /** The stage each publish gate's suppression files a finding under. */
 export const SUPPRESSION_RANK: Record<string, Stage> = {
   cap: "cap",
+  "pre-existing": "pre-existing",
+  silenced: "silenced",
   severity: "severity",
   "no-corroboration": "no-corroboration",
   dismissed: "dismissed",
@@ -221,7 +227,9 @@ export function evaluateRun(golden: GoldenSet, run: RunArtifacts): RunEvaluation
     else unattributed.push(f);
   }
 
-  const reached = new Set<Stage>(["inline", "cap", "severity", "no-corroboration", "dismissed", "refuted"]);
+  // Every stage above the two that mean nothing was located, read off the ladder: a list
+  // kept by hand here missed the stages added to it later.
+  const reached = new Set<Stage>(STAGES.slice(0, STAGES.indexOf("anchor-failed")));
   return {
     ...(run.stamp === undefined ? {} : { stamp: run.stamp }),
     outcomes,

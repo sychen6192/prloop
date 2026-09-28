@@ -250,8 +250,15 @@ export interface AnchoredFinding extends RawFinding {
   // open: refusing it would delete findings on a single-family deployment, which is most
   // of them), but the reader is told the check was weaker than it looks.
   skepticSameFamily?: boolean;
+  // Model findings only, set when they are anchored. The anchored lines touch nothing this
+  // change added or removed: finalize files the finding as pre-existing rather than posting it
+  // on a line the author did not write.
+  untouched?: boolean;
+  // Model findings only: the suppression marker on or just above the anchored lines, by name
+  // (`# noqa`, `eslint-disable`, libs/suppression.ts) — a check the author already silenced.
+  silencedBy?: string;
   // Why this finding did not reach an inline comment, when it didn't.
-  suppressedBy?: "severity" | "cap" | "no-corroboration" | "dismissed";
+  suppressedBy?: "severity" | "cap" | "no-corroboration" | "dismissed" | "pre-existing" | "silenced";
 }
 
 // --- Model runner (the interface that keeps the core free of SDK imports) ---

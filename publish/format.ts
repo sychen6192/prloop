@@ -40,6 +40,13 @@ const SUPPRESSED_LABEL: Record<string, string> = {
   dismissed: "matches a finding a reviewer previously dismissed (wontFix/byDesign)",
 };
 
+function whyNotCommented(f: AnchoredFinding): string {
+  if (f.suppressedBy === "silenced") {
+    return `the line carries \`${f.silencedBy ?? "a suppression marker"}\`, a check its author already silenced there`;
+  }
+  return SUPPRESSED_LABEL[f.suppressedBy ?? ""] ?? "below the reporting threshold";
+}
+
 // Enough to see what broke and where; the rest is one file away in the run directory.
 const BROKE_SHOWN = 20;
 
@@ -98,6 +105,10 @@ export function renderFindingComment(f: AnchoredFinding, span?: SpanMark): strin
   if (f.overlapping?.length) {
     bits.push(`${f.overlapping.join(", ")} flagged these lines with a different claim (not counted as corroboration)`);
   }
+  // Only a critical finding is posted from either lane (gates/aggregate.ts, laneOf), and its
+  // reader should know why a comment sits where it does.
+  if (f.untouched && !toolOf(f)) bits.push("on lines this change did not touch - it may predate the change");
+  if (f.silencedBy && !toolOf(f)) bits.push(`posted although the line carries ${f.silencedBy}, as it is critical`);
   if (f.skepticVerdicts) {
     // The qualifiers are the point. "Passed verification" reads as a stronger check than it
     // is when the verifier is the finder's own model family (shared blind spots), or when
@@ -321,12 +332,26 @@ export function renderSummary(input: SummaryInput): string {
   // worth reading. But "no issues found" is a claim about code somebody read, and a change
   // with none in it must not make it.
   const nothingFound = agg.inline.length === 0 && agg.belowBar.length === 0 && agg.degraded.length === 0;
+  const preExisting = agg.belowBar.filter((f) => f.suppressedBy === "pre-existing");
+  const notCommented = agg.belowBar.filter((f) => f.suppressedBy !== "pre-existing");
+  // A laned finding a live thread already carries (publish.ts): no comment from this run, one
+  // from an earlier run, which the reader should not be told does not exist.
+  const already = new Set((input.alreadyPosted ?? []).map((f) => f.fingerprint));
+  const earlier = (f: AnchoredFinding) =>
+    (f.suppressedBy === "pre-existing" || f.suppressedBy === "silenced") && already.has(f.fingerprint)
+      ? " _(commented by an earlier run)_"
+      : "";
   if (nothingFound && ctx.files.length === 0) {
     lines.push("_No code in this change for the code check to review._", "");
   } else if (nothingFound) {
     lines.push("✅ **No issues found.**", "");
   } else if (agg.inline.length === 0) {
-    lines.push("✅ **No issues above the reporting threshold.**", "");
+    lines.push(
+      preExisting.length > 0
+        ? "✅ **No issues on the changed lines above the reporting threshold.**"
+        : "✅ **No issues above the reporting threshold.**",
+      "",
+    );
   } else {
     lines.push(postingClaim(input, agg.inline), "");
     const bySeverity = new Map<string, number>();
@@ -348,14 +373,33 @@ export function renderSummary(input: SummaryInput): string {
     lines.push("");
   }
 
-  if (agg.belowBar.length > 0) {
-    lines.push(detailsOpen(`Other findings, not commented (${agg.belowBar.length})`), "");
-    for (const f of agg.belowBar) {
+  // Findings that earned a comment, on lines the change did not touch: most often code that
+  // was there before it, worth knowing about and not the author's to answer for in this PR. On
+  // an incremental run "the change" is the push, so the lines may be an earlier push's.
+  if (preExisting.length > 0) {
+    lines.push(
+      detailsOpen(
+        ctx.compareTo > 0
+          ? `On lines this push did not touch (${preExisting.length}) - earlier code, no new comments`
+          : `Pre-existing issues (${preExisting.length}) - on lines this change did not touch, no new comments`,
+      ),
+      "",
+    );
+    for (const f of preExisting) {
+      const loc = f.anchor ? `${f.file}:${f.anchor.startLine}` : f.file;
+      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}${earlier(f)}`);
+    }
+    lines.push("", "</details>", "");
+  }
+
+  if (notCommented.length > 0) {
+    lines.push(detailsOpen(`Other findings, not commented (${notCommented.length})`), "");
+    for (const f of notCommented) {
       const loc = f.anchor ? `${f.file}:${f.anchor.startLine}` : f.file;
       const overlap = f.overlapping?.length
         ? `; ${f.overlapping.join(", ")} flagged the same lines with a different claim`
         : "";
-      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}`, `  <sub>${SUPPRESSED_LABEL[f.suppressedBy ?? ""] ?? "below the reporting threshold"}${overlap}</sub>`);
+      lines.push(`- **${f.severity}** \`${loc}\` — ${f.claim}${earlier(f)}`, `  <sub>${whyNotCommented(f)}${overlap}</sub>`);
     }
     lines.push("", "</details>", "");
   }

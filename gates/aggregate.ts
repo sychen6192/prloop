@@ -13,7 +13,8 @@ import {
 import { anchorFinding } from "../anchoring/locate";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { log } from "../libs/log";
-import type { Anchor, AnchoredFinding, RawFinding } from "../libs/types";
+import { suppressionMarker } from "../libs/suppression";
+import type { Anchor, AnchoredFinding, FileDiff, RawFinding } from "../libs/types";
 import type { FinderOutput } from "./finder";
 
 export interface AggregateResult {
@@ -154,6 +155,41 @@ function noteOverlap(a: AnchoredFinding, b: AnchoredFinding): void {
   }
 }
 
+/**
+ * Whether an anchored span touches this change: a line the change added or removed on the
+ * span's side, or — on the new side — a line directly beside a removal nothing replaced. A pure
+ * removal has no line of its own in the new file, so a finding about it ("`x` can be null now
+ * that the check is gone") can only quote a neighbour, and that neighbour is where the change is.
+ */
+function touchesChange(fd: FileDiff, a: Anchor): boolean {
+  const changed = a.side === "right" ? fd.changedRightLines : fd.changedLeftLines;
+  for (let l = a.startLine; l <= a.endLine; l++) if (changed.has(l)) return true;
+  return a.side === "right" && removalNeighbours(fd).some((l) => l >= a.startLine && l <= a.endLine);
+}
+
+/** New-side lines directly above and below each run of removed lines with no `+` beside it. */
+function removalNeighbours(fd: FileDiff): number[] {
+  const out: number[] = [];
+  for (const h of fd.hunks) {
+    const body = h.body.split("\n");
+    let right = h.rightStart;
+    for (let i = 0; i < body.length; i++) {
+      if (!body[i]!.startsWith("-")) {
+        if (body[i]!.startsWith(" ") || body[i]!.startsWith("+")) right++;
+        continue;
+      }
+      let j = i;
+      while (body[j + 1]?.startsWith("-")) j++;
+      if (!body[i - 1]?.startsWith("+") && !body[j + 1]?.startsWith("+")) {
+        if (right > 1) out.push(right - 1);
+        out.push(right);
+      }
+      i = j;
+    }
+  }
+  return out;
+}
+
 export interface AnchoredCandidates {
   // Anchored and deduped, ranked, but not yet verified or filtered.
   merged: AnchoredFinding[];
@@ -236,6 +272,18 @@ export function anchorAndDedupe(outputs: FinderOutput[], index: FileIndex): Anch
   const degraded = dedupe(anchoredAll.filter((f) => !f.anchor));
   const all = [...merged, ...degraded];
 
+  // What finalize needs to file a finding in one of its two lanes, read here where the file
+  // is at hand: whether the anchored lines touch the change at all, and whether they carry a
+  // marker silencing a check. Markers are read on the new side only — one on a line the change
+  // removed silenced nothing that is still there.
+  for (const f of merged) {
+    const fd = index.exact(f.file);
+    if (!fd || !f.anchor) continue;
+    if (!touchesChange(fd, f.anchor)) f.untouched = true;
+    const marker = f.anchor.side === "right" ? suppressionMarker(fd.rightLines, f.anchor.startLine, f.anchor.endLine) : undefined;
+    if (marker) f.silencedBy = marker;
+  }
+
   // Rank: severity, then how many models independently found it, then confidence.
   merged.sort((a, b) => {
     const s = severityRank(a.severity) - severityRank(b.severity);
@@ -284,6 +332,9 @@ export function mergeToolFindings(survivors: AnchoredFinding[], tools: AnchoredF
       mergeInto(hit, t);
       // A tool's sighting counts as an active clearing, like it does standalone.
       hit.skepticVerdicts = Math.max(hit.skepticVerdicts ?? 0, t.skepticVerdicts ?? 0);
+      // A tool that reports the line in spite of its marker shows the marker is not about
+      // this: `# noqa: E501` silences ruff's line length, not the type error mypy found there.
+      delete hit.silencedBy;
     } else {
       out.push(t);
     }
@@ -292,12 +343,32 @@ export function mergeToolFindings(survivors: AnchoredFinding[], tools: AnchoredF
 }
 
 /**
+ * The lane a finding that earned a comment goes to instead, if any. A suppression marker is
+ * the author's decision about the line, and Anthropic's review plugin counts findings the code
+ * explicitly silences among its false positives; a finding on lines the change did not touch
+ * is most often about code that was there before it — AutoCommenter drops comments on
+ * unchanged lines, Claude Code Review tags them pre-existing. A marker silences a tool's
+ * check, not every defect a line can hold, and a finding on an untouched line can still be one
+ * the change caused, so a critical finding is posted wherever it is: at that severity, a
+ * comment the author waves off costs less than a defect kept in a summary list. Tool findings
+ * never enter a lane — a tool reads its own markers, and the static gate keeps changed lines
+ * only.
+ */
+function laneOf(f: AnchoredFinding): "silenced" | "pre-existing" | undefined {
+  if (f.tier !== undefined || f.severity === "critical") return undefined;
+  if (f.silencedBy) return "silenced";
+  if (f.untouched) return "pre-existing";
+  return undefined;
+}
+
+/**
  * Phase 2: decide what actually gets published.
  *
- * Corroboration first, then severity, then the cap. A finding that only one model raised and
- * that no skeptic examined is not published inline — with weak models, an unverified single
- * opinion is the main source of false positives. It still appears in the summary, so nothing
- * is silently dropped.
+ * Corroboration first, then severity, then the two lanes, then the cap. A finding that only
+ * one model raised and that no skeptic examined is not published inline — with weak models, an
+ * unverified single opinion is the main source of false positives. It still appears in the
+ * summary, so nothing is silently dropped. The lanes come after the gates that judge a finding,
+ * so the summary's pre-existing list holds only findings that earned a comment.
  */
 export function finalize(
   candidates: AnchoredCandidates,
@@ -351,8 +422,14 @@ export function finalize(
   const belowSeverity = corroborated.filter((f) => severityRank(f.severity) > minRank);
   for (const f of belowSeverity) f.suppressedBy = "severity";
 
-  const inline = eligible.slice(0, MAX_INLINE_COMMENTS);
-  const overCap = eligible.slice(MAX_INLINE_COMMENTS);
+  const silenced = eligible.filter((f) => laneOf(f) === "silenced");
+  const preExisting = eligible.filter((f) => laneOf(f) === "pre-existing");
+  const postable = eligible.filter((f) => laneOf(f) === undefined);
+  for (const f of silenced) f.suppressedBy = "silenced";
+  for (const f of preExisting) f.suppressedBy = "pre-existing";
+
+  const inline = postable.slice(0, MAX_INLINE_COMMENTS);
+  const overCap = postable.slice(MAX_INLINE_COMMENTS);
   for (const f of overCap) f.suppressedBy = "cap";
 
   log(
@@ -360,7 +437,9 @@ export function finalize(
       (uncorroborated.length > 0 ? ` (${uncorroborated.length} lack corroboration, summary only)` : "") +
       (previouslyDismissed.length > 0
         ? ` (${previouslyDismissed.length} match findings a reviewer dismissed, suppressed)`
-        : ""),
+        : "") +
+      (preExisting.length > 0 ? ` (${preExisting.length} on lines the change did not touch, listed as pre-existing)` : "") +
+      (silenced.length > 0 ? ` (${silenced.length} on lines carrying a suppression marker, summary only)` : ""),
   );
   // Distinguish "one model said it and a verifier disagreed or never ran" from "one model
   // said it and no verifier was configured". They look identical in the counts above, and
@@ -387,7 +466,7 @@ export function finalize(
 
   return {
     inline,
-    belowBar: [...previouslyDismissed, ...uncorroborated, ...belowSeverity, ...overCap],
+    belowBar: [...previouslyDismissed, ...uncorroborated, ...belowSeverity, ...overCap, ...silenced, ...preExisting],
     degraded: candidates.degraded,
     stats: {
       raw: candidates.rawCount,

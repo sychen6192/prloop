@@ -37,7 +37,9 @@ Output rules (violations cause the finding to be discarded by the system):
    prefixed \`+\` or unprefixed in the diff. Use "left" ONLY when your quote is a line this
    change DELETED (prefixed \`-\`). If in doubt, use "right".
 5. Only raise issues about this change (code that appears in the diff). Do not raise
-   pre-existing issues unrelated to this change.
+   pre-existing issues unrelated to this change. When this change makes an existing line
+   wrong, quote the changed line that does it: a finding whose quote covers only lines this
+   change did not touch is listed as possibly pre-existing, not commented on the line.
 6. "claim" states the defect in one sentence; "evidence" explains why it is a real problem
    (how it breaks, under what conditions).
 7. "suggested_fix" is the corrected code, ready to paste in place of the quote — it is

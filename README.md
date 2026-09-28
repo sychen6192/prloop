@@ -120,6 +120,18 @@ want (`PRR_EXCLUDE_CATEGORIES`) and findings a reviewer already closed as *wontF
 reach the skeptic. A human's decision outranks every gate above — corroboration cannot
 re-open what a reviewer closed.
 
+Two last lanes are positional and need no model. A finding whose quoted lines hold nothing
+the change added or removed is most often about code that was there before it — AutoCommenter
+drops such comments, Claude Code Review tags them pre-existing — so it is listed in the summary
+under *Pre-existing issues* rather than commented, and it does not fail the PR. A finding on a
+line carrying a suppression marker (`# noqa`, `eslint-disable`, `@SuppressWarnings`, `NOSONAR`,
+`# nosec`, `//nolint`, `# type: ignore` and their kin, on the line or just above it) argues with
+a decision the author already made, so it is listed with the marker named. Both come after
+corroboration and severity, so they list only findings that earned a comment. A marker
+silences a tool's check, not every defect a line can hold, and a finding on an untouched line
+can still be one the change caused, so a **critical** finding is posted from either lane, with
+a line saying why it sits where it does.
+
 Three deliberate asymmetries:
 
 | Stage | Asymmetry | Why |
@@ -385,6 +397,10 @@ no model endpoint at all.
   often prloop is wrong, and only the reason says in what way. It is a reviewer's free text,
   so it is flattened, capped and redacted on the way into the store, and it reaches no prompt:
   nothing under `prompts/` can read that store at all, and the selftest pins it.
+- **Old code gets a list, not comments.** Findings on lines the change did not touch go in the
+  summary's *Pre-existing issues* section (*On lines this push did not touch* on an incremental
+  run), never inline unless critical, and do not fail the status; one an earlier run already
+  commented on is marked as such.
 - **Clean PR → one quiet line.** Style and formatting never get a comment; that's the linter's job.
 
 Every run writes `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`: the settings the run
@@ -672,9 +688,9 @@ against them:
 ```
 
 The output is not one recall number, because a miss is not one event. Each defect is filed
-under the furthest stage it reached — `inline`, `cap`, `severity`, `no-corroboration`,
-`dismissed`, `refuted`, `anchor-failed`, `not-found` — and each of those names a different
-file to open. A defect nothing mentioned is a finder-prompt or model problem; one whose quote
+under the furthest stage it reached — `inline`, `cap`, `pre-existing`, `silenced`, `severity`,
+`no-corroboration`, `dismissed`, `refuted`, `anchor-failed`, `not-found` — and each of those
+names a different file to open. A defect nothing mentioned is a finder-prompt or model problem; one whose quote
 would not anchor is `anchoring/locate.ts`; one the skeptic killed is verification; one held
 back for want of a second finder is the corroboration gate. "Recall 60%" hides which.
 

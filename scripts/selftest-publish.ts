@@ -191,6 +191,41 @@ try {
     check("...and that one is the summary", contentOf(threadPosts()[0]!).includes(SUMMARY_MARKER));
   }
 
+  section("a lane holds back new comments, never the ones already on the PR");
+  {
+    // Filed as pre-existing, so not posted. The one an earlier run commented on — in the push
+    // that wrote the line, typically — is still reported as commented, not as never commented.
+    const carried = finding({ fingerprint: "dddd4444", claim: "Retry loop swallows the error.", suppressedBy: "pre-existing", untouched: true });
+    const fresh = finding({
+      fingerprint: "eeee5555",
+      claim: "Old helper leaks a handle.",
+      suppressedBy: "pre-existing",
+      untouched: true,
+      anchor: { side: "right", startLine: 20, endLine: 20, startOffset: 1, endOffset: 8 },
+    });
+    setState({
+      threads: [
+        {
+          id: 4300,
+          status: "active",
+          comments: [ourComment(95, "Retry loop swallows the error.", "dddd4444", "correctness")],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 11 }, rightFileEnd: { line: 11 } },
+        },
+      ],
+    });
+    const agg = { ...summaryInput().agg, belowBar: [carried, fresh] };
+    const { value: result } = await capture(() => publish(ref, { requirement: [], code: [] }, summaryInput({ agg })));
+    eq("the laned finding an earlier run commented on is reported as already commented", result.alreadyPosted.map((f) => f.fingerprint), ["dddd4444"]);
+    eq("...and nothing is posted for either", result.posted.length, 0);
+    eq("...so the only thread POST is the summary", threadPosts().length, 1);
+    const summary = contentOf(threadPosts()[0]!);
+    check("the summary lists both as pre-existing", summary.includes("Pre-existing issues (2) - on lines this change did not touch, no new comments"), summary);
+    check("...the one with a comment says so", summary.includes("Retry loop swallows the error. _(commented by an earlier run)_"), summary);
+    check("...the other does not", summary.includes("Old helper leaks a handle.\n"), summary);
+    // Code that was there before the change is not the change's to block on.
+    eq("a high finding on untouched lines does not fail the PR", statusOf(statusPosts()[0]), "succeeded");
+  }
+
   section("position dedupe is scoped to one axis: the two axes must not delete each other");
   {
     // Models do not reproduce a quote byte-for-byte across runs, so a rephrased finding on

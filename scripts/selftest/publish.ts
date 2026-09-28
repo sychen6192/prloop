@@ -195,6 +195,49 @@ section("publish honesty: the summary reports what actually reached the PR");
   check("...and still reports what it found", noPosting.includes("Found **3** issues worth attention"));
 }
 
+section("the lanes in the summary: pre-existing issues, and lines a marker silenced");
+{
+  const mk = (over: Partial<AnchoredFinding>): AnchoredFinding => ({
+    category: "correctness", severity: "high", confidence: 0.8, file: "src/a.ts", quote: "x();",
+    claim: "c", sources: ["m1", "m2"], fingerprint: `fp-${over.claim ?? "c"}`,
+    anchor: { side: "right", startLine: 3, endLine: 3, startOffset: 1, endOffset: 5 },
+    ...over,
+  });
+  const ctxOf = (compareTo: number) =>
+    ({
+      ref: { baseUrl: "https://dev.azure.com/o", org: "o", project: "p", repoId: "r", prId: 1 },
+      pr: { title: "t", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" },
+      iterations: [],
+      iteration: { id: 2, sourceRefCommit: "", targetRefCommit: "", commonRefCommit: "", createdDate: "" },
+      compareTo, files: [], skipped: [], changeTrackingIds: new Map(),
+    }) as unknown as Parameters<typeof renderSummary>[0]["ctx"];
+  const old = mk({ claim: "Old loop swallows errors.", suppressedBy: "pre-existing", untouched: true });
+  const quiet = mk({ claim: "Broad except hides the failure.", suppressedBy: "silenced", silencedBy: "# noqa" });
+  const summaryOf = (compareTo: number) =>
+    renderSummary({
+      ctx: ctxOf(compareTo),
+      agg: { inline: [], belowBar: [quiet, old], degraded: [], stats: { raw: 2, afterDedupe: 2, anchored: 2, survived: 2, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 } },
+      finderErrors: [], omittedFiles: [], appliedRules: [], durationSec: 1, runDir: "",
+    });
+  const full = summaryOf(0);
+  check("a full review lists pre-existing issues in their own section", full.includes("Pre-existing issues (1) - on lines this change did not touch, no new comments"), full);
+  check("...with the finding", full.includes("`src/a.ts:3` — Old loop swallows errors."), full);
+  const preSection = full.slice(full.indexOf("Pre-existing issues"), full.indexOf("</details>", full.indexOf("Pre-existing issues")));
+  check("...and only that one: a silenced finding is not pre-existing", !preSection.includes("Broad except"), preSection);
+  check("the headline does not say nothing was found", full.includes("No issues on the changed lines above the reporting threshold."), full);
+  check("the silenced finding names its marker", full.includes("the line carries `# noqa`, a check its author already silenced there"), full);
+  const incremental = summaryOf(1);
+  check("an incremental review says the lines are earlier code, not pre-existing", incremental.includes("On lines this push did not touch (1) - earlier code, no new comments") && !incremental.includes("Pre-existing issues"), incremental);
+
+  // Only a critical finding is posted from a lane, and its comment says why it sits there.
+  const posted = renderFindingComment(mk({ severity: "critical", untouched: true }));
+  check("a critical finding on untouched lines says so on the comment", posted.includes("on lines this change did not touch - it may predate the change"), posted);
+  const pastMarker = renderFindingComment(mk({ severity: "critical", silencedBy: "@SuppressWarnings" }));
+  check("...and one past a marker, why it was posted anyway", pastMarker.includes("posted although the line carries @SuppressWarnings, as it is critical"), pastMarker);
+  const plain = renderFindingComment(mk({}));
+  check("an ordinary comment carries neither", !plain.includes("did not touch") && !plain.includes("posted although"), plain);
+}
+
 section("position dedupe stays inside one axis");
 {
   // The one place the "two blind axes, separate budgets" invariant leaked: a requirement

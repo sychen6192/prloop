@@ -426,6 +426,14 @@ try {
     check("...with its own claim", contentOf(posted[0] ?? {}).includes("fractional cents"), contentOf(posted[0] ?? {}));
     eq("the finding both runs made is not posted again", ado.state.threads.length - threadsBefore, 1);
     eq("...and is reported as already commented", result.publishResult?.alreadyPosted.map((f) => f.anchor?.startLine), [5]);
+    // Line 5 is push 1's code and push 2 left it alone: a new finding there would have been
+    // listed rather than commented, and this one, commented by push 1, is said to be.
+    eq("...filed as on lines this push did not touch", result.agg.belowBar.find((f) => f.claim.includes("ends the retry loop"))?.suppressedBy, "pre-existing");
+    check(
+      "...and listed so, with the comment an earlier run left",
+      /On lines this push did not touch \(1\)[\s\S]*ends the retry loop[^\n]*_\(commented by an earlier run\)_/.test(summaryOf()),
+      summaryOf(),
+    );
 
     // Push 2 fixed the refund bug. The comment records the code it was about, and that code
     // is gone; the retry comment's code is still there, one push later and unchanged.
@@ -672,7 +680,8 @@ try {
       const bench = (...args: string[]) => script("bench.ts", args);
 
       const ran = await bench("run", located, out, "--repeat", "2", "--repos", repos);
-      check("bench run reviews the case twice", ran.code === 0 && ran.out.includes("run 2/2: 2 inline comments"), ran.out.slice(-1500));
+      // One comment a run: the finding on the retry loop is on code the branch did not touch.
+      check("bench run reviews the case twice", ran.code === 0 && ran.out.includes("run 2/2: 1 inline comment ("), ran.out.slice(-1500));
       eq("...with both finders each time", stageCalls("findings").length, 4);
       const pinned = JSON.parse(fs.readFileSync(located, "utf8")) as { cases: Array<{ base: string; head: string; resolvedBy?: string }> };
       eq("the suite is pinned to the commits reviewed", [pinned.cases[0]?.base, pinned.cases[0]?.head, pinned.cases[0]?.resolvedBy], [main, feature, "base from the dataset"]);
@@ -682,7 +691,7 @@ try {
       const byLine = await bench("score", located, out);
       check("score, by location", byLine.code === 0 && byLine.out.includes("Recall, on the reference's lines (±1): 33.3% of 3 references"), byLine.out.slice(-2500));
       check("...per run and in any run", byLine.out.includes("(run 1 33.3%, run 2 33.3%; hit in any run 33.3%)"), byLine.out.slice(-2500));
-      check("...precision over the inline comments", byLine.out.includes("Precision: 50.0% of 4 inline comments"), byLine.out.slice(-2500));
+      check("...precision over the inline comments", byLine.out.includes("Precision: 100.0% of 2 inline comments"), byLine.out.slice(-2500));
       check("...and the noise the repeat measured", byLine.out.includes("Noise: one run's recall moves by ±0.0 pt"), byLine.out.slice(-2500));
       check("a reference on deleted lines is named, not silently unreachable", byLine.out.includes("1 reference is on deleted lines"), byLine.out.slice(-2500));
       const score = JSON.parse(fs.readFileSync(path.join(out, "score.json"), "utf8")) as {

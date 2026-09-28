@@ -252,6 +252,22 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- **Two kinds of finding no longer become new comments: one on lines the change did not touch,
+  and one on a line whose author silenced a check.** A finding whose quoted lines hold nothing
+  the change added or removed — or, for a removal, the line on either side of it — is listed
+  in the summary under *Pre-existing issues* (on an incremental run, *On lines this push did not
+  touch*) instead of commented, and it no longer fails the PR status: a high-severity problem in
+  code that was already there stops blocking a change that did not write it. A finding on a line
+  carrying `# noqa`, `eslint-disable`, `@SuppressWarnings`, `NOSONAR`, `# nosec`, `//nolint`,
+  `# type: ignore`, `@ts-ignore` or one of their kin (`libs/suppression.ts`), on the line or on
+  the comment and annotation lines just above it, is listed under *Other findings* with the
+  marker named. Both lanes come after corroboration and the severity bar, so they list only
+  findings that earned a comment, and both let a **critical** finding through, posted with a
+  line saying why it sits where it does. Tool findings never enter a lane. A finding an
+  earlier run already commented on is reported as commented, not as new. The finder is told
+  to quote the changed line when the change is what makes an old line wrong.
+  `scripts/evaluate.ts` and `scripts/bench.ts` file such findings under the new stages
+  `pre-existing` and `silenced`.
 - **A static-analysis comment closes only on the tool's evidence.** It used to close like a
   model's, when the code under it changed — which is the right test for a finding nothing
   re-checks, and the wrong one for a tool that re-runs every time. It now closes only when

@@ -23,6 +23,10 @@ import { calibrate } from "../calibrate";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { MAX_INLINE_COMMENTS } from "../../config";
+import { buildHunks, diffLines } from "../../libs/diff";
+import { suppressionMarker } from "../../libs/suppression";
+import type { FileDiff } from "../../libs/types";
 import { check, eq, section } from "./harness";
 import { mkFile, mkFinding } from "./fixtures";
 
@@ -378,4 +382,132 @@ section("aggregate: a disagreeing source lends neither its fix nor its evidence"
   );
   eq("an agreeing source still fills a missing fix", agree.merged[0]?.suggested_fix, "counter.incrementAndGet();");
   eq("...and missing evidence", agree.merged[0]?.evidence, "two callers interleave");
+}
+
+section("suppression markers: on the line, or on the comment lines just above it");
+{
+  const at = (lines: string[], line: number, end = line) => suppressionMarker(lines, line, end);
+  eq("a marker after the code on the line", at(["const x: any = y; // eslint-disable-line"], 1), "eslint-disable");
+  eq("# noqa, in either case", at(["import os  # NOQA: F401"], 1), "# noqa");
+  eq("a marker line above, written for the line below", at(["// eslint-disable-next-line no-explicit-any", "const x: any = y;"], 2), "eslint-disable");
+  eq("an annotation above, through a stack of them", at(['@SuppressWarnings("unchecked")', "@Override", "public List<T> items() {"], 3), "@SuppressWarnings");
+  eq("a C# attribute above", at(['[SuppressMessage("Design", "CA1031")]', "catch (Exception) { }"], 2), "SuppressMessage");
+  eq("@ts-ignore above", at(["// @ts-ignore", "foo.bar = 1;"], 2), "@ts-ignore");
+  eq("Go's //nolint", at(["x, _ := f() //nolint:errcheck"], 1), "//nolint");
+  eq("Rust's allow attribute", at(["#[allow(dead_code)]", "fn unused() {}"], 2), "#[allow]");
+  eq("a marker on any line of a longer span", at(["a = 1", "b = eval(s)  # nosec", "c = 3"], 1, 3), "# nosec");
+  eq("a marker after code on the line above is that line's own", at(["x = f()  # noqa: E501", "y = g()"], 2), undefined);
+  eq("a blank line ends the search", at(["// eslint-disable-next-line", "", "const x = y;"], 3), undefined);
+  eq("three comment lines up is within reach", at(["// NOSONAR", "// a", "// b", "run();"], 4), "NOSONAR");
+  eq("...four is not", at(["// NOSONAR", "// a", "// b", "// c", "run();"], 5), undefined);
+  eq("a name that merely contains one is not a marker", at(["const nolinter = noqaSetting;"], 1), undefined);
+  eq("a line starting with a dereference is code, not a comment", at(["*p = 1; // NOLINT", "q();"], 2), undefined);
+  eq("a clean line has none", at(["return total / parts;"], 1), undefined);
+}
+
+section("lanes: lines the change did not touch, and a check the author silenced");
+{
+  // Line 4 is the change; everything else was there before it.
+  const lines = ["const a = load();", "const b = a.x;", "// eslint-disable-next-line", "const c: any = b;", "save(c);"];
+  const file = mkFile("/src/lanes.ts", lines, [4]);
+  const out = (quote: string, over: Partial<RawFinding> = {}): FinderOutput => ({
+    model: "m1",
+    findings: [mkFinding({ file: "/src/lanes.ts", quote, category: "correctness", claim: `about ${quote}`, ...over })],
+    rejected: 0,
+    raw: "",
+  });
+  const c = anchorAndDedupe([out("const b = a.x;"), out("const c: any = b;"), out("save(c);")], new FileIndex([file]));
+  const by = (q: string) => c.merged.find((f) => f.quote === q);
+  eq("a finding on an unchanged line is marked untouched", by("const b = a.x;")?.untouched, true);
+  eq("...one on the changed line is not", by("const c: any = b;")?.untouched, undefined);
+  eq("...and the marker above the changed line is named", by("const c: any = b;")?.silencedBy, "eslint-disable");
+  eq("...but not for the line after it", by("save(c);")?.silencedBy, undefined);
+
+  // A pure removal leaves no line of its own in the new file: the lines on either side of it
+  // are where a finding about it can point.
+  const left = ["function f(x) {", "  if (x == null) return;", "  x.go();", "  done();", "}"];
+  const right = ["function f(x) {", "  x.go();", "  done();", "}"];
+  const removed: FileDiff = {
+    path: "src/f.js", changeType: "edit", rightLines: right, leftLines: left,
+    ...buildHunks(left, right, diffLines(left, right)),
+    binary: false, truncated: false, language: "javascript",
+  };
+  const r = anchorAndDedupe(
+    [{ model: "m1", rejected: 0, raw: "", findings: [
+      mkFinding({ file: "src/f.js", quote: "  x.go();", claim: "x can be null now that the check is gone" }),
+      mkFinding({ file: "src/f.js", quote: "  done();", claim: "done() runs twice" }),
+    ] }],
+    new FileIndex([removed]),
+  );
+  eq("the line below a removal counts as the change", r.merged.find((f) => f.quote === "  x.go();")?.untouched, undefined);
+  eq("...the line after that does not", r.merged.find((f) => f.quote === "  done();")?.untouched, true);
+  const swapLeft = ["a();", "b();", "c();"];
+  const swapRight = ["a();", "B();", "c();"];
+  const swapped: FileDiff = {
+    path: "src/g.js", changeType: "edit", rightLines: swapRight, leftLines: swapLeft,
+    ...buildHunks(swapLeft, swapRight, diffLines(swapLeft, swapRight)),
+    binary: false, truncated: false, language: "javascript",
+  };
+  const s2 = anchorAndDedupe([{ model: "m1", rejected: 0, raw: "", findings: [mkFinding({ file: "src/g.js", quote: "a();" })] }], new FileIndex([swapped]));
+  eq("a replaced line has its own new line, so its neighbours stay untouched", s2.merged[0]?.untouched, true);
+
+  // A marker on a line the change removed silences nothing that is still there.
+  const gone: FileDiff = {
+    path: "src/h.py", changeType: "edit", rightLines: ["y = 2"], leftLines: ["x = f()  # noqa", "y = 2"],
+    ...buildHunks(["x = f()  # noqa", "y = 2"], ["y = 2"], diffLines(["x = f()  # noqa", "y = 2"], ["y = 2"])),
+    binary: false, truncated: false, language: "python",
+  };
+  const g = anchorAndDedupe([{ model: "m1", rejected: 0, raw: "", findings: [mkFinding({ file: "src/h.py", quote: "x = f()  # noqa", side: "left" })] }], new FileIndex([gone]));
+  eq("a left-side finding is on the change", g.merged[0]?.untouched, undefined);
+  eq("...and its removed marker silences nothing", g.merged[0]?.silencedBy, undefined);
+
+  const mk = (over: Partial<AnchoredFinding>): AnchoredFinding => ({
+    category: "correctness", severity: "high", confidence: 0.8, file: "src/a.ts", quote: "x();", claim: "c",
+    sources: ["m1", "m2"], fingerprint: `fp${Math.random()}`,
+    anchor: { side: "right", startLine: 2, endLine: 2, startOffset: 1, endOffset: 5 },
+    ...over,
+  });
+  const empty = { merged: [], degraded: [], rawCount: 0, byFailure: {}, excluded: 0 };
+  const res = finalize(empty, [
+    mk({ claim: "old code", untouched: true }),
+    mk({ claim: "silenced", silencedBy: "# noqa" }),
+    mk({ claim: "both", untouched: true, silencedBy: "# noqa" }),
+    mk({ claim: "critical old code", severity: "critical", untouched: true }),
+    mk({ claim: "critical silenced", severity: "critical", silencedBy: "# noqa" }),
+    mk({ claim: "low old code", severity: "low", untouched: true }),
+    mk({ claim: "unverified old code", sources: ["m1"], untouched: true }),
+    // A tool's sighting is its own clearing, as triageAndConvert records it.
+    mk({ claim: "tool", tier: "fact", sources: ["tsc"], skepticVerdicts: 1, untouched: true, silencedBy: "# noqa" }),
+    mk({ claim: "new code" }),
+  ]);
+  const why = (claim: string) =>
+    res.inline.some((f) => f.claim === claim) ? "inline" : res.belowBar.find((f) => f.claim === claim)?.suppressedBy;
+  eq("a finding on untouched lines is listed as pre-existing", why("old code"), "pre-existing");
+  eq("a finding under a suppression marker is listed as silenced", why("silenced"), "silenced");
+  eq("...which outranks untouched: someone decided about that line", why("both"), "silenced");
+  eq("a critical finding is posted from untouched lines", why("critical old code"), "inline");
+  eq("...and past a marker", why("critical silenced"), "inline");
+  eq("severity is judged first: a low finding stays below the bar", why("low old code"), "severity");
+  eq("...and corroboration before that", why("unverified old code"), "no-corroboration");
+  eq("a tool finding never enters a lane", why("tool"), "inline");
+  eq("a finding on the change is posted", why("new code"), "inline");
+
+  // The lanes are not the cap: a laned finding takes no inline slot, and a critical one let
+  // through takes one like any other. Here the high "pre" would outrank every medium.
+  const full = finalize(empty, [
+    mk({ claim: "critical past a marker", severity: "critical", silencedBy: "# noqa" }),
+    mk({ claim: "pre", untouched: true }),
+    ...Array.from({ length: MAX_INLINE_COMMENTS }, (_, i) => mk({ claim: `n${i}`, severity: "medium" })),
+  ]);
+  eq("the cap fills with what is posted", full.inline.length, MAX_INLINE_COMMENTS);
+  eq("...the critical one first", full.inline[0]?.claim, "critical past a marker");
+  eq("...so only the overflow is capped: a laned finding took no slot", full.belowBar.filter((f) => f.suppressedBy === "cap").length, 1);
+  eq("...and the laned one is filed under its lane", full.belowBar.find((f) => f.claim === "pre")?.suppressedBy, "pre-existing");
+
+  // A tool that reports the line in spite of its marker shows the marker was about something else.
+  const model = mk({ claim: "x may be undefined here", sources: ["m1"], skepticVerdicts: 1, silencedBy: "# noqa" });
+  const tool = mk({ claim: "'x' is possibly undefined", sources: ["tsc"], tier: "fact" });
+  const merged = mergeToolFindings([model], [tool]);
+  eq("an agreeing tool merges in", merged.length, 1);
+  eq("...and lifts the marker's silence", merged[0]?.silencedBy, undefined);
 }

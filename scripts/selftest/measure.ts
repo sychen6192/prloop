@@ -318,6 +318,20 @@ section("golden-set evaluation: which stage lost the defect, not just that one w
   eq("a defect one finder found and another had refuted still counts as reported", both.outcomes[0]?.stage, "inline");
 
   // Paths come from a golden file a human typed; findings.json stores them canonically.
+  // The two lanes are publish gates like the cap: a defect filed there was found, and the
+  // stage says which rule held it back.
+  const laned = evaluateRun(
+    { defects: [{ file: "src/a.ts", lines: [10, 10], note: "old" }, { file: "src/a.ts", lines: [20, 20], note: "quiet" }] },
+    {
+      inline: [],
+      belowBar: [at("src/a.ts", 10, { suppressedBy: "pre-existing" }), at("src/a.ts", 20, { suppressedBy: "silenced" })],
+      degraded: [],
+      refuted: [],
+    },
+  );
+  eq("a defect on untouched lines is filed as pre-existing", laned.outcomes.map((o) => o.stage), ["pre-existing", "silenced"]);
+  eq("...and one under a marker as silenced, found but not commented", [laned.found, laned.hits], [2, 0]);
+
   const slashed = evaluateRun(
     { defects: [{ file: "/src/a.ts", lines: [10, 10], note: "x" }] },
     { inline: [at("src/a.ts", 10)], belowBar: [], degraded: [], refuted: [] },

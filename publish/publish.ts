@@ -391,6 +391,14 @@ export async function publish(
     }
   }
 
+  // A lane (gates/aggregate.ts, laneOf) decides where a NEW comment would go, and cannot
+  // unsay one an earlier run left — typically in the push that wrote the line, which this push
+  // did not touch. Such a finding is reported as already commented, never as not commented.
+  for (const f of summaryInput.agg.belowBar) {
+    if (f.suppressedBy !== "pre-existing" && f.suppressedBy !== "silenced") continue;
+    if (seen.has(f.fingerprint) || coveredByThread(f, positions)) result.alreadyPosted.push(f);
+  }
+
   if (result.alreadyPosted.length > 0) {
     log(`${result.alreadyPosted.length} findings already commented, skipped`);
   }
