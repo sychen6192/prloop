@@ -82,13 +82,13 @@ export interface LocalIntakeOptions {
 }
 
 export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise<ReviewContext> {
-  // Three-dot: compare against the merge base, which is what a PR diff actually shows.
-  const raw = await git(opts.repo, [
-    "diff",
-    "--name-status",
-    "--find-renames",
-    `${opts.base}...${opts.head}`,
-  ]);
+  // Everything is taken against the merge base, which is what a pull request's diff shows —
+  // the file list AND the left side of each file. The list was three-dot while the left side
+  // was read at the base branch's tip, so once that branch moved on after the fork, every
+  // change it made to a file the branch also touched was shown to the finders as the branch
+  // reverting it: `-` the base's new line, `+` the old one, in code the branch never touched.
+  const mergeBase = (await git(opts.repo, ["merge-base", opts.base, opts.head])).trim();
+  const raw = await git(opts.repo, ["diff", "--name-status", "--find-renames", mergeBase, opts.head]);
 
   const entries = raw
     .split("\n")
@@ -130,7 +130,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     // wholly new file.
     const [right, left] = await Promise.all([
       showFile(opts.repo, opts.head, e.path),
-      showFile(opts.repo, opts.base, e.originalPath ?? e.path),
+      showFile(opts.repo, mergeBase, e.originalPath ?? e.path),
     ]);
     const failure = "failure" in right ? right.failure : "failure" in left ? left.failure : undefined;
     if (failure !== undefined) {
@@ -190,7 +190,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     id: 1,
     sourceRefCommit: (await git(opts.repo, ["rev-parse", opts.head])).trim(),
     targetRefCommit: (await git(opts.repo, ["rev-parse", opts.base])).trim(),
-    commonRefCommit: (await git(opts.repo, ["merge-base", opts.base, opts.head])).trim(),
+    commonRefCommit: mergeBase,
     createdDate: "",
   };
   return {

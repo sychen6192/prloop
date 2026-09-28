@@ -240,6 +240,13 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **A local review no longer shows the base branch's later changes as the branch reverting
+  them.** `git/intake.ts` listed the changed files three-dot, against the merge base, but read
+  each file's left side at the base branch's tip. Once the base had moved on after the fork,
+  every line it changed in a file the branch also touched reached the finders as a `-`/`+` pair
+  the branch never wrote. The left side is now read at the merge base too, as a pull request's
+  diff is; it is what makes a benchmark's pull request, pinned to a base that moved on, review
+  the diff its references were written against.
 - **A PR in C#, Go, Rust, PHP, C++ or another language outside a nine-entry list is reviewed,
   not reported as reviewed.** Such a PR had "no reviewable code changes": no finder read it,
   the requirement axis was skipped along with them although it does not depend on language,

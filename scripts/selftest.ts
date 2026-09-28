@@ -3072,15 +3072,25 @@ section("local intake: the second provider at the ReviewContext seam, held to th
     await g("config", "user.email", "selftest@example.invalid");
     await g("config", "user.name", "selftest");
     fs.writeFileSync(path.join(repo, "old.ts"), "export function a() {\n  return 1;\n}\n");
+    const keep = (second: string, seventh: string) => ["a", second, "c", "d", "e", "f", seventh, "h", ""].join("\n");
+    fs.writeFileSync(path.join(repo, "keep.ts"), keep("b", "g"));
     await g("add", "-A");
     await g("commit", "-qm", "base");
     await g("checkout", "-q", "-b", "feature");
     await g("mv", "old.ts", "new.ts");
     fs.writeFileSync(path.join(repo, "new.ts"), "export function a() {\n  return 2;\n}\n");
+    fs.writeFileSync(path.join(repo, "keep.ts"), keep("B", "g"));
     await g("add", "-A");
     await g("commit", "-qm", "rename");
+    // The base branch moves on after the fork, in a file the branch also changed.
+    await g("checkout", "-q", "main");
+    fs.writeFileSync(path.join(repo, "keep.ts"), keep("b", "G"));
+    await g("commit", "-qam", "main moves on");
 
     const ctx = await buildLocalReviewContext({ repo, base: "main", head: "feature" });
+    const kept = ctx.files.find((x: FileDiff) => x.path === "keep.ts");
+    eq("a change the base branch made after the fork is not shown as the branch undoing it", [...(kept?.changedRightLines ?? [])], [2]);
+    eq("...because the left side is read at the merge base, as a pull request's diff is", kept?.leftLines[6], "g");
     const f = ctx.files.find((x: FileDiff) => x.path === "new.ts");
     eq("the renamed file is under review", f?.changeType, "rename");
     // libs/fileindex.ts follows originalPath to keep a thread created on the old name
