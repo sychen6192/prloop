@@ -141,6 +141,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
   { name: "PRR_RUNS_KEEP", kind: "number", section: S_DIAG, description: "iteration dirs kept per PR; 0 = keep every one" },
   { name: "PRR_RUNS_MAX_AGE_DAYS", kind: "number", section: S_DIAG, description: "also delete iteration dirs older than N days; 0 = off" },
   { name: "PRR_SHOW_CONFIG", kind: "bool", section: S_DIAG, description: "1 = print this table and exit, same as --config" },
+  { name: "PRR_SAVE_REPLAY", kind: "bool", section: S_DIAG, description: "1 = save replay.json so scripts/replay.ts can re-run offline" },
 ];
 
 const BY_NAME = new Map(KNOWN_KEYS.map((k) => [k.name, k]));
@@ -979,6 +980,11 @@ export const RUNS_KEEP = numEnv("PRR_RUNS_KEEP", 20, 0);
 // Age ceiling for an iteration directory, in days. 0 = no age limit. Independent of
 // PRR_RUNS_KEEP: either rule alone is enough to delete a directory.
 export const RUNS_MAX_AGE_DAYS = numEnv("PRR_RUNS_MAX_AGE_DAYS", 0, 0);
+// Whether a run also saves replay.json: every model's findings, every verdict, and the file
+// contents the gates read, so scripts/replay.ts can re-run everything after the models —
+// anchoring, dedupe, the gates, the rendering — offline and for free. Off by default because
+// it keeps the reviewed source on disk in one more file.
+export const SAVE_REPLAY = flagEnv("PRR_SAVE_REPLAY");
 
 export const SEVERITIES = ["critical", "high", "medium", "low"] as const;
 export type Severity = (typeof SEVERITIES)[number];

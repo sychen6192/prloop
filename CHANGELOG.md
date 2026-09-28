@@ -11,6 +11,11 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- `PRR_SAVE_REPLAY=1` saves `replay.json` — every finder's findings, every skeptic verdict, the
+  triaged tool findings and the file contents they were about — and `scripts/replay.ts <run
+  dir>` re-runs everything after the models offline under the current code and settings,
+  marking what changed. Opt-in: it keeps the reviewed source on disk.
+
 - Two-axis review: a **code axis** (N finder models over the diff, same prompt, in parallel)
   and a **requirement axis** (linked work items and acceptance criteria, walking one level up),
   run blind to each other with separate comment budgets.

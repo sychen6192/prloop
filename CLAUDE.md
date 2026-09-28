@@ -18,6 +18,7 @@ npx tsx scripts/selftest-docs.ts     # claims the docs make about the code
 npx tsx scripts/demo.ts              # render comments + review.html from fake data, no network
 npx tsx scripts/calibrate.ts         # dismissal / kill rates from runs/ + dismissals.jsonl
 npx tsx scripts/evaluate.ts          # golden-set recall: which stage lost each known defect
+npx tsx scripts/replay.ts <run dir>  # re-run everything after the models, offline (PRR_SAVE_REPLAY=1 runs)
 ```
 
 Everything is offline-testable; no test needs ADO credentials or a model endpoint. The five

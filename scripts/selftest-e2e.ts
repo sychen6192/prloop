@@ -280,6 +280,7 @@ try {
   process.env["PRR_SKIP_STATIC"] = "1";
   process.env["PRR_POST_STATUS"] = "1";
   process.env["PRR_QUIET"] = "1";
+  process.env["PRR_SAVE_REPLAY"] = "1";
   runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-e2e-runs-"));
   process.env["PRR_RUNS_DIR"] = runsDir;
   models.answerBy(reviewer);
@@ -400,13 +401,22 @@ try {
     const prDir = path.join(runsDir, "contoso", "Shop", "shop-api", "pr-4821");
     const runs = fs.existsSync(prDir) ? fs.readdirSync(prDir).filter((d) => d.startsWith("iter-")) : [];
     eq("one run directory per push", runs.map((d) => d.split("-").slice(0, 2).join("-")).sort(), ["iter-1", "iter-2"]);
+    const { replay } = await import("../libs/replay");
     for (const d of runs.sort()) {
       const files = fs.readdirSync(path.join(prDir, d));
+      const iter = d.split("-").slice(0, 2).join("-");
       check(
-        `${d.split("-").slice(0, 2).join("-")} holds the prompts, the verdicts and the review`,
-        ["finder-prompt.md", "skeptic.json", "findings.json", "publish.json", "review.html", "stamp.json"].every((f) => files.includes(f)),
+        `${iter} holds the prompts, the verdicts and the review`,
+        ["finder-prompt.md", "skeptic.json", "findings.json", "publish.json", "review.html", "stamp.json", "replay.json"].every((f) => files.includes(f)),
         files.join(", "),
       );
+      // Everything after the models is deterministic TypeScript: replayed from the saved
+      // answers, the run must reach the same comments without a single model call.
+      const saved = JSON.parse(fs.readFileSync(path.join(prDir, d, "findings.json"), "utf8")) as { inline: Array<{ fingerprint: string }>; belowBar: Array<{ fingerprint: string }> };
+      const again = replay(JSON.parse(fs.readFileSync(path.join(prDir, d, "replay.json"), "utf8")));
+      eq(`${iter} replays offline to the same inline findings`, again.agg.inline.map((f) => f.fingerprint).sort(), saved.inline.map((f) => f.fingerprint).sort());
+      eq(`...and the same ones below the bar`, again.agg.belowBar.map((f) => f.fingerprint).sort(), saved.belowBar.map((f) => f.fingerprint).sort());
+      eq(`...with every candidate covered by a saved verdict`, again.unverified, 0);
     }
   }
 

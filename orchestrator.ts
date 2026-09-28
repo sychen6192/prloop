@@ -7,6 +7,7 @@
 // answer selects the next action is not.
 import {
   LEARN_FROM_DISMISSALS,
+  SAVE_REPLAY,
   SKIP_REQUIREMENT,
   SKIP_STATIC,
   STRICT_COVERAGE,
@@ -29,6 +30,7 @@ import { isWorktreeFailure, prepareWorktree, type PreparedWorktree } from "./git
 import { createRunDir, createSkipDir } from "./libs/artifacts";
 import { configSnapshot } from "./libs/configreport";
 import { runStamp } from "./libs/stamp";
+import { toReplayBundle } from "./libs/replay";
 import { tokenTotals } from "./models/runner";
 import { dismissedCategoryHints, loadDismissals } from "./libs/learnings";
 import { banner, log } from "./libs/log";
@@ -503,6 +505,12 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     degraded: agg.degraded,
     stats: agg.stats,
   });
+  if (SAVE_REPLAY) {
+    run.saveJson(
+      "replay.json",
+      toReplayBundle({ files: ctx.files, outputs, outcomes, tools: toolOut.findings, dismissed: dismissedFps }),
+    );
+  }
 
   banner("Step 4/4: post comments");
   const durationSec = Math.round((Date.now() - started) / 1000);

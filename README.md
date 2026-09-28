@@ -444,6 +444,7 @@ Full list with explanations in [.env.example](./.env.example). The ones that cha
 | `PRR_ADO_MAX_RETRIES` | `3` | **TOTAL** attempts per ADO request, first try included — `1` = never retry. Opposite sense to `PRR_LLM_RETRIES`; both names are published, so neither was renamed |
 | `PRR_RUNS_KEEP` | `20` | iteration directories kept per PR under `runs/`, oldest deleted first; `0` = keep everything. Never touches `dismissals.jsonl` |
 | `PRR_RUNS_MAX_AGE_DAYS` | `0` | also delete iteration directories older than this; `0` = no age limit |
+| `PRR_SAVE_REPLAY` | — | `1` = also save `replay.json`, so `scripts/replay.ts` can re-run everything after the models offline. Keeps the reviewed source on disk |
 
 Everything else prloop reads. `prloop --config` prints this same list with the value each
 one currently has and where it came from (`shell` / `.env` / `default`), which is the fast
@@ -581,7 +582,17 @@ summary rather than silently dropped.
 npm run check                 # typecheck + selftest
 npx tsx scripts/demo.ts       # render comments from fake data, no ADO or model calls
 npx tsx scripts/calibrate.ts  # is it getting better? joins runs/ to the dismissal store
+npx tsx scripts/replay.ts <run dir>  # re-run a saved run after a threshold or code change
 ```
+
+`scripts/replay.ts` re-runs everything after the models — anchoring, dedupe, the skeptic's
+saved verdicts, the corroboration and severity gates, the cap — over a run saved with
+`PRR_SAVE_REPLAY=1`, under the current code and settings, and marks what is inline now that
+was not in the run. Tuning `PRR_MIN_INLINE_SEVERITY`, the consensus rule or the dedupe
+threshold no longer costs a model call per try: `PRR_MIN_INLINE_SEVERITY=high npx tsx
+scripts/replay.ts runs/…/iter-3-…`. A candidate no saved verdict covers (dedupe now draws a
+line the run did not) replays unverified, and the count is printed. The end-to-end net checks
+that a replay reaches exactly the run's own comments.
 
 `scripts/calibrate.ts` reads `runs/**/findings.json`, `runs/**/skeptic.json` and each repo's
 `dismissals.jsonl` and prints the dismissal rate by finder confidence, by category and by
