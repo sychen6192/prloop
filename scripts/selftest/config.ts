@@ -602,6 +602,12 @@ section("run artifacts: a run has to be diagnosable from its own directory alone
   // failure with an empty message or a skip with an empty reason.
   eq("a clean result claims no fatal", "fatal" in summary, false);
   eq("...and no skip reason", "skippedReason" in summary, false);
+  eq("...and no stage timings it was not given", "timingsMs" in summary, false);
+  const timed = buildResultSummary({
+    exitCode: 0, incomplete: [], counts: { raw: 0, anchored: 0, survived: 0, inline: 0, degraded: 0 },
+    tokens: { calls: 0, promptTokens: 0, completionTokens: 0 }, durationSec: 9, timingsMs: { intake: 1200, finders: 7000, static: 6500 },
+  });
+  eq("a review's result says how long each stage took", timed["timingsMs"], { intake: 1200, finders: 7000, static: 6500 });
 
   // Identity: without it a result.json could only be identified by the directory path it
   // happens to sit in, so any cross-run report had to parse directory names or open two

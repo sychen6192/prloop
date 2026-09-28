@@ -32,6 +32,8 @@ export interface ReplayBundle {
   tools: AnchoredFinding[];
   /** Fingerprints a human had dismissed when the run happened (the learnings store). */
   dismissed: string[];
+  /** Fingerprints already on the pull request, whose findings skipped the skeptic. */
+  posted?: string[];
 }
 
 export function toReplayBundle(input: {
@@ -40,6 +42,7 @@ export function toReplayBundle(input: {
   outcomes: SkepticOutcome[];
   tools: AnchoredFinding[];
   dismissed: Iterable<string>;
+  posted?: Iterable<string>;
 }): ReplayBundle {
   return {
     version: REPLAY_VERSION,
@@ -48,6 +51,7 @@ export function toReplayBundle(input: {
     verdicts: input.outcomes.map((o) => ({ fingerprint: o.finding.fingerprint, killed: o.killed, verdicts: o.verdicts })),
     tools: input.tools,
     dismissed: [...input.dismissed],
+    posted: [...(input.posted ?? [])],
   };
 }
 
@@ -83,9 +87,10 @@ export function replay(bundle: ReplayBundle): ReplayResult {
   }));
   const candidates = anchorAndDedupe(outputs, index);
   const dismissed = new Set(bundle.dismissed);
+  const posted = new Set(bundle.posted ?? []);
   const saved = new Map(bundle.verdicts.map((v) => [v.fingerprint, v]));
   let unverified = 0;
-  const fresh = candidates.merged.filter((f) => !dismissed.has(f.fingerprint));
+  const fresh = candidates.merged.filter((f) => !dismissed.has(f.fingerprint) && !posted.has(f.fingerprint));
   const outcomes: SkepticOutcome[] = fresh.map((finding) => {
     const v = saved.get(finding.fingerprint);
     if (!v) unverified++;
@@ -93,13 +98,15 @@ export function replay(bundle: ReplayBundle): ReplayResult {
   });
   const survivors = applyVerdicts(outcomes);
   const knownDismissed = candidates.merged.filter((f) => dismissed.has(f.fingerprint));
+  const knownPosted = candidates.merged.filter((f) => !dismissed.has(f.fingerprint) && posted.has(f.fingerprint));
   const agg = finalize(
     candidates,
-    mergeToolFindings([...survivors, ...knownDismissed], bundle.tools),
+    mergeToolFindings([...survivors, ...knownDismissed, ...knownPosted], bundle.tools),
     dismissed,
     outcomes.filter((o) => o.killed).length,
     // The bar a live run over these files would use now, risk tier included.
     runTier(files).minSeverity,
+    posted,
   );
   return { agg, unverified };
 }

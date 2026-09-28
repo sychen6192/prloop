@@ -86,6 +86,8 @@ async function main() {
       compareTo: 0,
       intake: (_ref, _compareTo, o) => buildLocalReviewContext({ repo, base, head, ...(o?.text ? { text: true } : {}) }),
       conventions: (commit, paths) => readLocalConventions(repo, commit, paths),
+      // No pull request, so nothing is posted yet and every finding is verified.
+      posted: async () => new Set(),
       workItems: async () => ({ items: criteria ? [localWorkItem(criteria)] : [], inheritedFrom: [] }),
       ...(partial ? {} : { searchRepo: repo }),
     });

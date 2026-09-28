@@ -815,6 +815,19 @@ section("over-budget diffs: read the rest instead of reporting it unread");
   check("a split request says which part it is", split.chunks[1]!.includes("you are reviewing part 2"), split.chunks[1]!.slice(0, 600));
   check("...and that the other parts hold different files", split.chunks[1]!.includes("do not report anything about a file you cannot see here"));
   check("...before the diff, not after it", split.chunks[1]!.indexOf("reviewing part 2") < split.chunks[1]!.indexOf("## The change"));
+  // After the rules, though: everything ahead of the notice is then the same in every part,
+  // which is what a server's prefix cache can reuse.
+  const ruled = buildFinderPrompts({ pr, files: overBudget, iterationId: 1, compareTo: 0, rules: "## Money\n\nAmounts are integer cents." }, 3);
+  const shared = (a: string, b: string) => {
+    let i = 0;
+    while (i < a.length && a[i] === b[i]) i++;
+    return i;
+  };
+  check(
+    "the parts share their whole start, rules included",
+    shared(ruled.chunks[0]!, ruled.chunks[1]!) > ruled.chunks[0]!.indexOf("Amounts are integer cents."),
+    ruled.chunks[1]!.slice(0, 900),
+  );
   check("...and each part actually carries a different file", split.chunks[0]!.includes("/src/p.ts") && !split.chunks[0]!.includes("### /src/q.ts"), "");
 }
 

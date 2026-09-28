@@ -416,7 +416,7 @@ outcome for everything including what was rejected and why (`findings.json`). Th
 make a run readable on its own: `run.log` (every log line, including the ones printed before
 the directory existed), `calls.jsonl` (one line per model *attempt* — stage, model, retry
 number, duration, tokens, error), and `result.json` (the outcome: exit code, what was
-incomplete, the counts down the funnel, tokens, duration, version). Start there when a
+incomplete, the counts down the funnel, tokens, duration, how long each stage took, version). Start there when a
 result looks wrong. `stamp.json` (also inside `result.json`) records what produced the run:
 prloop's commit, whether its checkout had uncommitted changes, and short hashes of the
 prompts, the loaded rules, the model fleet and the settings that shape a review.

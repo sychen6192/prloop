@@ -170,6 +170,8 @@ export interface ResultSummaryInput {
   counts: { raw: number; anchored: number; survived: number; inline: number; degraded: number };
   tokens: { calls: number; promptTokens: number; completionTokens: number };
   durationSec: number;
+  /** Wall time per stage, in ms. Stages that run side by side overlap, so they do not sum. */
+  timingsMs?: Record<string, number>;
   /**
    * Which pull request, which iteration, which settings. Without it the file could only be
    * identified by the directory path it happens to sit in, so any cross-run reporting — a
@@ -210,6 +212,7 @@ export function buildResultSummary(input: ResultSummaryInput): Record<string, un
     counts: { ...input.counts },
     tokens: { ...input.tokens },
     durationSec: input.durationSec,
+    ...(input.timingsMs === undefined ? {} : { timingsMs: { ...input.timingsMs } }),
     version: PRLOOP_VERSION,
     ...(input.stamp === undefined ? {} : { stamp: input.stamp }),
   };

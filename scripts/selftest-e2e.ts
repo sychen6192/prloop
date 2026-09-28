@@ -444,6 +444,12 @@ try {
     eq("...on the line it introduced it", lineOf(posted[0] ?? {}), 15);
     check("...with its own claim", contentOf(posted[0] ?? {}).includes("fractional cents"), contentOf(posted[0] ?? {}));
     eq("the finding both runs made is not posted again", ado.state.threads.length - threadsBefore, 1);
+    check("...nor verified again: push 1 already did", stageCalls("verdict").every((c) => !userPrompt(c).includes("ends the retry loop")));
+    check(
+      "the run says how long each stage took",
+      ["intake", "conventions", "static", "finders", "claims", "skeptic", "triage", "publish"].every((k) => typeof result.timings?.[k] === "number"),
+      JSON.stringify(result.timings),
+    );
     eq("...and is reported as already commented", result.publishResult?.alreadyPosted.map((f) => f.anchor?.startLine), [5]);
     // Line 5 is push 1's code and push 2 left it alone: a new finding there would have been
     // listed rather than commented, and this one, commented by push 1, is said to be.

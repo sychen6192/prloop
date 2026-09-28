@@ -558,6 +558,11 @@ section("risk tiers: how much review a change gets, from its size and what it to
   const empty = { merged: [], degraded: [], rawCount: 0, byFailure: {}, excluded: 0 };
   const strict = finalize(empty, [f("high"), f("medium")], new Set(), 0, "high");
   eq("a stricter bar keeps a medium finding off the lines", [strict.inline.map((x) => x.claim), strict.belowBar.map((x) => x.suppressedBy)], [["high"], ["severity"]]);
+
+  // A finding an earlier run posted skipped the skeptic this time; it is not "unverified".
+  const lone = { ...f("high"), sources: ["m1"], fingerprint: "posted-before" };
+  eq("a single-source finding nobody verified this run lacks corroboration", finalize(empty, [lone]).belowBar[0]?.suppressedBy, "no-corroboration");
+  eq("...unless an earlier run verified and posted it", finalize(empty, [lone], new Set(), 0, "medium", new Set(["posted-before"])).inline.length, 1);
 }
 
 section("convergence: on a later push, code an earlier push wrote is not code from before the PR");

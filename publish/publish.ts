@@ -198,6 +198,11 @@ function postedFingerprints(threads: Thread[]): Set<string> {
   return out;
 }
 
+/** Every fingerprint already on the pull request, read on its own for the skeptic's filter. */
+export async function postedFingerprintsOnPr(ref: PrRef): Promise<Set<string>> {
+  return postedFingerprints(await listThreads(ref));
+}
+
 /**
  * Reads what humans did to prloop's comments and records it. No writes of any kind.
  *

@@ -287,6 +287,7 @@ async function main() {
       },
       tokens: tokenTotals(),
       durationSec: result.durationSec,
+      ...(result.timings === undefined ? {} : { timingsMs: result.timings }),
     }),
   );
   process.exit(exitCode);

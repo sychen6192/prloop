@@ -271,6 +271,10 @@ export function buildFinderPrompts(input: FinderPromptInput, maxChunks: number =
   // here shares one context window with the payload — and until this was counted, only the
   // diff's characters were, which is how a "safely" sized diff still arrived at the model
   // truncated (config.ts, PRR_CONTEXT_TOKENS, says what that costs).
+  //
+  // The part notice goes after the rules, as late as it can while still preceding the diff:
+  // everything before it is the same in every part of a split review, and a server with a
+  // prefix cache (vLLM's) reuses a shared start instead of reading the rules again per part.
   const headFor = (note: string) => `## Pull Request info
 
 - Title: ${neutralizeLine(input.pr.title)}
@@ -283,8 +287,8 @@ ${renderPrDescription(input.pr.description)}
 ## Review scope
 
 ${scope}
-${input.files.length} file(s) changed.${note}
-${rulesBlock}
+${input.files.length} file(s) changed.
+${rulesBlock}${note ? `${note}\n` : ""}
 ## The change (unified diff)
 
 In the diff, the numbers in \`@@ -leftStart,leftCount +rightStart,rightCount @@\` are real

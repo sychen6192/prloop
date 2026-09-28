@@ -279,6 +279,16 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- **The slow steps are off the critical path.** The static gate's worktree — a fetch and a
+  setup command, up to ten minutes each — is now prepared inside the static branch, beside the
+  finders, instead of before any finder starts. Triage runs beside the skeptic instead of after
+  it. A finding whose fingerprint is already on the pull request skips the claim check and the
+  skeptic — publish() would not post it again, and an earlier run verified it — and counts as
+  corroborated, so the summary still shows it as already commented; the fingerprints are read
+  beside the finders, and a failed read verifies everything, as before. The part notice of a
+  split finder request now follows the rules, so every part shares its start and a server's
+  prefix cache (vLLM's) can reuse it. `result.json` records each stage's wall time under
+  `timingsMs`.
 - **On a `--since auto` run, a finding on lines the push left alone says who wrote them.**
   The whole pull request's diff — read once and shared with the requirement axis — splits
   them: code an earlier push of the PR wrote is listed as *Previously missed*, the finding its

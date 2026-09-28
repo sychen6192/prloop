@@ -395,6 +395,10 @@ export function finalize(
   refuted = 0,
   // The inline bar: PRR_MIN_INLINE_SEVERITY, unless the run's risk tier set a stricter one.
   minSeverity: Severity = MIN_INLINE_SEVERITY,
+  // Fingerprints already on the pull request. Their findings skipped the skeptic because an
+  // earlier run verified and posted them, so they count as corroborated — or the summary
+  // would call a finding with an open thread "single model, unverified".
+  posted: ReadonlySet<string> = new Set(),
 ): AggregateResult {
   // Re-rank before the cap. The sort in anchorAndDedupe is stale by now: the skeptic may
   // have downgraded severities after it ran, and tool findings are appended at the tail
@@ -427,7 +431,7 @@ export function finalize(
     // off the same verdicts. holds > refuted + unchecked is exactly holds*2 > answered.
     const clearedBySkeptic =
       (f.skepticVerdicts ?? 0) > (f.skepticRefuted ?? 0) + (f.skepticUnchecked ?? 0);
-    if (!REQUIRE_CORROBORATION || multiSource || clearedBySkeptic) corroborated.push(f);
+    if (!REQUIRE_CORROBORATION || multiSource || clearedBySkeptic || posted.has(f.fingerprint)) corroborated.push(f);
     else {
       f.suppressedBy = "no-corroboration";
       uncorroborated.push(f);
