@@ -12,7 +12,7 @@ import { unmetCriteria } from "../gates/requirement";
 import { recordDismissals } from "../libs/learnings";
 import { recordOutcomes } from "../libs/outcomes";
 import { log } from "../libs/log";
-import { collectDismissals, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
+import { collectDismissals, collectFinalOutcomes, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
 import { iterationMarker, readMarkers, spanMark, type SpanMark } from "./markers";
 import type { AnchoredFinding, PrRef } from "../libs/types";
 import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, WatermarkDecision } from "./lifecycle";
@@ -210,7 +210,9 @@ function postedFingerprints(threads: Thread[]): Set<string> {
 export async function harvestClosedThreads(ref: PrRef): Promise<{ dismissals: number; outcomes: number }> {
   const [threads, selfId] = await Promise.all([listThreads(ref), selfIdentityId(ref)]);
   const dismissals = collectDismissals(threads, selfId);
-  const outcomes = collectOutcomes(threads, selfId);
+  // The fixes first: the store keeps the first record per finding, and a comment fixed
+  // before the merge must not be filed as ignored because it is also past the merge.
+  const outcomes = [...collectOutcomes(threads, selfId), ...collectFinalOutcomes(threads, selfId)];
   return {
     dismissals: LEARN_FROM_DISMISSALS ? recordDismissals(ref, dismissals) : 0,
     outcomes: recordOutcomes(ref, outcomes),
@@ -336,6 +338,7 @@ export async function publish(
         file: c.file,
         ...(c.category ? { category: c.category } : {}),
         outcome: "auto-closed" as const,
+        ...(c.likes === undefined ? {} : { likes: c.likes }),
       })),
   ];
   if (result.outcomes.length > 0) {

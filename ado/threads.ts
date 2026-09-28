@@ -17,6 +17,9 @@ export interface ThreadComment {
   commentType?: string;
   isDeleted?: boolean;
   author?: { displayName?: string; id?: string };
+  // Who liked the comment. The one positive signal ADO records that costs a reader a single
+  // click; absent on servers that do not return it.
+  usersLiked?: Array<{ id?: string }>;
 }
 
 export interface Thread {

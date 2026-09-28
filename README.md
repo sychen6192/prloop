@@ -596,11 +596,24 @@ Each of those three tables also carries a **`fixed`** column and the headline an
 fixed. That is PROPOSAL §12's north star, and until now the only per-finding outcome prloop
 kept was negative — so precision could only be estimated as one minus the dismissal rate,
 which scores every comment nobody answered as a success. Threads prloop auto-closed because
-the flagged line went away are counted beside the rate, never inside it: that is prloop's own
-inference, not a person's decision, and folding it in would let the tool grade itself. The
-record lives in `runs/<org>/<project>/<repo>/outcomes.jsonl`, deliberately not in
-`dismissals.jsonl` — everything in that file is suppressed on every future PR in the repo, and
-a finding somebody fixed is the last thing to stop reporting.
+the code they flagged changed under them are counted beside the rate, never inside it: that is
+prloop's own inference, not a person's decision, and folding it in would let the tool grade
+itself. They do count toward the **addressed rate** printed next to it — fixed, or the code
+changed while the comment was open — which is how the industrial reviewers that publish
+results (Uber's uReview, ByteDance's BitsAI-CR) steer. When a PR merges, prloop also records
+what became of every comment still open (`ignored`) or closed without a verdict (`closed`),
+and how many people liked each comment, so a category nobody ever answers no longer looks as
+good as one that is always fixed. The record lives in
+`runs/<org>/<project>/<repo>/outcomes.jsonl`, deliberately not in `dismissals.jsonl` —
+everything in that file is suppressed on every future PR in the repo, and a finding somebody
+fixed is the last thing to stop reporting.
+
+From those outcomes calibrate adds a table by severity — the addressed rate should rise with
+severity, and a `[CAUTION]` line says so when low-severity comments are addressed more than
+critical ones, which reads as people fixing to make a bot go quiet — a table per static-analysis
+rule, and **demotion proposals**: a category or rule with ten or more comments in one
+repository, addressed at most 15% of the time and dismissed or ignored at least half of it,
+is printed with the setting that would stop it. Proposals only; prloop never applies one.
 
 Each of those three tables also carries a **`killed`** column: how many of that bucket's
 findings the skeptic majority refuted. A refuted finding reaches no comment and appears in no

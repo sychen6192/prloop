@@ -169,7 +169,13 @@ export interface StaleThread {
   /** From the comment's marker, so closing it can be recorded as an outcome. */
   fingerprint?: string;
   category?: string;
+  /** Likes on prloop's comment when it was closed. */
+  likes?: number;
 }
+
+/** Likes on a comment, when the server reports them; undefined when it does not. */
+const likesOf = (c: ThreadComment | undefined): number | undefined =>
+  Array.isArray(c?.usersLiked) ? c.usersLiked.length : undefined;
 
 /**
  * Where the code a comment was about sits in `lines` now: the start line of the matching
@@ -263,6 +269,7 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
         // before the marker protocol wrote; those still close, they are just not counted.
         ...(m.fingerprint ? { fingerprint: m.fingerprint } : {}),
         ...(m.category ? { category: m.category } : {}),
+        ...(likesOf(first) === undefined ? {} : { likes: likesOf(first) }),
       });
     }
   }
@@ -347,7 +354,8 @@ export interface OutcomeRecord {
   fingerprint: string;
   file: string;
   category?: string;
-  outcome: "fixed" | "auto-closed";
+  outcome: "fixed" | "auto-closed" | "ignored" | "closed";
+  likes?: number;
 }
 
 /**
@@ -378,6 +386,43 @@ export function collectOutcomes(threads: Thread[], selfId?: string): OutcomeReco
       file: t.threadContext?.filePath ?? "",
       ...(m.category ? { category: m.category } : {}),
       outcome: "fixed",
+      ...(likesOf(c) === undefined ? {} : { likes: likesOf(c) }),
+    });
+  }
+  return out;
+}
+
+/**
+ * What became of the rest, read once the pull request has merged: a comment still open was
+ * ignored, and one a human set to "closed" was acknowledged without a verdict. Only for a
+ * merged PR — before the merge, an open comment is simply not answered YET.
+ *
+ * The addressed rate needs this denominator. Without it the only outcomes on record were
+ * the ones somebody acted on, so a category nobody ever responded to looked no worse than
+ * one that was always fixed — both had no dismissals.
+ *
+ * Same authorship rule as the other two collectors, for the same reason: a record here is a
+ * claim about prloop's own comment, and a store the PR author could write to would let them
+ * write the tool's success rate. First-record-wins in the store (libs/outcomes.ts) keeps a
+ * fix recorded earlier from being overwritten by this.
+ */
+export function collectFinalOutcomes(threads: Thread[], selfId?: string): OutcomeRecord[] {
+  const out: OutcomeRecord[] = [];
+  for (const t of threads) {
+    const outcome = t.status === "active" || t.status === "pending" ? "ignored" : t.status === "closed" ? "closed" : undefined;
+    if (!outcome) continue;
+    const c = t.comments?.find(
+      (x) => !x.isDeleted && readMarkers(x.content).ours && isSelfIdentity(x.author?.id, selfId),
+    );
+    if (!c) continue;
+    const m = readMarkers(c.content);
+    if (!m.fingerprint) continue;
+    out.push({
+      fingerprint: m.fingerprint,
+      file: t.threadContext?.filePath ?? "",
+      ...(m.category ? { category: m.category } : {}),
+      outcome,
+      ...(likesOf(c) === undefined ? {} : { likes: likesOf(c) }),
     });
   }
   return out;

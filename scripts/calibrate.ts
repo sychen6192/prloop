@@ -32,6 +32,11 @@ export interface CalibrationFinding {
   published: boolean;
   // What produced the run it came from (libs/stamp.ts stampLabel); absent on older runs.
   stamp?: string;
+  severity?: string;
+  // `tool:ruleId` for a static tool's finding; absent on a model's.
+  rule?: string;
+  // `org/project/repo`, from where the run sits under runs/: what a proposal is scoped to.
+  repo?: string;
 }
 
 /** One verifier answer as it appears in a run's skeptic.json. */
@@ -70,11 +75,19 @@ export interface CalibrationInput {
   outcomes?: CalibrationOutcome[];
   // Fingerprints a human closed as wontFix/byDesign, from the repo's dismissals.jsonl.
   dismissed: Set<string>;
-  // Fingerprints the author acted on, from the repo's outcomes.jsonl, split by how prloop
-  // knows. `fixed` is a human's statement; `autoClosed` is prloop's own inference from the
-  // flagged line having gone away, which is narrow but not a person saying anything — so the
-  // headline rate counts only the first, and the second is reported beside it.
-  actedOn?: { fixed: Set<string>; autoClosed: Set<string> };
+  // What became of each published finding, from the repo's outcomes.jsonl, split by how
+  // prloop knows. `fixed` is a human's statement; `autoClosed` is prloop's own inference
+  // that the code it flagged changed under the open comment (BitsAI-CR's "outdated" signal);
+  // `ignored` is a comment still open when the PR merged, `closed` one a human closed without
+  // a verdict, and `liked` one somebody liked. The implementation rate counts only `fixed`;
+  // the addressed rate adds `autoClosed`, and both are printed.
+  actedOn?: {
+    fixed: Set<string>;
+    autoClosed: Set<string>;
+    ignored?: Set<string>;
+    closed?: Set<string>;
+    liked?: Set<string>;
+  };
   /**
    * What reviewers actually said when they dismissed something, one entry per dismissal that
    * carried a reply, from the same stores as `dismissed`. Kept apart from the fingerprint
@@ -104,6 +117,13 @@ export interface Bucket {
   // threw away, which is the number that says whether a finder is pulling its weight and
   // the one nothing in the tool could answer before.
   killed: number;
+  // The code changed under the open comment (auto-closed), still open at merge, and liked.
+  codeChanged: number;
+  ignored: number;
+  liked: number;
+  // (fixed + codeChanged) / published: what the comments led to, rather than only what was
+  // rejected. The number every published industrial reviewer steers by.
+  addressedRate: number;
   // dismissed / published, NOT dismissed / findings: only a published finding is ever put
   // in front of a human, so the wider denominator would report a bucket as accurate purely
   // because the corroboration gate kept it out of the PR.
@@ -155,8 +175,43 @@ export interface CalibrationReport {
   // By what produced the run: a prompt or rule change is only measurable against the runs
   // before it if the two are kept apart.
   byStamp: Bucket[];
+  bySeverity: Bucket[];
+  // Static-tool findings only, by `tool:rule`.
+  byRule: Bucket[];
+  // Published findings that went nowhere: still open at merge.
+  ignored: number;
+  // The code changed under the open comment, plus the human fixes: the addressed count.
+  addressed: number;
+  /** Suggestions for a human to apply, never applied (PROPOSAL M6). */
+  proposals: Proposal[];
+  /**
+   * Set when low-severity comments are addressed more often than critical and high ones. A
+   * compliance signal as much as a quality one: people also "fix" to make a bot go quiet, and
+   * the cheapest findings are the cheapest to silence.
+   */
+  inverted?: string;
   skeptics: SkepticStats[];
 }
+
+export interface Proposal {
+  repo: string;
+  /** What to demote: a category, or a tool's rule. */
+  subject: string;
+  kind: "category" | "rule";
+  published: number;
+  addressed: number;
+  dismissed: number;
+  ignored: number;
+  /** One line a person can act on. */
+  suggestion: string;
+}
+
+// A proposal needs enough comments behind it to be about the rule rather than about one PR,
+// and a rate this low with most of the rest rejected or ignored: a category reviewers act on
+// one time in ten, and push back on or walk past most of the time, is costing attention.
+const PROPOSAL_MIN_PUBLISHED = 10;
+const PROPOSAL_MAX_ADDRESSED = 0.15;
+const PROPOSAL_MIN_REJECTED = 0.5;
 
 // Bucket floors, highest first. Coarse on purpose: the question is whether a finder's
 // confidence carries any signal at all, and finer buckets on a few hundred findings only
@@ -171,15 +226,17 @@ const CONFIDENCE_FLOORS: Array<[number, string]> = [
 const confidenceBucket = (c: number) =>
   CONFIDENCE_FLOORS.find(([floor]) => c >= floor)?.[1] ?? CONFIDENCE_FLOORS[CONFIDENCE_FLOORS.length - 1]![1];
 
-function tally(): { findings: number; published: number; dismissed: number; actedOn: number; killed: number } {
-  return { findings: 0, published: 0, dismissed: 0, actedOn: 0, killed: 0 };
+function tally() {
+  return { findings: 0, published: 0, dismissed: 0, actedOn: 0, killed: 0, codeChanged: 0, ignored: 0, liked: 0 };
 }
+type Tally = ReturnType<typeof tally>;
 
-function toBuckets(m: Map<string, ReturnType<typeof tally>>, order?: string[]): Bucket[] {
+function toBuckets(m: Map<string, Tally>, order?: string[]): Bucket[] {
   const rows = [...m.entries()].map(([key, t]) => ({
     key,
     ...t,
     rate: t.published > 0 ? t.dismissed / t.published : 0,
+    addressedRate: t.published > 0 ? (t.actedOn + t.codeChanged) / t.published : 0,
   }));
   if (order) return rows.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
   // Biggest population first: a 100% dismissal rate over one finding is not the top line.
@@ -254,30 +311,36 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   let fixedCount = 0;
   let autoClosedCount = 0;
 
-  const conf = new Map<string, ReturnType<typeof tally>>();
-  const cat = new Map<string, ReturnType<typeof tally>>();
-  const finder = new Map<string, ReturnType<typeof tally>>();
-  const stamp = new Map<string, ReturnType<typeof tally>>();
-  const add = (
-    m: Map<string, ReturnType<typeof tally>>,
-    key: string,
-    f: CalibrationFinding,
-    dismissed: boolean,
-    killed: boolean,
-    actedOn: boolean,
-  ) => {
+  const conf = new Map<string, Tally>();
+  const cat = new Map<string, Tally>();
+  const finder = new Map<string, Tally>();
+  const stamp = new Map<string, Tally>();
+  const severity = new Map<string, Tally>();
+  const rule = new Map<string, Tally>();
+  // Per repository, for the proposals: "exclude this category" is a decision about one
+  // codebase's reviewers, and pooling repositories would propose it for all of them.
+  const repoCat = new Map<string, Tally>();
+  const repoRule = new Map<string, Tally>();
+  type Fate = { dismissed: boolean; killed: boolean; fixed: boolean; changed: boolean; ignored: boolean; liked: boolean };
+  const add = (m: Map<string, Tally>, key: string, f: CalibrationFinding, x: Fate) => {
     const t = m.get(key) ?? tally();
     t.findings++;
     if (f.published) t.published++;
-    if (dismissed) t.dismissed++;
-    if (killed) t.killed++;
-    if (actedOn) t.actedOn++;
+    if (x.dismissed) t.dismissed++;
+    if (x.killed) t.killed++;
+    if (x.fixed) t.actedOn++;
+    // Only a published finding had a comment for the code to change under, be walked past
+    // at merge, or be liked.
+    if (f.published && x.changed) t.codeChanged++;
+    if (f.published && x.ignored) t.ignored++;
+    if (f.published && x.liked) t.liked++;
     m.set(key, t);
   };
 
   let published = 0;
   let dismissedCount = 0;
   let publishedDismissed = 0;
+  let ignoredCount = 0;
   for (const f of byFingerprint.values()) {
     const dismissed = input.dismissed.has(f.fingerprint);
     if (f.published) published++;
@@ -287,14 +350,23 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     if (killed) killedCount++;
     const fixed = input.actedOn?.fixed.has(f.fingerprint) ?? false;
     if (fixed) fixedCount++;
-    if (input.actedOn?.autoClosed.has(f.fingerprint)) autoClosedCount++;
-    add(conf, confidenceBucket(f.confidence), f, dismissed, killed, fixed);
-    add(cat, f.category || "(none)", f, dismissed, killed, fixed);
+    const changed = input.actedOn?.autoClosed.has(f.fingerprint) ?? false;
+    if (changed) autoClosedCount++;
+    const ignored = input.actedOn?.ignored?.has(f.fingerprint) ?? false;
+    if (ignored && f.published) ignoredCount++;
+    const x: Fate = { dismissed, killed, fixed, changed, ignored, liked: input.actedOn?.liked?.has(f.fingerprint) ?? false };
+    add(conf, confidenceBucket(f.confidence), f, x);
+    add(cat, f.category || "(none)", f, x);
     // A finding found by two models is credit — and blame — for both.
-    for (const s of f.sources.length > 0 ? f.sources : ["(unknown)"]) add(finder, s, f, dismissed, killed, fixed);
+    for (const s of f.sources.length > 0 ? f.sources : ["(unknown)"]) add(finder, s, f, x);
     // The configuration it was first seen under: a later run re-reporting it under a new
     // prompt did not produce it, it only failed to stop producing it.
-    add(stamp, f.stamp ?? "(unstamped)", f, dismissed, killed, fixed);
+    add(stamp, f.stamp ?? "(unstamped)", f, x);
+    add(severity, f.severity || "(none)", f, x);
+    if (f.rule) add(rule, f.rule, f, x);
+    const repo = f.repo ?? "(unknown)";
+    add(repoCat, `${repo}\u0000${f.category || "(none)"}`, f, x);
+    if (f.rule) add(repoRule, `${repo}\u0000${f.rule}`, f, x);
   }
 
   const skeptics = new Map<string, SkepticStats>();
@@ -319,6 +391,50 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
   let orphanDismissals = 0;
   for (const fp of input.dismissed) if (!byFingerprint.has(fp)) orphanDismissals++;
 
+  const proposals: Proposal[] = [];
+  const propose = (m: Map<string, Tally>, kind: Proposal["kind"]) => {
+    for (const [key, t] of m) {
+      const [repo = "", subject = ""] = key.split("\u0000");
+      const addressed = t.actedOn + t.codeChanged;
+      if (t.published < PROPOSAL_MIN_PUBLISHED) continue;
+      if (addressed / t.published > PROPOSAL_MAX_ADDRESSED) continue;
+      if ((t.dismissed + t.ignored) / t.published < PROPOSAL_MIN_REJECTED) continue;
+      const [tool = "", ruleId = ""] = subject.split(":");
+      proposals.push({
+        repo,
+        subject,
+        kind,
+        published: t.published,
+        addressed,
+        dismissed: t.dismissed,
+        ignored: t.ignored,
+        suggestion:
+          kind === "category"
+            ? `stop commenting on ${subject} findings where ${repo} is reviewed: PRR_EXCLUDE_CATEGORIES=${subject}`
+            : `turn off ${ruleId || tool} in ${repo}'s own ${tool} configuration, or add it to the ${tool} profile's ignoreRules`,
+      });
+    }
+  };
+  propose(repoCat, "category");
+  propose(repoRule, "rule");
+  proposals.sort((a, b) => b.published - a.published || a.repo.localeCompare(b.repo) || a.subject.localeCompare(b.subject));
+
+  // The compliance check: addressed rates should rise with severity. When the cheapest
+  // findings are acted on more than the most serious ones, some of that "addressing" is
+  // people making the bot go quiet, and the rate is not measuring usefulness.
+  const sev = toBuckets(severity, ["critical", "high", "medium", "low", "(none)"]);
+  const rateOf = (keys: string[]) => {
+    const rows = sev.filter((b) => keys.includes(b.key));
+    const pub = rows.reduce((n, b) => n + b.published, 0);
+    return pub >= PROPOSAL_MIN_PUBLISHED ? rows.reduce((n, b) => n + b.actedOn + b.codeChanged, 0) / pub : undefined;
+  };
+  const serious = rateOf(["critical", "high"]);
+  const minor = rateOf(["low"]);
+  const inverted =
+    serious !== undefined && minor !== undefined && minor > serious
+      ? `low-severity comments were addressed more often (${(minor * 100).toFixed(1)}%) than critical and high ones (${(serious * 100).toFixed(1)}%) — read the addressed rates as partly compliance`
+      : undefined;
+
   return {
     findings: byFingerprint.size,
     published,
@@ -334,6 +450,12 @@ export function calibrate(input: CalibrationInput): CalibrationReport {
     byCategory: toBuckets(cat),
     byFinder: toBuckets(finder),
     byStamp: toBuckets(stamp),
+    bySeverity: sev,
+    byRule: toBuckets(rule),
+    ignored: ignoredCount,
+    addressed: fixedCount + autoClosedCount,
+    proposals,
+    ...(inverted === undefined ? {} : { inverted }),
     skeptics: [...skeptics.values()].sort((a, b) => b.answered - a.answered || a.model.localeCompare(b.model)),
   };
 }
@@ -375,8 +497,11 @@ function readJson(file: string): unknown | undefined {
 const num = (v: unknown, fallback: number) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
 const str = (v: unknown) => (typeof v === "string" ? v : "");
 
-function readFindings(file: string, into: CalibrationFinding[]): boolean {
+function readFindings(file: string, into: CalibrationFinding[], root: string): boolean {
   const stampFile = readJson(path.join(path.dirname(file), "stamp.json"));
+  // runs/<org>/<project>/<repo>/pr-N/iter-M/findings.json: the repository is three levels up.
+  const parts = path.relative(root, file).split(path.sep);
+  const repo = parts.length >= 6 ? parts.slice(0, 3).join("/") : undefined;
   const stamp = typeof stampFile === "object" && stampFile !== null ? stampLabel(stampFile as Partial<RunStamp>) : undefined;
   const v = readJson(file);
   if (typeof v !== "object" || v === null) return false;
@@ -403,6 +528,9 @@ function readFindings(file: string, into: CalibrationFinding[]): boolean {
         sources: Array.isArray(f["sources"]) ? f["sources"].filter((s): s is string => typeof s === "string") : [],
         published,
         ...(stamp === undefined ? {} : { stamp }),
+        ...(typeof f["severity"] === "string" ? { severity: f["severity"] } : {}),
+        ...(typeof f["rule"] === "string" ? { rule: f["rule"] } : {}),
+        ...(repo === undefined ? {} : { repo }),
       });
     }
   }
@@ -461,7 +589,13 @@ export function scanRuns(root: string): ScanResult {
   const dismissed = new Set<string>();
   const dismissalReasons: string[] = [];
   let reasonlessDismissals = 0;
-  const actedOn = { fixed: new Set<string>(), autoClosed: new Set<string>() };
+  const actedOn = {
+    fixed: new Set<string>(),
+    autoClosed: new Set<string>(),
+    ignored: new Set<string>(),
+    closed: new Set<string>(),
+    liked: new Set<string>(),
+  };
   const repos: string[] = [];
 
   // runs/<org>/<project>/<repo>/pr-N/iter-M/findings.json is 6 deep; the walk is bounded so
@@ -469,7 +603,7 @@ export function scanRuns(root: string): ScanResult {
   const findingFiles = findFiles(root, "findings.json", 6, []);
   let runs = 0;
   for (const f of findingFiles) {
-    if (readFindings(f, findings)) runs++;
+    if (readFindings(f, findings, root)) runs++;
     else unusable.push(f);
   }
   for (const f of findFiles(root, "skeptic.json", 6, [])) {
@@ -492,7 +626,13 @@ export function scanRuns(root: string): ScanResult {
     // Its own store, read through its own loader for the same reason: both tolerate corrupt
     // lines and dedupe first-wins, and a second parser here would drift from the writer.
     for (const o of loadOutcomes(ref, root)) {
-      (o.outcome === "auto-closed" ? actedOn.autoClosed : actedOn.fixed).add(o.fingerprint);
+      const into =
+        o.outcome === "auto-closed" ? actedOn.autoClosed
+          : o.outcome === "ignored" ? actedOn.ignored
+            : o.outcome === "closed" ? actedOn.closed
+              : actedOn.fixed;
+      into.add(o.fingerprint);
+      if ((o.likes ?? 0) > 0) actedOn.liked.add(o.fingerprint);
     }
   }
 
@@ -514,15 +654,19 @@ function table(header: string[], rows: string[][]): string {
 function bucketTable(title: string, buckets: Bucket[]): string {
   if (buckets.length === 0) return `${title}\n  (nothing to report)`;
   return `${title}\n${table(
-    ["", "findings", "killed", "published", "fixed", "dismissed", "rate"],
+    ["", "findings", "killed", "published", "fixed", "changed", "dismissed", "ignored", "liked", "dismissed%", "addressed%"],
     buckets.map((b) => [
       b.key,
       String(b.findings),
       String(b.killed),
       String(b.published),
       String(b.actedOn),
+      String(b.codeChanged),
       String(b.dismissed),
+      String(b.ignored),
+      String(b.liked),
       pct(b.rate),
+      pct(b.addressedRate),
     ]),
   )}`;
 }
@@ -545,8 +689,13 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
     // because the flagged line went away is its own inference, not a person's decision.
     `${plural(report.actedOn, "commented finding")} a human then marked fixed` +
       (report.published > 0 ? ` — implementation rate ${pct(report.actedOn / report.published)}` : "") +
-      (report.autoClosed > 0 ? `, plus ${report.autoClosed} prloop auto-closed when the code went away` : ""),
+      (report.autoClosed > 0 ? `, plus ${report.autoClosed} whose code changed under the open comment` : ""),
+    // What the comments led to, the way Uber and BitsAI-CR count it: acted on by a person, or
+    // the flagged code changed while the comment was open.
+    `addressed rate ${report.published > 0 ? pct(report.addressed / report.published) : "—"} ` +
+      `(fixed, or the code changed under the comment); ${plural(report.ignored, "comment")} still open when the PR merged`,
   ];
+  if (report.inverted) out.push(`[CAUTION] ${report.inverted}`);
   if (report.orphanDismissals > 0) {
     out.push(
       `${plural(report.orphanDismissals, "dismissal")} belong to findings no surviving run records ` +
@@ -555,17 +704,31 @@ export function renderReport(scan: ScanResult, report: CalibrationReport, root: 
   }
   out.push(
     "",
-    "Only published findings can be dismissed, so every rate below is dismissed/published.",
+    "Only a published finding can be dismissed, fixed, changed under, ignored or liked, so",
+    "both rates below are over `published`: dismissed% = dismissed/published, addressed% =",
+    "(fixed + changed)/published.",
     "`killed` is the skeptic's share of the same population — read it against `findings` in",
     "the same row, and remember a killed finding was never published and so can never be",
     "dismissed. A finder whose killed count approaches its findings count is paying for",
     "verification it is not earning.",
     "",
-    bucketTable("Dismissal rate by finder confidence", report.byConfidence),
+    bucketTable("By finder confidence", report.byConfidence),
     "",
-    bucketTable("Dismissal rate by category", report.byCategory),
+    bucketTable("By category", report.byCategory),
     "",
-    bucketTable("Dismissal rate by finder model", report.byFinder),
+    bucketTable("By finder model", report.byFinder),
+    "",
+  );
+  out.push(bucketTable("By severity — addressed% should rise with severity", report.bySeverity), "");
+  if (report.byRule.length > 0) out.push(bucketTable("Static-analysis rules", report.byRule), "");
+  // Proposals, never actions: PROPOSAL M6. A person reads the numbers and decides.
+  out.push(
+    report.proposals.length === 0
+      ? `Demotion proposals\n  (none: no category or rule has ${PROPOSAL_MIN_PUBLISHED}+ comments in one repository with this few addressed)`
+      : `Demotion proposals — suggestions for a person to apply, never applied by prloop\n${table(
+          ["repository", "subject", "published", "addressed", "dismissed", "ignored"],
+          report.proposals.map((p) => [p.repo, p.subject, String(p.published), String(p.addressed), String(p.dismissed), String(p.ignored)]),
+        )}\n${report.proposals.map((p) => `  → ${p.suggestion}`).join("\n")}`,
     "",
   );
   // Only when there is a comparison to make: one configuration is the ordinary case.

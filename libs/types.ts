@@ -220,6 +220,10 @@ export interface AnchoredFinding extends RawFinding {
   // merge may raise a model finding's severity (mergeInto) — a triage-tier tool rating an
   // error-level lint rule "high" is a policy, not a measurement of impact.
   tier?: "fact" | "triage";
+  // Static-tool findings only: `tool:ruleId`. Structured so calibrate can report how often a
+  // rule's comments were acted on — "ruff:SIM102 is ignored everywhere" is only a finding if
+  // the rule is a field and not a phrase inside the evidence text.
+  rule?: string;
   anchor?: Anchor;
   anchorFailure?: AnchorFailure;
   // Stable identity across pushes, for dedup against already-posted threads.

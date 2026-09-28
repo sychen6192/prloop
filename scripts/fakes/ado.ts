@@ -17,6 +17,7 @@ export interface FakeComment {
   content?: string;
   isDeleted?: boolean;
   author?: { displayName?: string; id?: string };
+  usersLiked?: Array<{ id?: string }>;
 }
 
 export interface FakeThread {

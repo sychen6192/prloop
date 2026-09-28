@@ -772,6 +772,7 @@ export async function triageAndConvert(
       // A deterministic tool is its own corroboration: it doesn't guess, so it doesn't
       // need a second model to agree before we believe the location exists.
       sources: [f.tool],
+      rule: f.ruleId ? `${f.tool}:${f.ruleId}` : f.tool,
       skepticVerdicts: 1,
       skepticRefuted: 0,
       fingerprint: createHash("sha1")

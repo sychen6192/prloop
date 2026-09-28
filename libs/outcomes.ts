@@ -28,11 +28,17 @@ export interface StoredOutcome {
   category?: string;
   /**
    * `fixed` — a human set the thread to fixed. A statement.
-   * `auto-closed` — prloop closed it because the line it pointed at was gone. An inference,
-   *   and a narrow one (publish/lifecycle.ts findStaleThreads), so it is kept apart rather
-   *   than folded into the headline rate.
+   * `auto-closed` — prloop closed it because the code it flagged is gone from the file: the
+   *   code changed under an open comment (publish/lifecycle.ts findStaleThreads). An
+   *   inference, so it is kept apart from the human's statement rather than folded into it.
+   * `ignored` — still open when the pull request merged. Nobody acted on it and nobody said
+   *   no: the most common response a review bot gets, and the one no store used to record.
+   * `closed` — a human set the thread to "closed" before the merge: ADO's catch-all, which
+   *   routinely means "I have read this" and is neither a fix nor a dismissal.
    */
-  outcome: "fixed" | "auto-closed";
+  outcome: "fixed" | "auto-closed" | "ignored" | "closed";
+  /** How many people liked prloop's comment, when the server said. */
+  likes?: number;
   prId: number;
   recordedAt: string;
 }
@@ -86,7 +92,7 @@ export function loadOutcomes(ref: PrRef, root: string = RUNS_DIR): StoredOutcome
  */
 export function recordOutcomes(
   ref: PrRef,
-  records: Array<{ fingerprint: string; file: string; category?: string; outcome: StoredOutcome["outcome"] }>,
+  records: Array<{ fingerprint: string; file: string; category?: string; outcome: StoredOutcome["outcome"]; likes?: number }>,
   root: string = RUNS_DIR,
 ): number {
   if (records.length === 0) return 0;

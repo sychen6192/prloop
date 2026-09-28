@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fakeAdo, type FakeAdoState, type FakeThread } from "./fakes/ado";
+import { fakeAdo, type FakeAdoState, type FakeComment, type FakeThread } from "./fakes/ado";
 import type { AnchoredFinding, FileDiff } from "../libs/types";
 import type { ReviewContext } from "../ado/intake";
 import type { SummaryInput } from "../publish/format";
@@ -686,6 +686,19 @@ try {
           comments: [{ id: 92, content: `${BOT_MARKER}<!-- prloop:fp=bbbb9999 --><!-- prloop:cat=correctness -->\ny`, author: { id: BOT } }],
           threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 9 }, rightFileEnd: { line: 9 } },
         },
+        // Still open at the merge: nobody acted on it and nobody said no — liked, though.
+        {
+          id: 6102,
+          status: "active",
+          comments: [{ id: 93, content: `${BOT_MARKER}<!-- prloop:fp=cccc9999 --><!-- prloop:cat=maintainability -->\nz`, author: { id: BOT }, usersLiked: [{ id: "someone" }] } as FakeComment],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 12 }, rightFileEnd: { line: 12 } },
+        },
+        {
+          id: 6103,
+          status: "closed",
+          comments: [{ id: 94, content: `${BOT_MARKER}<!-- prloop:fp=dddd9999 --><!-- prloop:cat=performance -->\nw`, author: { id: BOT } }],
+          threadContext: { filePath: "/src/app.ts", rightFileStart: { line: 14 }, rightFileEnd: { line: 14 } },
+        },
       ],
     });
     resetIdentityCache();
@@ -704,6 +717,12 @@ try {
     // was refusing anyway.
     eq("a dismissal clicked after the merge is still recorded", loadDismissals(ref, runsDir).some((d) => d.fingerprint === "aaaa9999"), true);
     eq("...and so is a fix", loadOutcomes(ref, runsDir).some((o) => o.fingerprint === "bbbb9999"), true);
+    // The denominator the addressed rate needs: what became of the comments nobody acted on.
+    const final = new Map(loadOutcomes(ref, runsDir).map((o) => [o.fingerprint, o]));
+    eq("a comment still open at the merge is recorded as ignored", final.get("cccc9999")?.outcome, "ignored");
+    eq("...with its likes", final.get("cccc9999")?.likes, 1);
+    eq("one a human closed without a verdict is recorded as closed", final.get("dddd9999")?.outcome, "closed");
+    eq("...and the fix is not overwritten as ignored", final.get("bbbb9999")?.outcome, "fixed");
 
     // One fixed directory per PR, not an iter- one: a daily cron over a merged PR would
     // otherwise evict the last REAL review inside PRR_RUNS_KEEP ticks and orphan every

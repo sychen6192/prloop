@@ -189,6 +189,13 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- calibrate measures what comments led to, not only what was rejected: an **addressed rate**
+  (a human fixed it, or the code it flagged changed under the open comment), comments still
+  open when the PR merged (`ignored`) and ones closed without a verdict, ADO likes, a table by
+  severity with a caution when low-severity comments are addressed more than critical ones,
+  a table per static-analysis rule (tool findings now carry `rule`), and per-repository
+  **demotion proposals** for a category or rule nobody acts on — printed, never applied.
+
 - Every run records what produced it — `stamp.json` in the run directory and a `stamp` block in
   `result.json`: prloop's commit and whether its checkout was dirty, and 12-hex hashes of the
   prompts, the loaded rules, the model fleet and the review-shaping settings. `calibrate` and

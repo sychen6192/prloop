@@ -96,7 +96,7 @@ import { REQUIREMENT_SYSTEM } from "../prompts/requirement";
 import { buildReqDisputePrompt } from "../prompts/skeptic";
 import { coveredByThread } from "../publish/publish";
 import { rankForVerification } from "../gates/skeptic";
-import { calibrate, groupReasons } from "./calibrate";
+import { calibrate, groupReasons, type Bucket, type CalibrationFinding } from "./calibrate";
 import { evaluateRun, totalsOf, STAGES, type EvaluatedFinding, type GoldenSet } from "./evaluate";
 import { extractCriteria, splitCriteria } from "../libs/criteria";
 import { stampHashes, stampLabel } from "../libs/stamp";
@@ -1659,6 +1659,8 @@ section("excluded categories (PRR_EXCLUDE_CATEGORIES)");
   eq("tool exclusion is counted", res.excluded, 1);
   eq("mypy (correctness) finding kept", res.findings[0]?.category, "correctness");
   eq("a converted tool finding carries its tier", res.findings[0]?.tier, "fact");
+  // A field, not a phrase in the evidence: calibrate reports how often each rule is acted on.
+  eq("...and its rule, as tool:rule", res.findings[0]?.rule, "mypy:R1");
   delete process.env["PRR_EXCLUDE_CATEGORIES"];
 }
 
@@ -2057,6 +2059,52 @@ section("calibration: joining what we published to what humans rejected");
   });
   eq("findings are grouped by the configuration that produced them",
     byStamp.byStamp.map((b) => [b.key, b.findings, b.dismissed]), [["new", 2, 0], ["old", 1, 1]]);
+
+  // What the comments LED to. Dismissals alone count every comment nobody answered as a
+  // success; the ledger also knows the ones the code changed under, and the ones walked past.
+  const pubs = (n: number, over: Partial<CalibrationFinding>) =>
+    Array.from({ length: n }, (_, i): CalibrationFinding => ({
+      fingerprint: `${over.rule ?? over.category ?? "x"}-${over.severity ?? ""}-${i}`,
+      category: "maintainability", confidence: 0.8, sources: ["m"], published: true, repo: "o/p/r", ...over,
+    }));
+  const noisy = pubs(12, { category: "maintainability", severity: "low" });
+  const useful = pubs(10, { category: "correctness", severity: "high" });
+  const lint = pubs(10, { category: "maintainability", severity: "low", rule: "ruff:SIM102", sources: ["ruff"] });
+  const ledger = calibrate({
+    findings: [...noisy, ...useful, ...lint],
+    verdicts: [],
+    dismissed: new Set([...noisy.slice(0, 5), ...lint.slice(0, 2)].map((f) => f.fingerprint)),
+    actedOn: {
+      fixed: new Set(useful.slice(0, 5).map((f) => f.fingerprint)),
+      autoClosed: new Set([...useful.slice(5, 8), ...noisy.slice(5, 6)].map((f) => f.fingerprint)),
+      ignored: new Set([...noisy.slice(6), ...lint.slice(2)].map((f) => f.fingerprint)),
+      liked: new Set(useful.slice(0, 2).map((f) => f.fingerprint)),
+    },
+  });
+  const row = (b: Bucket[], key: string) => b.find((x) => x.key === key);
+  eq("a category's addressed rate counts fixes and code changed under the comment",
+    row(ledger.byCategory, "correctness")?.addressedRate, 0.8);
+  eq("...and the ones walked past at merge are counted, not read as silence",
+    [row(ledger.byCategory, "maintainability")?.ignored, row(ledger.byCategory, "maintainability")?.liked], [14, 0]);
+  eq("likes are counted where they fell", row(ledger.byCategory, "correctness")?.liked, 2);
+  eq("a tool's rule has its own row", row(ledger.byRule, "ruff:SIM102")?.published, 10);
+  eq("the headline addressed count", ledger.addressed, 9);
+  eq("a category and a rule nobody acts on are proposed for demotion — in their own repository",
+    ledger.proposals.map((p) => [p.repo, p.subject, p.kind]).sort(),
+    [["o/p/r", "maintainability", "category"], ["o/p/r", "ruff:SIM102", "rule"]]);
+  check("...as a suggestion naming the setting, never applied",
+    ledger.proposals.some((p) => p.suggestion.includes("PRR_EXCLUDE_CATEGORIES=maintainability")));
+  check("a category people act on is not proposed", !ledger.proposals.some((p) => p.subject === "correctness"));
+  check("severity ordered as expected raises no caution", ledger.inverted === undefined);
+  const inverted = calibrate({
+    findings: [...pubs(10, { category: "a", severity: "low" }), ...pubs(10, { category: "b", severity: "critical" })],
+    verdicts: [],
+    dismissed: new Set(),
+    actedOn: { fixed: new Set(pubs(10, { category: "a", severity: "low" }).map((f) => f.fingerprint)), autoClosed: new Set() },
+  });
+  check("low-severity comments addressed more than critical ones raise the compliance caution",
+    (inverted.inverted ?? "").includes("partly compliance"), inverted.inverted);
+  eq("too few comments propose nothing", calibrate({ findings: pubs(3, { category: "z" }), verdicts: [], dismissed: new Set() }).proposals, []);
 }
 
 section("run stamp: what produced a run, as hashes a report can group by");
