@@ -15,6 +15,8 @@ import {
   isDryRun,
 } from "./config";
 import { buildReviewContext, type ReviewContext } from "./ado/intake";
+import type { IntakeProvider } from "./libs/context";
+import { FileIndex } from "./libs/fileindex";
 import { terminalPrStatus } from "./ado/iterations";
 import { fetchRepoConventions } from "./ado/conventions";
 import { renderConventions } from "./libs/rules";
@@ -44,7 +46,7 @@ export interface ReviewRunOptions {
    * contract in libs/context.ts is something a provider can be held to — including in a
    * test — instead of being whatever ado/intake.ts happens to return.
    */
-  intake?: (ref: PrRef, compareTo: number) => Promise<ReviewContext>;
+  intake?: IntakeProvider;
 }
 
 export interface ReviewRunResult {
@@ -220,51 +222,12 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
     skipped: ctx.skipped,
   });
 
-  if (ctx.files.length === 0) {
-    // Still publish: the sticky summary is what carries the iteration marker forward and
-    // what resolves stale threads. Skipping it wedged `--since auto` forever on a
-    // docs-only push, and left threads open whose code the push had deleted.
-    log("No reviewable code changes — publishing summary only");
-    const agg: AggregateResult = {
-      inline: [],
-      belowBar: [],
-      degraded: [],
-      stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
-    };
-    const durationSec = Math.round((Date.now() - started) / 1000);
-    // "No reviewable code changes" can also mean "the only changed file was too large to
-    // fetch" — that is not a clean PR, and the status must say so too, not just the exit
-    // code. Computed before publishing for the same reason as on the main path.
-    const incomplete: string[] = coverageGaps([], ctx.skipped, STRICT_COVERAGE);
-    const publishResult = await publish(
-      opts.ref,
-      { requirement: [], code: [] },
-      {
-        ctx,
-        agg,
-        req: { workItems: [], criteria: [], extras: [], skipped: "no reviewable code changes" },
-        finderErrors: [],
-        omittedFiles: [],
-        appliedRules: [],
-        staticResult: {
-          facts: [],
-          needsTriage: [],
-          suppressedCount: 0,
-          ranTools: [],
-          skipped: [],
-          staleFiles: [],
-          unresolved: 0,
-          skippedReason: "no reviewable code changes",
-        },
-        dismissalHints: [],
-        durationSec,
-        runDir: run.dir,
-      },
-      { unreviewed: [], incomplete },
-    );
-    incomplete.push(...publishResult.gaps);
-    return { ctx, agg, reqFindings: [], publishResult, runDir: run.dir, durationSec, incomplete };
-  }
+  // A change with no code in it — docs and config, or only deleted files — still runs, and
+  // still publishes: the sticky summary carries the resume point forward and closes threads
+  // whose code the push deleted (skipping it wedged `--since auto` on a docs-only push), and
+  // the requirement axis does not depend on code at all. Only the code axis stands down.
+  const noCode = ctx.files.length === 0;
+  if (noCode) log("No code in this change — the code axis has nothing to review");
 
   // The two axes run concurrently and blind to each other: neither model sees the other's
   // output, so "the code is clean" can't excuse a missing requirement, or vice versa.
@@ -283,6 +246,11 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // the PR for work it already contained. So an incremental run reads the PR a second time,
   // whole, through the same intake seam. Blobs are content-addressed and cached, so the
   // second read fetches only the files this push left alone.
+  //
+  // Whole, and not only its code: a criterion met in a config file or a document is not
+  // missing because it is not code. So the read that feeds this axis includes the changed
+  // non-code text as well, and costs those files' blob reads — which is why the gate asks
+  // for it only once it knows there are criteria to judge.
   const reqPromise = (
     SKIP_REQUIREMENT
       ? Promise.resolve<Awaited<ReturnType<typeof runRequirementGate>>>({
@@ -293,9 +261,16 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
             skipped: "requirement check skipped by config",
           },
         })
-      : (ctx.compareTo > 0 ? intake(opts.ref, 0) : Promise.resolve(ctx)).then((whole) =>
-          runRequirementGate({ ref: opts.ref, pr: ctx.pr, files: whole.files, fileIndex: whole.fileIndex, runner: opts.runner }),
-        )
+      : runRequirementGate({
+          ref: opts.ref,
+          pr: ctx.pr,
+          diff: async () => {
+            const whole = await intake(opts.ref, 0, { text: true });
+            const files = [...whole.files, ...(whole.textFiles ?? [])];
+            return { files, fileIndex: new FileIndex(files) };
+          },
+          runner: opts.runner,
+        })
   ).catch((e): Awaited<ReturnType<typeof runRequirementGate>> => {
     const msg = e instanceof Error ? e.message : String(e);
     log(`[FAIL] requirement axis threw: ${msg}`);
@@ -309,7 +284,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // PR would otherwise steer the review of that very PR. Non-fatal: most repos have none,
   // and a failed fetch costs the finder its context bonus, not the run.
   const conventions = renderConventions(
-    ctx.iteration.targetRefCommit
+    ctx.iteration.targetRefCommit && !noCode
       ? await fetchRepoConventions(opts.ref, ctx.iteration.targetRefCommit).catch((e) => {
           log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
           return [];
@@ -334,7 +309,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // named; it never fails the run, because a missing linter is not a missing review.
   let worktree: PreparedWorktree | undefined;
   let worktreeError: string | undefined;
-  if (WORKTREE_REPO && !SKIP_STATIC) {
+  if (WORKTREE_REPO && !SKIP_STATIC && !noCode) {
     const prepared = await prepareWorktree(WORKTREE_REPO, ctx.iteration.sourceRefCommit, opts.ref.prId).catch(
       (e): { error: string } => ({ error: `worktree preparation failed: ${e instanceof Error ? e.message : String(e)}` }),
     );
@@ -357,7 +332,12 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           unresolved: 0,
           skippedReason: "static analysis skipped by config",
         })
-      : worktreeError !== undefined
+      : noCode
+        ? Promise.resolve<StaticResult>({
+            facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0,
+            skippedReason: "no code in this change",
+          })
+        : worktreeError !== undefined
         ? Promise.resolve<StaticResult>({
             facts: [], needsTriage: [], suppressedCount: 0, ranTools: [], skipped: [], staleFiles: [], unresolved: 0,
             skippedReason: worktreeError,
@@ -373,13 +353,16 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       // and `finally` rather than a line after the await means a crashed gate does not
       // leave one behind, which on a cron over a PR list would accumulate every day.
       .finally(() => worktree?.cleanup()),
-    runFinders(opts.runner, {
-      pr: ctx.pr,
-      files: ctx.files,
-      iterationId: ctx.iteration.id,
-      compareTo: ctx.compareTo,
-      conventions,
-    }).catch((e): Awaited<ReturnType<typeof runFinders>> => {
+    (noCode
+      ? Promise.resolve<Awaited<ReturnType<typeof runFinders>>>({ outputs: [], prompt: "", omitted: [], rules: [] })
+      : runFinders(opts.runner, {
+          pr: ctx.pr,
+          files: ctx.files,
+          iterationId: ctx.iteration.id,
+          compareTo: ctx.compareTo,
+          conventions,
+        })
+    ).catch((e): Awaited<ReturnType<typeof runFinders>> => {
       const why = `finder stage (${e instanceof Error ? e.message : String(e)})`;
       stageFailures.push(why);
       // Nothing read the diff, so nothing about this push is known.

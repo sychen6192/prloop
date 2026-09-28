@@ -71,8 +71,8 @@ export interface ToolSpec {
 
 export interface Profile {
   language: string;
-  /** File extensions this profile claims. */
-  extensions: string[];
+  /** File extensions this profile claims, drawn from libs/lang.ts. */
+  extensions: readonly string[];
   tools: ToolSpec[];
   /** Rule ids that are always dropped, whatever tier the tool sits in. */
   ignoreRules?: string[];

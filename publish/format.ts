@@ -2,7 +2,7 @@
 // own threads: the bot marker identifies authorship, the fingerprint identifies the issue.
 import { MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "../config";
 import { defuseHtmlComments, findingMarkers, summaryMarkers } from "./markers";
-import { detectLanguage } from "../libs/lang";
+import { UNKNOWN_FILE_TYPE, detectLanguage } from "../libs/lang";
 import { redactSecrets } from "../libs/redact";
 import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
 import type { AggregateResult } from "../gates/aggregate";
@@ -303,8 +303,12 @@ export function renderSummary(input: SummaryInput): string {
   lines.push("### 🔍 Code check", "");
 
   // The no-comment path is a feature: silence on a clean PR is what makes the noisy runs
-  // worth reading.
-  if (agg.inline.length === 0 && agg.belowBar.length === 0 && agg.degraded.length === 0) {
+  // worth reading. But "no issues found" is a claim about code somebody read, and a change
+  // with none in it must not make it.
+  const nothingFound = agg.inline.length === 0 && agg.belowBar.length === 0 && agg.degraded.length === 0;
+  if (nothingFound && ctx.files.length === 0) {
+    lines.push("_No code in this change for the code check to review._", "");
+  } else if (nothingFound) {
     lines.push("✅ **No issues found.**", "");
   } else if (agg.inline.length === 0) {
     lines.push("✅ **No issues above the reporting threshold.**", "");
@@ -359,8 +363,17 @@ export function renderSummary(input: SummaryInput): string {
   if (input.omittedFiles.length > 0) {
     notes.push(`Diff size limit: ${input.omittedFiles.length} files left out of this analysis: ${input.omittedFiles.slice(0, 10).join(", ")}${input.omittedFiles.length > 10 ? " and more" : ""}`);
   }
-  if (ctx.skipped.length > 0) {
-    notes.push(`Skipped ${ctx.skipped.length} non-code/generated files`);
+  // Named, not counted: a file type prloop does not know may be code in a language it does
+  // not review yet, and that is the one skip a reader has to be able to see.
+  const unknown = ctx.skipped.filter((f) => f.reason === UNKNOWN_FILE_TYPE).map((f) => f.path);
+  if (unknown.length > 0) {
+    notes.push(
+      `Not reviewed, file type unknown to prloop: ${unknown.slice(0, 10).join(", ")}${unknown.length > 10 ? ` and ${unknown.length - 10} more` : ""}`,
+    );
+  }
+  const otherSkips = ctx.skipped.length - unknown.length;
+  if (otherSkips > 0) {
+    notes.push(`The code check skipped ${otherSkips} files that are not code, generated, deleted or binary`);
   }
   if (input.appliedRules.length > 0) {
     notes.push(`Review rules applied: ${input.appliedRules.join(", ")}`);

@@ -203,9 +203,27 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   life in April 2026. CI runs 22 and 24. Requests now take `fetch` from the same undici as
   their dispatcher — Node's global fetch is its own bundled undici, and undici 8 rejects the
   handler an older one hands it.
+- `PRR_RULES_DIR` is added to the shipped rules instead of replacing them: a team that wrote
+  its own C# pack used to lose the base smells and every language pack with it. A file named
+  like a shipped one (`_base.md`, `java.md`) still replaces that one — which is how to opt out
+  of a pack. **If you pointed `PRR_RULES_DIR` at a full copy of `rules/`, nothing changes; if
+  you relied on it to drop the shipped packs, add same-named files to override them.**
+- Configuration, markup and documentation files changed by a PR are now read by the
+  requirement axis (never by the finders), so a criterion met in `appsettings.json` or a
+  pipeline YAML is judged against it. They cost one blob read each, and only on a PR with a
+  linked work item that has criteria.
 
 ### Fixed
 
+- **A PR in C#, Go, Rust, PHP, C++ or another language outside a nine-entry list is reviewed,
+  not reported as reviewed.** Such a PR had "no reviewable code changes": no finder read it,
+  the requirement axis was skipped along with them although it does not depend on language,
+  and the status read `succeeded — Reviewed 0 files, no blockers`. One table in
+  `libs/lang.ts` now says what every file is — the code axis reviews source in the common
+  languages, and the static-analysis profiles take their extensions from the same table. A
+  change with no code (docs, config, only deletions) still runs the requirement axis, and the
+  summary and status say no code was reviewed instead of "no issues found". A changed file of
+  a type prloop does not know is named in the summary rather than dropped silently.
 - **`--since auto` no longer fails a PR for acceptance criteria an earlier push delivered.** The
   requirement axis judged each incremental run's diff as if it were the whole PR, so a
   criterion implemented two pushes ago came back "missing", the dispute pass — shown the same

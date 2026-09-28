@@ -128,6 +128,7 @@ const shows = (prompt: string, code: string) =>
 
 interface Defect {
   by: string[];
+  file: string;
   quote: string;
   claim: string;
   category: string;
@@ -136,18 +137,24 @@ interface Defect {
   always?: boolean;
 }
 
+const PAY = "src/pay.ts";
+const INVOICE = "src/Billing/Invoice.cs";
 const DEFECTS: Defect[] = [
-  { by: ["finder-a", "finder-b"], quote: "return amountCents + feeCents;", category: "correctness", severity: "high", claim: "refund() adds the fee to the amount instead of subtracting it" },
-  { by: ["finder-a", "finder-b"], quote: "if (await send(amountCents)) return true;", category: "reliability", severity: "medium", claim: "An exception thrown by send() ends the retry loop instead of counting as a failed attempt" },
-  { by: ["finder-a"], quote: "const total = amountCents * 100;", category: "correctness", severity: "high", claim: "Converts cents to cents a second time", always: true },
-  { by: ["finder-b"], quote: "for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {", category: "correctness", severity: "medium", claim: "The retry loop never terminates while send() keeps failing" },
-  { by: ["finder-a", "finder-b"], quote: "return totalCents / parts;", category: "correctness", severity: "medium", claim: "splitEvenly() returns fractional cents; floor it and hand out the remainder" },
+  { by: ["finder-a", "finder-b"], file: PAY, quote: "return amountCents + feeCents;", category: "correctness", severity: "high", claim: "refund() adds the fee to the amount instead of subtracting it" },
+  { by: ["finder-a", "finder-b"], file: PAY, quote: "if (await send(amountCents)) return true;", category: "reliability", severity: "medium", claim: "An exception thrown by send() ends the retry loop instead of counting as a failed attempt" },
+  { by: ["finder-a"], file: PAY, quote: "const total = amountCents * 100;", category: "correctness", severity: "high", claim: "Converts cents to cents a second time", always: true },
+  { by: ["finder-b"], file: PAY, quote: "for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {", category: "correctness", severity: "medium", claim: "The retry loop never terminates while send() keeps failing" },
+  { by: ["finder-a", "finder-b"], file: PAY, quote: "return totalCents / parts;", category: "correctness", severity: "medium", claim: "splitEvenly() returns fractional cents; floor it and hand out the remainder" },
+  { by: ["finder-a", "finder-b"], file: INVOICE, quote: "public decimal Total => Lines.Sum(l => l.Price);", category: "correctness", severity: "high", claim: "Total ignores each line's quantity" },
 ];
 
 /** The line that implements each acceptance criterion, and the file it lives in. */
 const EVIDENCE: Record<string, { file: string; quote: string }> = {
   "4711-AC1": { file: "src/pay.ts", quote: "for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {" },
   "4711-AC2": { file: "src/export.ts", quote: 'const header = "id,amount";' },
+  "4712-AC1": { file: "appsettings.json", quote: '"InvoiceDueDays": 30' },
+  "4712-AC2": { file: INVOICE, quote: "public DateTime DueDate => IssuedOn.AddDays(_options.InvoiceDueDays);" },
+  "4713-AC1": { file: "docs/retry.md", quote: "A failed charge is retried three times before the order is cancelled." },
 };
 
 function finderAnswer(model: string, prompt: string): unknown {
@@ -155,7 +162,7 @@ function finderAnswer(model: string, prompt: string): unknown {
     category: d.category,
     severity: d.severity,
     confidence: 0.8,
-    file: "src/pay.ts",
+    file: d.file,
     quote: d.quote,
     context_before: null,
     context_after: null,
@@ -392,6 +399,106 @@ try {
         files.join(", "),
       );
     }
+  }
+
+  /** Points the fake at another pull request: one push, these files, this work item. */
+  const nextPr = (title: string, files: Record<string, { blob: string; text: string }>, workItem: Record<string, unknown>) => {
+    ado.state.pr = { ...ado.state.pr, title, description: "" };
+    ado.state.iterations = [iteration(1)];
+    const entries = Object.entries(files).map(([file, f], i) => entry(`/${file}`, f.blob, 10 + i));
+    ado.state.changesFor = () => [{ changeEntries: entries }];
+    ado.state.blobs = Object.fromEntries(Object.values(files).map((f) => [f.blob, f.text]));
+    ado.state.workItemRefs = [Number(workItem["id"])];
+    ado.state.workItems = { [Number(workItem["id"])]: workItem };
+    ado.state.threads = [];
+    ado.reset();
+    models.reset();
+    models.answerBy(reviewer);
+  };
+  const story = (id: number, criteria: string[]) => ({
+    id,
+    fields: {
+      "System.Title": `Story ${id}`,
+      "System.WorkItemType": "User Story",
+      "System.State": "Active",
+      "Microsoft.VSTS.Common.AcceptanceCriteria": `<ul>${criteria.map((c) => `<li>${c}</li>`).join("")}</ul>`,
+    },
+  });
+
+  section("a C# pull request: reviewed, not waved through as \"0 files\"");
+  {
+    // C# was not on the list of reviewable languages. A PR written in it had "no reviewable
+    // code changes": no finder read it, the requirement axis was skipped along with them
+    // although it does not depend on language, and the status read `Reviewed 0 files, no
+    // blockers` — green, on exactly the PRs nobody had reviewed.
+    const invoice = [
+      "namespace Shop.Billing;",
+      "",
+      "public sealed class Invoice",
+      "{",
+      "    private readonly BillingOptions _options;",
+      "",
+      "    public Invoice(BillingOptions options, DateTime issuedOn, IReadOnlyList<Line> lines)",
+      "    {",
+      "        _options = options;",
+      "        IssuedOn = issuedOn;",
+      "        Lines = lines;",
+      "    }",
+      "",
+      "    public DateTime IssuedOn { get; }",
+      "    public IReadOnlyList<Line> Lines { get; }",
+      "",
+      "    public DateTime DueDate => IssuedOn.AddDays(_options.InvoiceDueDays);",
+      "",
+      "    public decimal Total => Lines.Sum(l => l.Price);",
+      "}",
+      "",
+    ].join("\n");
+    const settings = '{\n  "Billing": {\n    "InvoiceDueDays": 30\n  }\n}\n';
+    nextPr(
+      "Billing: invoices with a configurable due date",
+      {
+        [INVOICE]: { blob: "c5c5c5", text: invoice },
+        "appsettings.json": { blob: "c6c6c6", text: settings },
+        "build.zig": { blob: "c7c7c7", text: "const std = @import(\"std\");\n" },
+      },
+      story(4712, ["The invoice due period is configurable", "An invoice's due date follows from the configured period"]),
+    );
+    const csRef = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4822");
+    const { value: result } = await capture(() => runReview({ ref: csRef, runner, compareTo: 0 }));
+
+    const finderPrompts = stageCalls("findings").map(userPrompt);
+    eq("both finders are asked", finderPrompts.length, 2);
+    check("...and read the C# file, as C#", finderPrompts.every((p) => p.includes(`### ${INVOICE} [add, csharp]`)), finderPrompts[0]?.slice(0, 600));
+    check("...but not the settings file, which is not code", finderPrompts.every((p) => !p.includes("appsettings.json")));
+    const posted = inlinePosts();
+    eq("the C# bug is posted", posted.length, 1);
+    eq("...on its line", lineOf(posted[0] ?? {}), 19);
+
+    // A criterion met in a config file is not missing because the file is not code.
+    const reqPrompt = userPrompt(stageCalls("requirements")[0] ?? ({ body: {} } as RecordedCall));
+    check("the requirement axis reads the settings file", reqPrompt.includes("appsettings.json"), reqPrompt.slice(0, 300));
+    eq("...so both criteria are met", result.req?.criteria.map((c) => c.verdict), ["satisfied", "satisfied"]);
+    check("a file type prloop does not read is named, not silently dropped", summaryOf().includes("file type unknown to prloop: build.zig"), summaryOf());
+    eq("the status fails the PR over the bug it found", ado.matching("POST", /\/statuses$/)[0]?.body?.["state"], "failed");
+  }
+
+  section("a pull request with no code: the requirement axis still runs, and nobody claims a review");
+  {
+    const doc = "# Retries\n\nA failed charge is retried three times before the order is cancelled.\n";
+    nextPr("Document the retry policy", { "docs/retry.md": { blob: "d1d1d1", text: doc } }, story(4713, ["The retry policy is documented"]));
+    const docsRef = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4823");
+    const { value: result } = await capture(() => runReview({ ref: docsRef, runner, compareTo: 0 }));
+
+    eq("no finder is asked about a change with no code", stageCalls("findings").length, 0);
+    eq("the requirement axis still is", stageCalls("requirements").length, 1);
+    eq("...and finds the criterion met in the document", result.req?.criteria.map((c) => c.verdict), ["satisfied"]);
+    check("the summary says there was no code, not that the code was clean",
+      summaryOf().includes("No code in this change for the code check to review") && !summaryOf().includes("No issues found"), summaryOf());
+    const status = ado.matching("POST", /\/statuses$/)[0]?.body;
+    eq("the status passes", status?.["state"], "succeeded");
+    check("...without claiming it reviewed anything", !String(status?.["description"] ?? "").includes("Reviewed 0 files"), String(status?.["description"]));
+    eq("...and the exit code agrees", exitCodeFor(result), 0);
   }
 } finally {
   await ado.close();

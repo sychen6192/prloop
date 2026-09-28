@@ -1,10 +1,15 @@
 // Language profiles. Adding a language is adding an entry here — the pipeline itself has
-// no per-language branches.
+// no per-language branches. Which files a profile claims comes from libs/lang.ts, the one
+// table of file types, so the analysers and the finders cannot disagree about what a
+// TypeScript file is.
+import { extensionsOf } from "../libs/lang";
 import type { Profile } from "./types";
+
+const extensionsFor = (...ids: string[]) => ids.flatMap((id) => extensionsOf(id));
 
 const python: Profile = {
   language: "python",
-  extensions: [".py", ".pyi"],
+  extensions: extensionsFor("python"),
   tools: [
     {
       // Ruff subsumes flake8/bugbear/pyupgrade and is fast enough to run on every PR.
@@ -60,7 +65,7 @@ const python: Profile = {
 
 const java: Profile = {
   language: "java",
-  extensions: [".java"],
+  extensions: extensionsFor("java"),
   tools: [
     {
       name: "pmd",
@@ -138,7 +143,7 @@ const java: Profile = {
 
 const nextjs: Profile = {
   language: "typescript",
-  extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+  extensions: extensionsFor("typescript", "tsx", "javascript", "jsx"),
   tools: [
     {
       // Type errors are facts. tsc is project-wide, so its findings get diff-filtered

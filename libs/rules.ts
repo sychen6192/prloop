@@ -3,7 +3,7 @@
 // touched no Java — which is what lets the rule set grow without growing every prompt.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { RULES_DIR } from "../config";
+import { RULES_DIR, SHIPPED_RULES_DIR } from "../config";
 import { normalizePath } from "./fileindex";
 import { logVerbose } from "./log";
 
@@ -69,14 +69,14 @@ function parseRule(name: string, raw: string): Rule {
   return { name, applyTo, body: body.trim() };
 }
 
-function readRuleDir(dir: string): Rule[] {
+function readRuleDir(dir: string, root: string = dir): Rule[] {
   if (!fs.existsSync(dir)) return [];
   const out: Rule[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...readRuleDir(p));
+    if (entry.isDirectory()) out.push(...readRuleDir(p, root));
     else if (entry.name.endsWith(".md")) {
-      out.push(parseRule(path.relative(RULES_DIR, p), fs.readFileSync(p, "utf8")));
+      out.push(parseRule(path.relative(root, p), fs.readFileSync(p, "utf8")));
     }
   }
   return out;
@@ -86,8 +86,17 @@ function readRuleDir(dir: string): Rule[] {
 // rule loading lives.
 export { RULES_DIR };
 
-export function loadRules(): Rule[] {
-  return readRuleDir(RULES_DIR);
+/**
+ * The shipped rules plus the team's own (PRR_RULES_DIR), a team file replacing the shipped
+ * one of the same name. The directories are parameters for the selftest, which cannot
+ * re-configure the process.
+ */
+export function loadRules(extraDir: string = RULES_DIR, shippedDir: string = SHIPPED_RULES_DIR): Rule[] {
+  const shipped = readRuleDir(shippedDir);
+  if (!extraDir || path.resolve(extraDir) === path.resolve(shippedDir)) return shipped;
+  const own = readRuleDir(extraDir);
+  const replaced = new Set(own.map((r) => r.name));
+  return [...shipped.filter((r) => !replaced.has(r.name)), ...own];
 }
 
 /** The rules whose applyTo matches at least one changed path. */

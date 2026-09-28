@@ -5,7 +5,7 @@
 // needing ADO credentials. It reuses libs/diff.ts wholesale, so what it validates is the
 // same code that runs in production, not a parallel implementation.
 import { FileIndex } from "../libs/fileindex";
-import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
+import { UNKNOWN_FILE_TYPE, detectLanguage, fileKind, isNoiseFile } from "../libs/lang";
 import { buildHunks, diffLines } from "../libs/diff";
 import { splitLines } from "../libs/text";
 import { log, logVerbose } from "../libs/log";
@@ -61,6 +61,8 @@ export interface LocalIntakeOptions {
   repo: string;
   base: string;
   head: string;
+  /** Also diff the changed non-code text files into `textFiles` (libs/context.ts). */
+  text?: boolean;
 }
 
 export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise<ReviewContext> {
@@ -89,6 +91,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
 
   const skipped: SkippedFile[] = [];
   const files: FileDiff[] = [];
+  const textFiles: FileDiff[] = [];
 
   for (const e of entries) {
     const changeType = mapStatus(e.status);
@@ -96,12 +99,13 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       skipped.push({ path: e.path, reason: "generated/lock/vendor" });
       continue;
     }
-    if (!isReviewable(e.path)) {
-      skipped.push({ path: e.path, reason: `non-code (${detectLanguage(e.path)})` });
-      continue;
-    }
     if (changeType === "delete") {
       skipped.push({ path: e.path, reason: "deleted" });
+      continue;
+    }
+    const kind = fileKind(e.path);
+    if (kind === "unknown" || (kind === "text" && !opts.text)) {
+      skipped.push({ path: e.path, reason: kind === "text" ? `not code (${detectLanguage(e.path)})` : UNKNOWN_FILE_TYPE });
       continue;
     }
 
@@ -114,7 +118,9 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     ]);
     const failure = "failure" in right ? right.failure : "failure" in left ? left.failure : undefined;
     if (failure !== undefined) {
-      skipped.push({ path: e.path, reason: failure });
+      // A text file too large to read is no coverage gap, so it must not carry the reason
+      // orchestrator.ts counts as one — the same distinction ado/intake.ts draws.
+      skipped.push({ path: e.path, reason: kind === "text" && failure === "too large" ? "too large (not code)" : failure });
       continue;
     }
     const rightLines = (right as { lines: string[] }).lines;
@@ -130,7 +136,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     }
     // Canonical path shape, same as the ADO intake produces after normalization: no
     // leading slash, forward separators. git already reports exactly that.
-    files.push({
+    (kind === "code" ? files : textFiles).push({
       path: e.path,
       ...(e.originalPath === undefined ? {} : { originalPath: e.originalPath }),
       changeType,
@@ -178,6 +184,7 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
     iteration,
     compareTo: 0,
     files,
+    textFiles,
     skipped,
     changeTrackingIds: new Map(),
     fileIndex: new FileIndex(files),

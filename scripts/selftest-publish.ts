@@ -111,6 +111,7 @@ try {
     iteration: { id: 3, sourceRefCommit: "src3", targetRefCommit: "tgt3", commonRefCommit: "base3", createdDate: "" },
     compareTo: 0,
     files,
+    textFiles: [],
     skipped: [],
     changeTrackingIds: new Map<string, number>([["src/app.ts", 11], ["src/pay.ts", 12]]),
     fileIndex: new FileIndex(files),

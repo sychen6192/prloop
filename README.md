@@ -463,7 +463,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_OPENCODE_AGENT` | `prloop-reviewer` | agent definition prloop drives (installed by `npm run setup`) |
 | `PRR_OPENCODE_JSON` | `1` | `0` = drop `--format json` for builds without JSONL events; loses tracing |
 | `PRR_AGENT_TIMEOUT_MS` | `900000` | wall clock for one opencode session |
-| `PRR_RULES_DIR` | `rules/` | your team's rules as `.md` files with an `applyTo` glob |
+| `PRR_RULES_DIR` | — | your team's rules as `.md` files with an `applyTo` glob, added to the shipped `rules/`; a file named like a shipped one replaces it |
 | `PRR_MAX_DIFF_CHARS` | `240000` | ceiling on the diff sent to a finder, in characters of the diff alone; overflow makes the run incomplete |
 | `PRR_FINDER_MAX_CHUNKS` | `1` | requests one finder may spend on a diff that does not fit; `1` = the overflow is never read. Every finder reads every chunk, so corroboration is unchanged — and the cost is linear |
 | `PRR_CONTEXT_TOKENS` | `0` (off) | the model's context window in tokens. Set it and the diff is budgeted as `window − PRR_LLM_MAX_TOKENS − (system prompt + rules + conventions + PR description + inlined schema)`, so the backend never truncates a prompt mid-hunk and corrupts the quotes anchoring depends on. Token counts are an estimate (±20%) |
@@ -551,7 +551,16 @@ The reviewed repository's own convention documents (`CONTRIBUTING.md`, `CODING_S
 `docs/` variants, `CLAUDE.md`, `AGENTS.md`) are fetched automatically at the iteration's
 commit and injected ahead of the rules — that is what makes "conventions override the
 baseline" enforceable rather than aspirational. Standards that live anywhere else go in
-`PRR_RULES_DIR` as rule files with an `applyTo` glob.
+`PRR_RULES_DIR` as rule files with an `applyTo` glob. They are added to the shipped rules,
+not swapped for them — a C# rule pack does not cost you the base smells — and a file named
+like a shipped one (`_base.md`, `java.md`) replaces that one.
+
+Which files are reviewed at all is one table, `libs/lang.ts`: the code axis reads source in
+the common languages (C#, Java, Kotlin, Python, TypeScript/JavaScript, Go, Rust, C/C++, PHP,
+Ruby, Swift, Scala, SQL, shell, PowerShell, Terraform, Bicep, Dockerfiles and more), while
+configuration, markup and documentation go to the requirement axis only — a criterion is
+often met in a config file. A changed file of a type the table does not list is named in the
+summary rather than silently dropped.
 
 ## Development
 

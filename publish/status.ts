@@ -72,6 +72,11 @@ export function reviewOutcome(input: {
   return {
     exitCode: 0,
     state: "succeeded",
-    description: `Reviewed ${input.filesReviewed} files, no blockers in requirements or code`,
+    // "Reviewed 0 files, no blockers" read as a clean review, on exactly the PRs nobody had
+    // reviewed — every one written in a language prloop did not read.
+    description:
+      input.filesReviewed > 0
+        ? `Reviewed ${input.filesReviewed} files, no blockers in requirements or code`
+        : "No code for prloop to review in this change; no blockers in requirements",
   };
 }

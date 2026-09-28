@@ -9,7 +9,7 @@ import { FileIndex, normalizePath } from "../libs/fileindex";
 import { parsePrUrl, prBase } from "../ado/client";
 import { buildHunks, diffLines, renderUnifiedDiff } from "../libs/diff";
 import { arrayField, escapeControlCharsInStrings, parseJsonObject, salvageArrayItems } from "../libs/json";
-import { detectLanguage, isNoiseFile, isReviewable } from "../libs/lang";
+import { detectLanguage, fileKind, isNoiseFile, isReviewable } from "../libs/lang";
 import { buildDiffPayload, buildDiffPayloads } from "../libs/payload";
 import { htmlToText } from "../libs/html";
 import { globToRegExp, loadRules, renderConventions, renderRules, ruleHeadings, selectRules } from "../libs/rules";
@@ -758,6 +758,25 @@ check("lockfile is noise", isNoiseFile("/package-lock.json"));
 check(".next output is noise", isNoiseFile("/apps/web/.next/static/x.js"));
 check("ordinary ts is reviewable", isReviewable("/src/a.ts"));
 check("markdown is not reviewed", !isReviewable("/README.md"));
+// The languages a nine-entry list left out, C# first: a PR written in one of them had "no
+// reviewable code changes", skipped the requirement axis too, and went green as reviewed.
+for (const [file, lang] of [
+  ["src/Billing/Invoice.cs", "csharp"], ["cmd/api/main.go", "go"], ["src/lib.rs", "rust"],
+  ["web/index.php", "php"], ["engine/core.cpp", "cpp"], ["infra/main.tf", "hcl"],
+  ["deploy/Dockerfile", "dockerfile"], ["Dockerfile.prod", "dockerfile"], ["CMakeLists.txt", "cmake"],
+  ["Makefile", "makefile"], ["Jenkinsfile", "groovy"], ["Views/Home/Index.cshtml", "razor"],
+] as const) {
+  eq(`${file} is ${lang}`, detectLanguage(file), lang);
+  check(`...and the code axis reviews it`, isReviewable(file));
+}
+// Non-code text a requirement is often delivered in: read by the requirement axis only.
+for (const file of ["appsettings.json", "azure-pipelines.yml", "docs/retry.md", "App.config", "Service.csproj"]) {
+  eq(`${file} is text, not code`, fileKind(file), "text");
+}
+eq("a name is matched before the extension", fileKind("CMakeLists.txt"), "code");
+eq("an unlisted type is unknown, never guessed", fileKind("build.zig"), "unknown");
+eq("...as is a file with no extension and no known name", fileKind("LICENSE"), "unknown");
+check("noise stays out of review whatever its type", !isReviewable("dist/app.js"));
 
 // --- payload budget ---
 section("diff budget");
@@ -858,6 +877,28 @@ section("rule selection");
     eq("_base.md applyTo is global", base.applyTo, ["**/*"]);
     check("_base.md body has Fowler smells", base.body.includes("Feature Envy"));
     check("_base.md frontmatter stripped", !base.body.startsWith("---"));
+  }
+}
+{
+  // PRR_RULES_DIR is added to the shipped rules. As a replacement, a team that wrote its own
+  // C# pack lost the base smells and every language pack with it, and nothing said so.
+  const team = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-rules-"));
+  try {
+    fs.writeFileSync(path.join(team, "csharp.md"), '---\napplyTo: "**/*.cs"\n---\n# C# rules\n');
+    fs.mkdirSync(path.join(team, "api"));
+    fs.writeFileSync(path.join(team, "api", "controllers.md"), '---\napplyTo: "**/Controllers/*.cs"\n---\n# Controllers\n');
+    const merged = loadRules(team);
+    const names = (paths: string[]) => selectRules(merged, paths).map((r) => r.name).sort();
+    eq("a team's C# pack is added to the base smells, not swapped for them",
+      names(["src/Api/Controllers/Orders.cs"]), ["_base.md", "api/controllers.md", "csharp.md"]);
+    check("...and the shipped language packs are all still there", merged.some((r) => r.name === "java.md"));
+    // A same-named file is how a team opts out of, or rewrites, a shipped pack.
+    fs.writeFileSync(path.join(team, "_base.md"), '---\napplyTo: "**/*"\n---\n# Our baseline\n');
+    const replaced = loadRules(team).filter((r) => r.name === "_base.md");
+    eq("a team file named like a shipped one replaces it", replaced.map((r) => r.body), ["# Our baseline"]);
+    eq("unset, the shipped rules alone", loadRules("").map((r) => r.name).sort(), loadRules().map((r) => r.name).sort());
+  } finally {
+    fs.rmSync(team, { recursive: true, force: true });
   }
 }
 {
@@ -1490,7 +1531,7 @@ section("suggested fix rendering");
   const padded = renderFindingComment({ ...base, suggested_fix: "\n\n    a()\n\n" });
   check("surrounding blank lines are dropped", padded.includes("```python\n    a()\n```"));
 
-  const unknown = renderFindingComment({ ...base, file: "/x/Makefile", suggested_fix: "all:" });
+  const unknown = renderFindingComment({ ...base, file: "/x/build.zig", suggested_fix: "all:" });
   check("an unknown language gets a bare fence", unknown.includes("```\nall:"));
 
   check("no fix means no section", !renderFindingComment(base).includes("Suggested fix"));

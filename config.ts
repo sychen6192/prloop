@@ -84,7 +84,7 @@ export const KNOWN_KEYS: readonly ConfigKey[] = [
 
   { name: "PRR_FINDER_PROMPT_SUFFIX_BY_MODEL", kind: "json", section: S_FINDER, description: "JSON model -> stance text for that finder's prompt" },
   { name: "PRR_FINDER_SEED", kind: "number", section: S_FINDER, description: "file-order shuffle seed; unset = fresh per run" },
-  { name: "PRR_RULES_DIR", kind: "string", section: S_FINDER, description: "reviewer rules dir (default: the tool's own rules/)" },
+  { name: "PRR_RULES_DIR", kind: "string", section: S_FINDER, description: "team rules added to the shipped rules; same name replaces" },
 
   { name: "PRR_MAX_DIFF_CHARS", kind: "number", section: S_BUDGET, description: "ceiling on the diff sent to a finder" },
   { name: "PRR_CONTEXT_TOKENS", kind: "number", section: S_BUDGET, description: "model context window; 0 = char ceiling only" },
@@ -734,7 +734,14 @@ export const FINDER_SEED: number | undefined = (() => {
 
 // Reviewer rules (markdown with an applyTo glob) loaded by libs/rules.ts. Declared here so
 // the registry covers it; rules.ts re-exports the resolved path.
-export const RULES_DIR = strEnv("PRR_RULES_DIR", path.join(PRLOOP_ROOT, "rules"));
+//
+// ADDED to the rules prloop ships, not a replacement for them. As a replacement, a team that
+// wrote its own C# rules lost the base code smells and every language pack in the same
+// move, with nothing saying so — and the languages the shipped packs do not cover are
+// exactly why a team writes its own. A file named like a shipped one (`_base.md`) still
+// replaces that one, which is how a team opts out of a pack.
+export const SHIPPED_RULES_DIR = path.join(PRLOOP_ROOT, "rules");
+export const RULES_DIR = strEnv("PRR_RULES_DIR", "");
 
 // --- Diff / token budget (PR-Agent style deterministic compression) ---
 export const MAX_DIFF_CHARS = numEnv("PRR_MAX_DIFF_CHARS", 240_000, 1000);
