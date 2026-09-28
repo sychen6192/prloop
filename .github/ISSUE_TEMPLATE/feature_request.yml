@@ -25,8 +25,8 @@ body:
     attributes:
       label: What you propose
       description: >-
-        If it is a new knob: which of the four places it lands in (config.ts KNOWN_KEYS,
-        .env.example, the README table, and the code that reads it — all four or none).
+        If it is a new knob: the three places it lands in (the config.ts reader that
+        declares it, .env.example and the README table — all three or none).
         If it is a new stage or gate: which existing gate could not be made to do it.
     validations:
       required: true

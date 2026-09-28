@@ -119,6 +119,18 @@ console.log("\nThe pipeline reaches Azure DevOps only through a ReviewHost");
   check("no pipeline module imports ado/", reaches.length === 0, reaches.join(", "));
 }
 
+console.log("\nChecklists state today's rules");
+{
+  // A new setting went from four places to three when KNOWN_KEYS started being built from the
+  // readers' declarations. CLAUDE.md and CONTRIBUTING.md changed with it; the pull request and
+  // feature-request templates did not, so the checklist every contributor ticks still asked for
+  // a step that no longer exists.
+  check("CLAUDE.md gives a new knob three places", read("CLAUDE.md").includes("Add all three or none"));
+  for (const f of [".github/PULL_REQUEST_TEMPLATE.md", ".github/ISSUE_TEMPLATE/feature_request.yml", "README.md", "CONTRIBUTING.md"]) {
+    check(`${f} does not ask for the retired fourth place`, !/\b(?:all four|four places)\b/i.test(read(f)));
+  }
+}
+
 console.log("\nPaths documents point at");
 {
   // docs/superpowers/specs/ was renamed to docs/design/; a stale link in a doc is silent.

@@ -305,11 +305,11 @@ table at the end — one line per PR with its exit code and what actually happen
 out of each run's own `result.json`, because the code alone cannot tell "clean" from "the PR
 had already merged" — and then exits `1` > `2` > `3` > `0`, worst wins. The whole file is
 validated first, so a typo on line 40 surfaces immediately rather than two hours in. Each PR
-is a separate process (per-run state is module-global in four places), one at a time unless
-`PRR_BATCH_PARALLEL` says more — and then each child gets its share of
-`PRR_LLM_CONCURRENCY` and `PRR_ADO_CONCURRENCY` rather than all of it, since both limits are
-per process and N children at the full limit would be N times what the endpoint was sized
-for; side by side, every line a child prints is prefixed with its pull request. If three pull
+is a separate process (the log, the record of model calls and the dry-run flag are per
+process), one at a time unless `PRR_BATCH_PARALLEL` says more — and then each child gets its
+share of `PRR_LLM_CONCURRENCY` and `PRR_ADO_CONCURRENCY` rather than all of it, since both
+limits are per process and N children at the full limit would be N times what the endpoint was
+sized for; side by side, every line a child prints is prefixed with its pull request. If three pull
 requests in a row fail before producing a review, the rest are abandoned — that is a
 credential, an endpoint or a proxy, not those pull requests, and the remaining PRs would each
 pay a full retry budget to find that out.
@@ -820,6 +820,6 @@ blocked; and reformatted indentation must still match on the second pass.
 
 ## Contributing
 
-[CONTRIBUTING.md](./CONTRIBUTING.md) — invariants, the four places a new knob lives, and how to
+[CONTRIBUTING.md](./CONTRIBUTING.md) — invariants, the three places a new knob lives, and how to
 run a review with no ADO credentials. [SECURITY.md](./SECURITY.md) covers what the tool handles
 and how to report a vulnerability privately; [CHANGELOG.md](./CHANGELOG.md) is the history.
