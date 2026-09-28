@@ -242,6 +242,14 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- **A static-analysis comment closes only on the tool's evidence.** It used to close like a
+  model's, when the code under it changed — which is the right test for a finding nothing
+  re-checks, and the wrong one for a tool that re-runs every time. It now closes only when
+  the same tool analysed that file this run and no longer reports the finding (reviewdog's
+  rule); a skipped tool, a broken toolchain or a file it was not given leaves it open. Tool
+  comments carry a `<!-- prloop:tool=... -->` marker after the existing ones, so a model
+  finding's bytes are unchanged, and `static.json` records what each tool analysed and every
+  fingerprint it reported there, on any line.
 - `scripts/selftest.ts` is one module per area under `scripts/selftest/` — anchoring, finder,
   skeptic, aggregate, requirement, static, rules, publish, models, security, config, measure —
   and takes area names to run a subset (`npx tsx scripts/selftest.ts anchoring` runs in about a

@@ -588,7 +588,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       durationSec,
       runDir: run.dir,
     },
-    { unreviewed, incomplete },
+    { unreviewed, incomplete, ...(staticResult.evidence ? { toolEvidence: staticResult.evidence } : {}) },
   );
   // The publish-side half, produced once by publish() rather than read back off its result
   // here. Appending after the coverage gaps reorders the list against older runs: when the

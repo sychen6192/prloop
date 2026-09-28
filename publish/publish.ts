@@ -15,7 +15,7 @@ import { log } from "../libs/log";
 import { collectDismissals, collectFinalOutcomes, collectOutcomes, findStaleThreads, locateSpan, resolveStaleThreads, tallyThreads, watermarkFor } from "./lifecycle";
 import { iterationMarker, readMarkers, spanMark, type SpanMark } from "./markers";
 import type { AnchoredFinding, PrRef } from "../libs/types";
-import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, WatermarkDecision } from "./lifecycle";
+import type { DismissalRecord, OutcomeRecord, StaleThread, ThreadTally, ToolEvidence, WatermarkDecision } from "./lifecycle";
 import { renderFindingComment, renderSummary, type SummaryInput } from "./format";
 
 export interface PublishResult {
@@ -235,6 +235,8 @@ export async function publish(
     unreviewed: readonly string[];
     /** Every reason this review is incomplete so far. Decides the branch-policy status. */
     incomplete: readonly string[];
+    /** What the static tools established; decides whether a tool's comment may close. */
+    toolEvidence?: ToolEvidence;
   } = { unreviewed: [], incomplete: [] },
 ): Promise<PublishResult> {
   const result: PublishResult = { posted: [], alreadyPosted: [], failed: [], resolved: 0, dismissals: [], outcomes: [], gaps: [] };
@@ -315,7 +317,7 @@ export async function publish(
 
   // Close our own threads whose code has since changed, before adding new ones — otherwise
   // a PR accumulates stale comments the author already addressed.
-  const closed = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex));
+  const closed = await resolveStaleThreads(ref, findStaleThreads(threads, ctx.fileIndex, known.toolEvidence));
   result.resolved = closed.length;
   // From the same pre-close snapshot as the outcomes below, so a thread this run has just
   // closed is still `active` in it and cannot also be booked as a reviewer's fix.

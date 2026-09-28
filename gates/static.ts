@@ -53,6 +53,16 @@ export interface StaticResult {
   // apart from the diff filter's `dropped`: "outside the changed region" and "path did not
   // resolve" are different facts, and only the second points at a coordinate problem.
   unresolved: number;
+  // What the tools established, for closing their own comments (publish/lifecycle.ts): the
+  // changed files each tool analysed after running cleanly, and the fingerprint of every
+  // finding it reported on them, on any line — before the changed-line filter, because a
+  // comment an earlier push left is usually on a line this push did not touch.
+  evidence?: { analysed: Record<string, string[]>; reported: string[] };
+}
+
+/** A tool finding's identity: the tool, the rule, the file and the line's own text — never the message. */
+export function toolFingerprint(tool: string, ruleId: string, file: string, lineText: string): string {
+  return createHash("sha1").update(`tool ${tool} ${ruleId} ${file} ${lineText.trim()}`).digest("hex").slice(0, 12);
 }
 
 // Findings per triage call. Not a knob: the number that matters to an operator is the
@@ -391,6 +401,7 @@ export async function runStaticGate(
   }
 
   const all: ToolFinding[] = [];
+  const analysed: Record<string, string[]> = {};
   const ranTools: string[] = [];
   const skipped: Array<{ tool: string; reason: string }> = [];
   let unresolved = 0;
@@ -458,6 +469,7 @@ export async function runStaticGate(
           return [
             Promise.resolve({
               spec: variants[0]!,
+              files: [] as string[],
               findings: [] as ToolFinding[],
               skipped: `${[...new Set(variants.map((v) => v.bin))].join(" or ")} not found on PATH`,
               unresolved: 0,
@@ -470,6 +482,7 @@ export async function runStaticGate(
           return [
             Promise.resolve({
               spec,
+              files: [] as string[],
               findings: [] as ToolFinding[],
               skipped: `no ${spec.requires} found above any changed file`,
               unresolved: 0,
@@ -478,6 +491,7 @@ export async function runStaticGate(
         }
         return projects.map(async (p) => ({
           spec,
+          files: p.files,
           ...(await runTool(spec, profile, p.files, workdir, p.dir, index)),
         }));
       }),
@@ -490,6 +504,7 @@ export async function runStaticGate(
       ranTools.push(r.spec.name);
       all.push(...r.findings);
       unresolved += r.unresolved;
+      analysed[r.spec.name] = [...new Set([...(analysed[r.spec.name] ?? []), ...r.files.map(normalizePath)])];
     }
   }
 
@@ -557,7 +572,20 @@ export async function runStaticGate(
     );
   }
 
-  return { facts, needsTriage, suppressedCount, ranTools, skipped, staleFiles: stale, unresolved };
+  const reported = all.flatMap((f) => {
+    const fd = index.exact(f.file);
+    return fd ? [toolFingerprint(f.tool, f.ruleId, f.file, fd.rightLines[f.line - 1] ?? "")] : [];
+  });
+  return {
+    facts,
+    needsTriage,
+    suppressedCount,
+    ranTools,
+    skipped,
+    staleFiles: stale,
+    unresolved,
+    evidence: { analysed, reported: [...new Set(reported)] },
+  };
 }
 
 export interface TriageVerdict {
@@ -775,10 +803,7 @@ export async function triageAndConvert(
       rule: f.ruleId ? `${f.tool}:${f.ruleId}` : f.tool,
       skepticVerdicts: 1,
       skepticRefuted: 0,
-      fingerprint: createHash("sha1")
-        .update(`tool ${f.tool} ${f.ruleId} ${f.file} ${lineText.trim()}`)
-        .digest("hex")
-        .slice(0, 12),
+      fingerprint: toolFingerprint(f.tool, f.ruleId, f.file, lineText),
       anchor: {
         side: "right",
         startLine: f.line,

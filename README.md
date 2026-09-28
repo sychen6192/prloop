@@ -366,7 +366,10 @@ no model endpoint at all.
   records a hash of the lines it was about, and "gone" means those lines appear nowhere in
   the file now — so code that merely moved keeps its comment open, and a comment's position
   for dedupe is where its code is now, not where it was posted. (Comments from before that
-  marker close only when their line is past the end of the file.)
+  marker close only when their line is past the end of the file.) A static-analysis comment
+  is the exception, reviewdog's rule: it closes only when the same tool ran on that file this
+  time and no longer reports it — a tool re-checks every run, so its silence after a skipped
+  run or a broken toolchain is not evidence, and neither is its code having moved.
 - **The summary says what became of the last run's comments** — how many this run closed
   because the code under them changed (dated from the `--since auto` resume point, which is
   what made them stale), how many a reviewer marked fixed, how many were dismissed, and how

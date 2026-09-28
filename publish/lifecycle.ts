@@ -227,8 +227,19 @@ function windowsOf(lines: readonly string[], size: number): Map<string, number[]
  * shrunk. A comment from before the marker still gets the position test; nothing better is
  * known about it.
  */
-export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThread[] {
+/**
+ * What the static-analysis tools established this run: the files each one analysed after
+ * running cleanly, and the fingerprints of everything they reported on them, before any
+ * filter. The only grounds on which a tool's comment is closed.
+ */
+export interface ToolEvidence {
+  analysed: Readonly<Record<string, readonly string[]>>;
+  reported: readonly string[];
+}
+
+export function findStaleThreads(threads: Thread[], index: FileIndex, tools?: ToolEvidence): StaleThread[] {
   const stale: StaleThread[] = [];
+  const reported = new Set(tools?.reported ?? []);
   for (const t of threads) {
     if (t.status !== "active") continue;
     // Markers alone, with no authorship check, and that is a decision rather than an
@@ -252,6 +263,25 @@ export function findStaleThreads(threads: Thread[], index: FileIndex): StaleThre
 
     const line = ctx.rightFileStart.line;
     const m = readMarkers(first.content);
+    // A tool's comment closes on the tool's word, reviewdog's rule: the same tool ran on the
+    // file this time and no longer reports it. "The code moved" is right for a model's
+    // finding, which nothing re-runs; a tool does re-run, and when it did not — skipped, a
+    // broken toolchain, a file it was not given — its silence is not evidence of anything.
+    if (m.tool) {
+      const analysed = tools?.analysed[m.tool];
+      if (analysed?.includes(fd.path) && m.fingerprint && !reported.has(m.fingerprint)) {
+        stale.push({
+          threadId: t.id,
+          file: ctx.filePath,
+          line,
+          reason: `${m.tool} ran on this file and no longer reports it`,
+          fingerprint: m.fingerprint,
+          ...(m.category ? { category: m.category } : {}),
+          ...(likesOf(first) === undefined ? {} : { likes: likesOf(first) }),
+        });
+      }
+      continue;
+    }
     const reason = m.span
       ? locateSpan(fd.rightLines, m.span, line) === undefined
         ? "the code it flagged is no longer in the file"

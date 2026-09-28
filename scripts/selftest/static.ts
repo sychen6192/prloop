@@ -10,7 +10,7 @@ import {
   untrustedNotice,
 } from "../../prompts/untrusted";
 import { type Verdict } from "../../gates/skeptic";
-import { environmentFailure, filterToChangedLines, rekeyToolFindings } from "../../gates/static";
+import { environmentFailure, filterToChangedLines, rekeyToolFindings, runStaticGate, toolFingerprint } from "../../gates/static";
 import { parseToolOutput } from "../../profiles/parsers";
 import { selectProfiles, filesForProfile, PROFILES } from "../../profiles";
 import { categoryForRule, parseTriageVerdicts, triageAndConvert } from "../../gates/static";
@@ -804,6 +804,54 @@ section("static-tool subprocesses: the timeout kills the tree, not just the chil
           /* already gone */
         }
       }
+    }
+  }
+}
+
+section("what the tools established: the evidence a tool comment closes on");
+{
+  // A stand-in mypy on PATH: the gate runs it as it would the real one, and it reports one
+  // error on the changed line and one on a line the change did not touch.
+  if (process.platform === "win32") {
+    skip("the static gate records what each tool analysed and reported", "a POSIX shell script stands in for mypy");
+  } else {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-evidence-"));
+    const bin = path.join(work, "bin");
+    const tree = path.join(work, "tree");
+    fs.mkdirSync(bin);
+    fs.mkdirSync(path.join(tree, "src"), { recursive: true });
+    const left = ["import os"];
+    const right = ["import os", "x: int = 'a'"];
+    fs.writeFileSync(path.join(tree, "src", "app.py"), `${right.join("\n")}\n`);
+    fs.writeFileSync(
+      path.join(bin, "mypy"),
+      "#!/bin/sh\n" +
+        "echo '{\"file\": \"src/app.py\", \"line\": 2, \"column\": 1, \"message\": \"Incompatible types\", \"code\": \"assignment\", \"severity\": \"error\"}'\n" +
+        "echo '{\"file\": \"src/app.py\", \"line\": 1, \"column\": 1, \"message\": \"Unused import\", \"code\": \"unused-ignore\", \"severity\": \"error\"}'\n" +
+        "exit 1\n",
+      { mode: 0o755 },
+    );
+    const fd = mkFile("src/app.py", right, [2]);
+    fd.leftLines = left;
+    const savedPath = process.env["PATH"];
+    process.env["PATH"] = `${bin}${path.delimiter}${savedPath ?? ""}`;
+    try {
+      const result = await runStaticGate([fd], new FileIndex([fd]), "abc123", tree);
+      eq("the stand-in ran, and its changed-line finding is a fact", [result.ranTools.includes("mypy"), result.facts.length], [true, 1]);
+      eq("what it analysed is recorded", result.evidence?.analysed["mypy"], ["src/app.py"]);
+      // Other linters installed on the machine run too and add their own; these two are mypy's.
+      const reported = new Set(result.evidence?.reported ?? []);
+      eq(
+        "...and everything it reported there, the untouched line included",
+        [
+          reported.has(toolFingerprint("mypy", "assignment", "src/app.py", "x: int = 'a'")),
+          reported.has(toolFingerprint("mypy", "unused-ignore", "src/app.py", "import os")),
+        ],
+        [true, true],
+      );
+    } finally {
+      process.env["PATH"] = savedPath;
+      fs.rmSync(work, { recursive: true, force: true });
     }
   }
 }

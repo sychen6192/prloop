@@ -7,7 +7,7 @@ import { renderSummary } from "../../publish/format";
 import { hunkRows, renderReviewHtml } from "../../publish/reviewhtml";
 import { renderFindingComment } from "../../publish/format";
 import { lastReviewedIteration, findStaleThreads, collectDismissals } from "../../publish/lifecycle";
-import { iterationMarker } from "../../publish/markers";
+import { findingMarkers, iterationMarker, readMarkers } from "../../publish/markers";
 import { postedPositions } from "../../publish/publish";
 import type { AnchoredFinding } from "../../libs/types";
 import { coveredByThread } from "../../publish/publish";
@@ -77,6 +77,37 @@ section("comment lifecycle");
   const foreign = { id: 5, status: "active", comments: [{ id: 1, content: "a teammate's comment" }],
     threadContext: { filePath: "/src/a.ts", rightFileStart: { line: 99, offset: 1 } } };
   eq("comments not from this tool are skipped", findStaleThreads([foreign], idx).length, 0);
+}
+{
+  // A static-analysis comment closes on the tool's word — the same tool ran on the file and
+  // no longer reports it — and never on "the code moved", which nothing re-checks for a model
+  // but a tool re-checks every run.
+  const f = mkFile("src/a.ts", ["x();", "y();"], [1]);
+  const idx = new FileIndex([f]);
+  const gone = { lines: 1, hash: "000000000000" };
+  const toolThread = {
+    id: 7,
+    status: "active",
+    comments: [{ id: 1, content: `${findingMarkers({ fingerprint: "abcdef123456", category: "correctness", tool: "tsc" }, gone)}issue` }],
+    threadContext: { filePath: "/src/a.ts", rightFileStart: { line: 1, offset: 1 } },
+  };
+  eq("the tool is written into the comment, and read back", readMarkers(toolThread.comments[0]!.content).tool, "tsc");
+  check("...a model finding's markers are what they always were", !findingMarkers({ fingerprint: "abcdef123456", category: "correctness" }).includes("tool="));
+  eq("a tool comment whose code moved stays open when the tool has said nothing", findStaleThreads([toolThread], idx).length, 0);
+  const closed = findStaleThreads([toolThread], idx, { analysed: { tsc: ["src/a.ts"] }, reported: [] });
+  eq("...and closes when the tool analysed the file and no longer reports it", closed[0]?.reason, "tsc ran on this file and no longer reports it");
+  eq("...not while it still reports it", findStaleThreads([toolThread], idx, { analysed: { tsc: ["src/a.ts"] }, reported: ["abcdef123456"] }).length, 0);
+  eq("...nor when it analysed other files, or another tool analysed this one", [
+    findStaleThreads([toolThread], idx, { analysed: { tsc: ["src/b.ts"] }, reported: [] }).length,
+    findStaleThreads([toolThread], idx, { analysed: { eslint: ["src/a.ts"] }, reported: [] }).length,
+  ], [0, 0]);
+  const toolFinding: AnchoredFinding = {
+    category: "correctness", severity: "high", confidence: 1, file: "src/a.ts", quote: "x();", claim: "TS2345", sources: ["tsc"],
+    fingerprint: "abcdef123456", tier: "fact", rule: "tsc:TS2345",
+    anchor: { side: "right", startLine: 1, endLine: 1, startOffset: 1, endOffset: 5 },
+  };
+  check("a tool finding's comment carries its tool", renderFindingComment(toolFinding).includes("<!-- prloop:tool=tsc -->"));
+  check("...a model finding's does not", !renderFindingComment({ ...toolFinding, tier: undefined, rule: undefined, sources: ["m1"] }).includes("prloop:tool="));
 }
 {
   const dismissed = [

@@ -62,6 +62,11 @@ function codeFence(code: string): string {
   return "`".repeat(Math.max(3, longest + 1));
 }
 
+/** The static-analysis tool behind a finding, or undefined for a model's. */
+export function toolOf(f: AnchoredFinding): string | undefined {
+  return f.tier === undefined ? undefined : f.rule?.split(":")[0] || f.sources[0];
+}
+
 export function renderFindingComment(f: AnchoredFinding, span?: SpanMark): string {
   const parts: string[] = [
     `**${SEVERITY_LABEL[f.severity] ?? f.severity}** · ${CATEGORY_LABEL[f.category] ?? f.category}`,
@@ -112,7 +117,7 @@ export function renderFindingComment(f: AnchoredFinding, span?: SpanMark): strin
   // comment carries the model's claim, evidence and fix verbatim — text that quotes
   // configuration and error output as readily as the summary's run notes do.
   return redactSecrets(
-    [findingMarkers(f, span), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n"),
+    [findingMarkers({ ...f, ...(toolOf(f) ? { tool: toolOf(f) } : {}) }, span), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n"),
   );
 }
 

@@ -30,6 +30,7 @@ export const SUMMARY_MARKER = "<!-- prloop:summary -->";
 const FP_RE = /<!-- prloop:fp=([^\s>]+) -->/g;
 const CAT_RE = /<!-- prloop:cat=([^\s>]+) -->/;
 const SPAN_RE = /<!-- prloop:span=(\d+)\.([0-9a-f]{12}) -->/;
+const TOOL_RE = /<!-- prloop:tool=([A-Za-z0-9._@/-]{1,64}) -->/;
 const ITERATION_RE = /<!-- prloop:iteration=(\d+) -->/;
 // One source, two compilations: the strip below has to match the read above byte for byte,
 // and two hand-written copies of a marker pattern is the exact drift this module was
@@ -71,11 +72,17 @@ export function spanMark(lines: readonly string[]): SpanMark {
   return { lines: lines.length, hash: createHash("sha1").update(text).digest("hex").slice(0, 12) };
 }
 
-/** Markers for an inline finding comment: authorship, issue identity, category, the code. */
-export function findingMarkers(f: { fingerprint: string; category: string }, span?: SpanMark): string {
+/**
+ * Markers for an inline finding comment: authorship, issue identity, category, the code —
+ * and, for a static-analysis finding, the tool that reported it. A tool comment closes on the
+ * tool's evidence, not on where its code went (publish/lifecycle.ts), so the thread has to
+ * say which tool that is. Written last, so a model finding's bytes are what they always were.
+ */
+export function findingMarkers(f: { fingerprint: string; category: string; tool?: string }, span?: SpanMark): string {
   return (
     `${BOT_MARKER}<!-- prloop:fp=${f.fingerprint} --><!-- prloop:cat=${f.category} -->` +
-    (span ? `<!-- prloop:span=${span.lines}.${span.hash} -->` : "")
+    (span ? `<!-- prloop:span=${span.lines}.${span.hash} -->` : "") +
+    (f.tool && TOOL_RE.test(`<!-- prloop:tool=${f.tool} -->`) ? `<!-- prloop:tool=${f.tool} -->` : "")
   );
 }
 
@@ -151,6 +158,8 @@ export interface CommentMarkers {
   category?: FindingCategory;
   /** The code the comment was about; absent on comments written before the marker. */
   span?: SpanMark;
+  /** The static-analysis tool whose finding this is; absent on model findings. */
+  tool?: string;
   /** The iteration recorded by the run that wrote this comment. */
   iteration?: number;
   /** A run that had this PR in hand when it wrote this comment (publish/lease.ts). */
@@ -202,6 +211,7 @@ export function readMarkers(body: string | undefined): CommentMarkers {
   }
   const cat = CAT_RE.exec(head)?.[1];
   const span = SPAN_RE.exec(head);
+  const tool = TOOL_RE.exec(head)?.[1];
   const tail = TRAILING_MARKERS.exec(body)?.[0] ?? "";
   const iter = ITERATION_RE.exec(tail)?.[1];
   const run = RUN_RE.exec(tail);
@@ -212,6 +222,7 @@ export function readMarkers(body: string | undefined): CommentMarkers {
     fingerprints,
     ...(cat !== undefined && CATEGORIES.has(cat) ? { category: cat as FindingCategory } : {}),
     ...(span?.[1] === undefined || span[2] === undefined || Number(span[1]) < 1 ? {} : { span: { lines: Number(span[1]), hash: span[2] } }),
+    ...(tool === undefined ? {} : { tool }),
     ...(iter === undefined ? {} : { iteration: Number(iter) }),
     ...(run?.[1] === undefined || run[2] === undefined ? {} : { run: { startedAt: Number(run[1]), id: run[2] } }),
   };
