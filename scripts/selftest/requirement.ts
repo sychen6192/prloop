@@ -76,8 +76,23 @@ section("two-axis wiring: citations, conventions, requirement skeptic");
     { path: "/c.md", text: "z".repeat(10_000) },
   ]);
   check("per-file cap applies", big.includes("(truncated"));
-  check("exhausted budget names the omitted file", big.includes("/c.md omitted"));
-  check("total stays bounded", big.length < 16_000);
+  // Shared, not first come first served: the third long document is cut like the other two
+  // rather than dropped whole.
+  check("every document gets a share of the budget", big.includes("### /c.md") && !big.includes("omitted"));
+  const four = renderConventions(["a", "b", "c", "d"].map((c) => ({ path: `/${c}.md`, text: c.repeat(7_000) })));
+  check("...an even one: the last of four long documents is not left the scraps", four.includes("d".repeat(3_500)), four.slice(-300));
+  check("total stays bounded", big.length < 18_000);
+  const shortAndLong = renderConventions([
+    { path: "/short.md", text: "Short and whole." },
+    { path: "/long.md", text: "w".repeat(7_000) },
+  ]);
+  check("a short document costs only its length", shortAndLong.includes("Short and whole."));
+  check("...and a long one still stops at the per-file cap", shortAndLong.includes("(truncated — read /long.md"));
+  const many = renderConventions(Array.from({ length: 14 }, (_, i) => ({ path: `/d${i}.md`, text: `doc ${i}` })));
+  check("past twelve documents the rest are named, not read", many.includes("(/d12.md omitted") && many.includes("(/d13.md omitted") && !many.includes("doc 12"));
+  const scoped = renderConventions([{ path: "/src/api/AGENTS.md", text: "API rules.", scope: "files under src/api/" }]);
+  check("a scoped document says what it applies to", scoped.includes("### /src/api/AGENTS.md\n\nApplies to: files under src/api/\n\nAPI rules."), scoped);
+  check("...and the block says the narrower scope wins", scoped.includes("the one scoped more narrowly to it wins"));
 
   // Requirement skeptic: a refuted accusation demotes to not-verifiable (never satisfied),
   // keeps the refuter's evidence, and errors/non-refutations change nothing (fail open).

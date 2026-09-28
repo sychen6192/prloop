@@ -54,10 +54,11 @@ export interface ReviewRunOptions {
    */
   intake?: IntakeProvider;
   /**
-   * Where the reviewed repository's own convention documents come from, at a commit.
-   * Defaults to ADO; a local review reads them out of the repository's own history.
+   * Where the reviewed repository's own convention documents come from, at a commit, for a
+   * change touching `changedPaths` (the scoped ones apply only to some files). Defaults to
+   * ADO; a local review reads them out of the repository's own history.
    */
-  conventions?: (commit: string) => Promise<ConventionDoc[]>;
+  conventions?: (commit: string, changedPaths: readonly string[]) => Promise<ConventionDoc[]>;
   /** Where the acceptance criteria come from. Defaults to the PR's linked work items. */
   workItems?: () => Promise<LinkedRequirements>;
   /**
@@ -307,14 +308,18 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   // not the source: the source branch is the author's, and a CLAUDE.md edited in the same
   // PR would otherwise steer the review of that very PR. Non-fatal: most repos have none,
   // and a failed fetch costs the finder its context bonus, not the run.
-  const conventions = renderConventions(
+  const conventionDocs =
     ctx.iteration.targetRefCommit && !noCode
-      ? await (opts.conventions ?? ((commit: string) => fetchRepoConventions(opts.ref, commit)))(ctx.iteration.targetRefCommit).catch((e) => {
+      ? await (opts.conventions ?? ((commit: string, paths: readonly string[]) => fetchRepoConventions(opts.ref, commit, paths)))(
+          ctx.iteration.targetRefCommit,
+          ctx.files.map((f) => f.path),
+        ).catch((e): ConventionDoc[] => {
           log(`[WARN] could not fetch repo convention docs: ${e instanceof Error ? e.message : String(e)}`);
           return [];
         })
-      : [],
-  );
+      : [];
+  if (conventionDocs.length > 0) log(`repo conventions: ${conventionDocs.map((d) => d.path).join(", ")}`);
+  const conventions = renderConventions(conventionDocs);
 
   // Stages that threw outright (vs returning their own error fields); reported as
   // incomplete so the run exits 3 instead of pretending the stage passed.
@@ -602,6 +607,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
       finderErrors,
       omittedFiles: omitted,
       appliedRules: rules,
+      conventionDocs: conventionDocs.map((d) => d.path),
       staticResult,
       dismissalHints: dismissedCategoryHints(storedDismissals, excludedCategories()),
       durationSec,

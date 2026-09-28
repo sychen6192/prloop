@@ -285,8 +285,9 @@ edited directly by a team lead without touching code, and adding a language = ad
 Rule content uses the four-part format Graphite validated: **rule → bad example → good example → why**.
 Research shows rules without contrasting examples work markedly worse.
 
-**Compatible with existing convention files**: automatically reads existing `CLAUDE.md`, `AGENTS.md`, and
-`.cursor/rules/*.mdc` from the repo as extra rule sources. CodeRabbit, Kodus, and GitHub Copilot code
+**Compatible with existing convention files**: automatically reads existing `CLAUDE.md`, `AGENTS.md` (at the
+root and beside the changed code), `.cursor/rules/*.mdc` and Copilot's `.github/copilot-instructions.md` and
+`*.instructions.md` from the repo as extra rule sources, each in the scope its own tool gives it. CodeRabbit, Kodus, and GitHub Copilot code
 review (from 2026-07) all support this set of files, so a team writes rules once and uses them across
 tools — no rewriting for prloop. The closest precedent is `supabase/supabase`'s `.coderabbit.yaml`, which
 feeds Claude Code's `SKILL.md` straight to the reviewer as glob-scoped review rules.

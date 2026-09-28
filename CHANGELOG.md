@@ -11,6 +11,21 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Added
 
+- **The instruction files teams already write for Copilot, Cursor and coding agents are read,
+  each in its own scope.** Six fixed root files used to be the whole list. Now also
+  `.github/copilot-instructions.md` and `.cursorrules` for the whole repository; Copilot's
+  `.github/instructions/*.instructions.md` (and `.azuredevops/instructions/`) where their
+  `applyTo` matches a changed file, skipping any marked `excludeAgent: "code-review"`; Cursor's
+  `.cursor/rules/*.mdc` when `alwaysApply` is set or their `globs` match; and an `AGENTS.md` or
+  `CLAUDE.md` in a directory above a changed file, for the files beneath it — the Anthropic
+  review plugin's scoping. All of it is read at the target commit, like the root documents, so
+  a pull request cannot write the instructions it is reviewed by. Each scoped document is
+  labelled with what it applies to, and the narrower of two that disagree wins. The documents
+  share a 16k-character budget (was 12k) split evenly, shortest first, instead of first come
+  first served, which let two long root files crowd out everything after them; past twelve,
+  the rest are named and not read. The summary's run notes list what was read. A convention
+  file that opens with an HTML comment (a markdownlint directive) is no longer mistaken for a
+  sign-in page and dropped. `.cursor/rules` was claimed in PROPOSAL.md and never read until now.
 - **`PRR_STATIC_BASELINE=1`: the fact tools run at the merge base too, and only what the change
   caused counts.** `tsc` and `mypy` check the whole project, and the gate kept only what they
   said about changed lines — so a caller the change broke, in a file it did not touch, was

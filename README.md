@@ -600,10 +600,18 @@ binding constraints: the repo's own conventions override the baseline, and every
 judgment call capped at `medium` severity. That cap is the built-in guard against
 over-reporting.
 
-The reviewed repository's own convention documents (`CONTRIBUTING.md`, `CODING_STANDARDS.md`,
-`docs/` variants, `CLAUDE.md`, `AGENTS.md`) are fetched automatically at the iteration's
-commit and injected ahead of the rules — that is what makes "conventions override the
-baseline" enforceable rather than aspirational. Standards that live anywhere else go in
+The reviewed repository's own convention documents are fetched automatically at the
+iteration's target commit and injected ahead of the rules — that is what makes "conventions
+override the baseline" enforceable rather than aspirational. That is the instructions a team
+already writes for its other tools, each read in its own scope: `CONTRIBUTING.md`,
+`CODING_STANDARDS.md` and their `docs/` variants, `CLAUDE.md`, `AGENTS.md`,
+`.github/copilot-instructions.md` and `.cursorrules` for the whole repository; Copilot's
+`.github/instructions/*.instructions.md` (and `.azuredevops/instructions/`) where their `applyTo`
+matches a changed file, unless one opts out with `excludeAgent: "code-review"`; Cursor's
+`.cursor/rules/*.mdc` when `alwaysApply` is set or their `globs` match; and an `AGENTS.md` or
+`CLAUDE.md` in any directory above a changed file, for the files beneath it. Each scoped
+document tells the model what it applies to, and where two disagree the narrower one wins. The
+summary's run notes name every document read. Standards that live anywhere else go in
 `PRR_RULES_DIR` as rule files with an `applyTo` glob. They are added to the shipped rules,
 not swapped for them — a C# rule pack does not cost you the base smells — and a file named
 like a shipped one (`_base.md`, `java.md`) replaces that one.

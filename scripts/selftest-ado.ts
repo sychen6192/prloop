@@ -210,6 +210,40 @@ try {
     setState({ items: { "/AGENTS.md": { body: "   \n\n" } } });
     const { value: blank } = await capture(() => fetchRepoConventions(ref, "tgt3"));
     eq("an empty document adds nothing", blank.length, 0);
+
+    // The page, not anything that starts with `<`: markdown often opens with a lint directive.
+    setState({ items: { "/CLAUDE.md": { body: "<!-- markdownlint-disable MD013 -->\n# House rules\n" } } });
+    const { value: commented } = await capture(() => fetchRepoConventions(ref, "tgt3"));
+    eq("a document opening with an HTML comment is kept", commented.map((d) => d.path), ["/CLAUDE.md"]);
+  }
+
+  section("repo conventions: the instruction files teams write for their other tools");
+  {
+    // Copilot's and Cursor's files, and an AGENTS.md beside the code, read at the TARGET
+    // commit like the root documents, each only where its scope meets the change.
+    setState({
+      items: {
+        "/.github/copilot-instructions.md": { body: "Prefer early returns." },
+        "/.github/instructions/api.instructions.md": { body: '---\napplyTo: "src/api/**"\n---\nValidate every request body.' },
+        "/.github/instructions/web.instructions.md": { body: '---\napplyTo: "web/**"\n---\nNo inline styles.' },
+        "/src/api/AGENTS.md": { body: "Handlers never throw." },
+        "/src/api/users.ts": { body: "export {}" },
+      },
+    });
+    const { value: docs } = await capture(() => fetchRepoConventions(ref, "tgt3", ["src/api/users.ts"]));
+    eq(
+      "the root, the matching instructions and the package's own AGENTS.md",
+      docs.map((d) => d.path),
+      ["/.github/copilot-instructions.md", "/.github/instructions/api.instructions.md", "/src/api/AGENTS.md"],
+    );
+    const listings = ado.matching("GET", /\/items$/).filter((r) => r.query["scopePath"] !== undefined);
+    check("directories are listed, not guessed at", listings.some((r) => r.query["scopePath"] === "/.github/instructions" && r.query["recursionLevel"] === "Full"), JSON.stringify(listings.map((r) => r.query)));
+    check("...the package directory one level only", listings.some((r) => r.query["scopePath"] === "/src/api" && r.query["recursionLevel"] === "OneLevel"));
+    check(
+      "every read and listing is at the target commit",
+      ado.matching("GET", /\/items$/).every((r) => r.query["versionDescriptor.version"] === "tgt3"),
+      JSON.stringify(ado.matching("GET", /\/items$/).map((r) => r.query["versionDescriptor.version"])),
+    );
   }
 
   section("repo conventions: a 404 is silence, a 401 is a failure that must be said");

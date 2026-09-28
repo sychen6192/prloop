@@ -1,6 +1,7 @@
 // Reviewer rules: glob selection, and what the shipped packs may and may not ask for.
 import { detectLanguage, isReviewable } from "../../libs/lang";
 import { globToRegExp, loadRules, ruleHeadings, selectRules } from "../../libs/rules";
+import { CONVENTION_PATHS, frontMatter, gatherConventions, type ConventionReader } from "../../libs/conventions";
 import { load } from "../../libs/tls";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -164,4 +165,88 @@ section("rules: java.md concurrency and @Transactional in rule → bad → good 
   const heads = ruleHeadings(java.body);
   check("rule names are headings", heads.includes("Self-invocation") && heads.includes("Compound operations on a volatile field"));
   check("fenced code contributes no headings", !heads.some((h) => /^(bad|good)\b/.test(h)));
+}
+
+section("repository instructions: every file teams write for their tools, each in its own scope");
+{
+  // A repository as a map of path -> text; directories are whatever the paths imply.
+  const repoOf = (files: Record<string, string>, broken: string[] = []) => {
+    const calls: string[] = [];
+    const reader: ConventionReader = {
+      async read(p) {
+        calls.push(`read ${p}`);
+        if (broken.includes(p)) throw new Error("HTTP 401");
+        return files[p];
+      },
+      async list(dir, deep) {
+        calls.push(`list ${dir}`);
+        const prefix = `${dir}/`;
+        return Object.keys(files).filter((p) => p.startsWith(prefix) && (deep || !p.slice(prefix.length).includes("/")));
+      },
+    };
+    return { reader, calls };
+  };
+  const files: Record<string, string> = {
+    "/CLAUDE.md": "Root rules.",
+    "/AGENTS.md": "   \n",
+    "/.github/copilot-instructions.md": "Copilot, everywhere.",
+    "/.github/instructions/api.instructions.md": '---\napplyTo: "src/api/**"\n---\nAPI handlers validate input.',
+    "/.github/instructions/py.instructions.md": '---\napplyTo: "**/*.py"\n---\nPython only.',
+    "/.github/instructions/none.instructions.md": "No applyTo, so attached by hand only.",
+    "/.github/instructions/chat.instructions.md": '---\napplyTo: "**"\nexcludeAgent: "code-review"\n---\nFor the coding agent.',
+    "/.azuredevops/instructions/db.instructions.md": "---\napplyTo: src/db/**, src/api/**\n---\nQueries are parameterised.",
+    "/.cursor/rules/always.mdc": "---\ndescription: house style\nalwaysApply: true\n---\nAlways applied.",
+    "/.cursor/rules/ts.mdc": "---\nglobs: *.ts\nalwaysApply: false\n---\nTypeScript, at any depth.",
+    "/.cursor/rules/manual.mdc": "---\ndescription: only when asked\n---\nAgent-requested.",
+    "/.cursor/rules/web/listed.mdc": "---\nglobs:\n  - web/**\n  - src/api/*.ts\n---\nA YAML list of globs.",
+    "/src/CLAUDE.md": "Everything under src.",
+    "/src/api/AGENTS.md": "The API package.",
+    "/lib/CLAUDE.md": "Nothing under lib changed.",
+  };
+  const { reader, calls } = repoOf(files);
+  const { docs, failures } = await gatherConventions(reader, ["src/api/users.ts", "/src/api/orders.ts"]);
+  const byPath = new Map(docs.map((d) => [d.path, d]));
+  eq(
+    "every document that applies, from the whole repository to the narrowest scope",
+    docs.map((d) => d.path),
+    [
+      "/CLAUDE.md",
+      "/.github/copilot-instructions.md",
+      "/.cursor/rules/always.mdc",
+      "/.github/instructions/api.instructions.md",
+      "/.azuredevops/instructions/db.instructions.md",
+      "/.cursor/rules/ts.mdc",
+      "/.cursor/rules/web/listed.mdc",
+      "/src/CLAUDE.md",
+      "/src/api/AGENTS.md",
+    ],
+  );
+  eq("an instructions file carries its applyTo as its scope", byPath.get("/.github/instructions/api.instructions.md")?.scope, "src/api/**");
+  eq("...and its body without the front matter", byPath.get("/.github/instructions/api.instructions.md")?.text.trim(), "API handlers validate input.");
+  eq("an always-applied Cursor rule is repository-wide", byPath.get("/.cursor/rules/always.mdc")?.scope, undefined);
+  eq("a nested AGENTS.md governs the files beneath it", byPath.get("/src/api/AGENTS.md")?.scope, "files under src/api/");
+  check("an instructions file for files the change did not touch is left out", !byPath.has("/.github/instructions/py.instructions.md"));
+  check("...and one with no applyTo, which Copilot attaches only by hand", !byPath.has("/.github/instructions/none.instructions.md"));
+  check("...and one that opts out of code review", !byPath.has("/.github/instructions/chat.instructions.md"));
+  check("...and a Cursor rule an agent would have to choose", !byPath.has("/.cursor/rules/manual.mdc"));
+  check("...and the CLAUDE.md of a directory nothing changed in", !byPath.has("/lib/CLAUDE.md"));
+  check("a blank root document is no document", !byPath.has("/AGENTS.md"));
+  eq("nothing failed", failures, []);
+  check("the nested files are looked for in the changed files' directories only", !calls.includes("list /lib"), calls.join(" | "));
+
+  const rootOnly = repoOf(files);
+  const none = await gatherConventions(rootOnly.reader, []);
+  eq("with no changed files only the root documents are read", none.docs.map((d) => d.path), ["/CLAUDE.md", "/.github/copilot-instructions.md"]);
+  check("...and no directory is listed", !rootOnly.calls.some((c) => c.startsWith("list")), rootOnly.calls.join(" | "));
+  eq("...each root path tried once", rootOnly.calls.length, CONVENTION_PATHS.length);
+
+  // A failure is named and the rest still arrive: one unreadable file does not cost the others.
+  const flaky = repoOf(files, ["/src/api/AGENTS.md"]);
+  const partial = await gatherConventions(flaky.reader, ["src/api/users.ts"]);
+  eq("a file that cannot be read is named", partial.failures.map((f) => f.split(":")[0]), ["/src/api/AGENTS.md"]);
+  check("...and the others are still read", partial.docs.some((d) => d.path === "/src/CLAUDE.md"));
+
+  const fm = frontMatter("---\napplyTo: a\nglobs:\n  - x/**\n  - y.ts\n---\nbody");
+  eq("front matter reads scalars and lists", [fm.fields["applyTo"], fm.fields["globs"], fm.body], ["a", "x/**,y.ts", "body"]);
+  eq("no front matter leaves the text whole", frontMatter("# Title\n---\n").body, "# Title\n---\n");
 }

@@ -289,6 +289,12 @@ const ado = await fakeAdo({
   iterations: [iteration(1)],
   changesFor,
   blobs: { [BLOB.pay1]: PAY_1, [BLOB.pay2]: PAY_2, [BLOB.export1]: EXPORT_1 },
+  // The team's Copilot instructions for its TypeScript, and a CLAUDE.md for a directory the
+  // pull request never touches.
+  items: {
+    "/.github/instructions/money.instructions.md": { body: '---\napplyTo: "src/**/*.ts"\n---\nAmounts are integer cents.' },
+    "/docs/CLAUDE.md": { body: "Docs are British English." },
+  },
   workItemRefs: [4711],
   workItems: {
     4711: {
@@ -349,12 +355,20 @@ try {
     models.calls.filter((c) => (c.body["response_format"] as { json_schema?: { name?: string } } | undefined)?.json_schema?.name === schema);
   const userPrompt = (c: RecordedCall) =>
     ((c.body["messages"] as Array<{ role: string; content: string }> | undefined) ?? []).find((m) => m.role === "user")?.content ?? "";
+  const wholePrompt = (c: RecordedCall) =>
+    ((c.body["messages"] as Array<{ role: string; content: string }> | undefined) ?? []).map((m) => m.content).join("\n");
 
   section("push 1, full review: what reaches the pull request");
   {
     const { value: result } = await capture(() => runReview({ ref, runner, compareTo: 0 }));
 
     eq("each finder is asked once", stageCalls("findings").length, 2);
+    check(
+      "...with the team's Copilot instructions for the files it reads, and their scope",
+      stageCalls("findings").every((c) => wholePrompt(c).includes("Amounts are integer cents.") && wholePrompt(c).includes("Applies to: src/**/*.ts")),
+      wholePrompt(stageCalls("findings")[0] ?? ({ body: {} } as RecordedCall)).slice(0, 1500),
+    );
+    check("...but not a directory's CLAUDE.md the change never touches", stageCalls("findings").every((c) => !wholePrompt(c).includes("British English")));
     eq(
       "every anchored finding meets a skeptic — not the hallucinated one, and not the one the code contradicts",
       stageCalls("verdict").length,
@@ -387,6 +401,7 @@ try {
     const summary = summaryOf();
     eq("one summary thread", summaryThreads().length, 1);
     eq("...recording push 1 as the resume point", readMarkers(summary).iteration, 1);
+    check("...naming the instructions it read", summaryOf().includes("Repository instructions read: /.github/instructions/money.instructions.md"), summaryOf());
     check("...naming the hallucination as unlocatable rather than dropping it", summary.includes("Converts cents to cents") && summary.includes("no locatable line"), summary);
     check("...and both criteria as implemented", summary.includes("All 2 acceptance criteria for #4711 are implemented"), summary);
 
@@ -596,7 +611,11 @@ try {
     // scripts/local-review.ts only built prompts and matched quotes; nothing reviewed a branch
     // before it became a PR, and nothing could run a benchmark's repositories through the
     // real pipeline. `review` does both, as a dry run by construction.
-    const { repo } = payRepo("prloop-local-");
+    const { repo, git } = payRepo("prloop-local-");
+    // A CLAUDE.md beside the code, on the base branch: read from the repository's own history.
+    fs.writeFileSync(path.join(repo, "src", "CLAUDE.md"), "Money is integer cents.\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "house rules");
     const localRuns = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-local-runs-"));
     try {
       const criteria = path.join(localRuns, "criteria.md");
@@ -610,6 +629,10 @@ try {
       });
       check("the local review ran", res.out.includes("Reviewed 1 files"), res.out.slice(-800));
       check("...and reported the bug the branch introduced", res.out.includes("fractional cents"), res.out.slice(-800));
+      check(
+        "...with the CLAUDE.md of the directory it changed, read at the base",
+        stageCalls("findings").some((c) => wholePrompt(c).includes("Money is integer cents.") && wholePrompt(c).includes("Applies to: files under src/")),
+      );
       eq("...judged the criteria file", stageCalls("requirements").length, 1);
       eq("...and exited clean: the finding is medium and the criterion is met", res.code, 0);
       eq("nothing was sent to Azure DevOps at all", ado.requests.length, 0);

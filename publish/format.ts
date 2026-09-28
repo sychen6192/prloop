@@ -143,6 +143,8 @@ export interface SummaryInput {
   finderErrors: Array<{ model: string; error: string }>;
   omittedFiles: string[];
   appliedRules: string[];
+  /** The repository's own instruction documents the finders were given (libs/conventions.ts). */
+  conventionDocs?: string[];
   staticResult?: StaticResult;
   // "The team keeps dismissing category X" — surfaced as a config suggestion, never applied.
   dismissalHints?: CategoryHint[];
@@ -453,6 +455,11 @@ export function renderSummary(input: SummaryInput): string {
   }
   if (input.appliedRules.length > 0) {
     notes.push(`Review rules applied: ${input.appliedRules.join(", ")}`);
+  }
+  // Named, so a team that wrote instructions for another tool can see they were read — and
+  // which scoped ones matched this change.
+  if (input.conventionDocs?.length) {
+    notes.push(`Repository instructions read: ${input.conventionDocs.join(", ")}`);
   }
   const sr = input.staticResult;
   if (sr?.skippedReason) {

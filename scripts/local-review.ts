@@ -85,7 +85,7 @@ async function main() {
       runner: await createRunner(),
       compareTo: 0,
       intake: (_ref, _compareTo, o) => buildLocalReviewContext({ repo, base, head, ...(o?.text ? { text: true } : {}) }),
-      conventions: (commit) => readLocalConventions(repo, commit),
+      conventions: (commit, paths) => readLocalConventions(repo, commit, paths),
       workItems: async () => ({ items: criteria ? [localWorkItem(criteria)] : [], inheritedFrom: [] }),
       ...(partial ? {} : { searchRepo: repo }),
     });

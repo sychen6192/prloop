@@ -46,6 +46,18 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${out}$`);
 }
 
+// A front-matter glob list: `a, b`, `"a", "b"` or `[a, b]`. Split on comma FIRST, which means
+// `{a,b}` alternation is unusable here even though globToRegExp supports it —
+// `"**/*.{ts,js}"` parses as two broken halves. Write the alternatives as separate entries.
+export function parseGlobList(value: string): string[] {
+  return value
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .split(",")
+    .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean);
+}
+
 function parseRule(name: string, raw: string): Rule {
   let applyTo = ["**/*"];
   let body = raw;
@@ -54,17 +66,7 @@ function parseRule(name: string, raw: string): Rule {
   if (fm?.[1]) {
     body = raw.slice(fm[0].length);
     const m = /^applyTo:\s*(.+)$/m.exec(fm[1]);
-    if (m?.[1]) {
-      // Split on comma FIRST, which means `{a,b}` alternation is unusable here even though
-      // globToRegExp supports it — `"**/*.{ts,js}"` parses as two broken halves. Write the
-      // alternatives as separate quoted entries instead.
-      applyTo = m[1]
-        .trim()
-        .replace(/^\[|\]$/g, "")
-        .split(",")
-        .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-        .filter(Boolean);
-    }
+    if (m?.[1]) applyTo = parseGlobList(m[1]);
   }
   return { name, applyTo, body: body.trim() };
 }
@@ -147,13 +149,31 @@ export function ruleHeadings(body: string): string[] {
 // the subject under review; an unbounded CONTRIBUTING.md must not crowd the diff out of
 // the window.
 const CONVENTION_FILE_CHARS = 6_000;
-const CONVENTION_TOTAL_CHARS = 12_000;
+const CONVENTION_TOTAL_CHARS = 16_000;
+const CONVENTION_MAX_DOCS = 12;
+
+/**
+ * Each document's share of the budget: an equal split of what is left, taken shortest first,
+ * so a short document costs only its length and hands the rest to the long ones. First come
+ * first served let two long root documents take everything, and the scoped ones read since —
+ * the instructions written for exactly the files under review — would have been cut whole.
+ */
+function shares(lengths: readonly number[]): number[] {
+  const out = new Array<number>(lengths.length).fill(0);
+  let left = CONVENTION_TOTAL_CHARS;
+  const order = lengths.map((_, i) => i).sort((a, b) => lengths[a]! - lengths[b]!);
+  order.forEach((i, k) => {
+    out[i] = Math.min(lengths[i]!, CONVENTION_FILE_CHARS, Math.floor(left / (order.length - k)));
+    left -= out[i]!;
+  });
+  return out;
+}
 
 /**
  * Renders the reviewed repo's own convention documents as the highest-priority rules
  * block. Pure (fetching lives in ado/conventions.ts) so the caps are testable offline.
  */
-export function renderConventions(docs: Array<{ path: string; text: string }>): string {
+export function renderConventions(docs: Array<{ path: string; text: string; scope?: string }>): string {
   if (docs.length === 0) return "";
   const parts: string[] = [
     "## This repository's own conventions",
@@ -162,21 +182,22 @@ export function renderConventions(docs: Array<{ path: string; text: string }>): 
     // convention doc may say what counts as a violation and how bad it is, never how the
     // finding is to be reported.
     "The documents below come from the repository under review. Where they conflict with" +
-      " these rules on what is reportable or how severe it is, the documents override the rules.",
+      " these rules on what is reportable or how severe it is, the documents override the rules." +
+      " A document that names the files it applies to governs only those files, and where two" +
+      " documents disagree about a file, the one scoped more narrowly to it wins.",
   ];
-  let budget = CONVENTION_TOTAL_CHARS;
-  for (const d of docs) {
-    if (budget <= 0) {
-      parts.push("", `(${d.path} omitted — convention budget exhausted)`);
-      continue;
+  const kept = docs.slice(0, CONVENTION_MAX_DOCS);
+  const texts = kept.map((d) => d.text.trim());
+  const budget = shares(texts.map((t) => t.length));
+  kept.forEach((d, i) => {
+    let text = texts[i]!;
+    if (text.length > budget[i]!) {
+      text = `${text.slice(0, budget[i])}\n\n(truncated — read ${d.path} in the repo for the rest)`;
     }
-    let text = d.text.trim();
-    const cap = Math.min(CONVENTION_FILE_CHARS, budget);
-    if (text.length > cap) {
-      text = `${text.slice(0, cap)}\n\n(truncated — read ${d.path} in the repo for the rest)`;
-    }
-    budget -= text.length;
-    parts.push("", `### ${d.path}`, "", text);
+    parts.push("", `### ${d.path}`, ...(d.scope ? ["", `Applies to: ${d.scope}`] : []), "", text);
+  });
+  for (const d of docs.slice(CONVENTION_MAX_DOCS)) {
+    parts.push("", `(${d.path} omitted — at most ${CONVENTION_MAX_DOCS} convention documents are read)`);
   }
   return parts.join("\n");
 }

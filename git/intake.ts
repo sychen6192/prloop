@@ -12,7 +12,7 @@ import { log, logVerbose } from "../libs/log";
 import { run } from "../libs/shell";
 import type { ChangeType, FileDiff, PrInfo } from "../libs/types";
 import type { ReviewContext, SkippedFile } from "../libs/context";
-import { CONVENTION_PATHS, type ConventionDoc } from "../ado/conventions";
+import { gatherConventions, type ConventionDoc } from "../libs/conventions";
 
 async function git(repo: string, args: string[]): Promise<string> {
   const res = await run("git", ["-C", repo, ...args], 120_000);
@@ -59,18 +59,29 @@ function mapStatus(code: string): ChangeType {
 }
 
 /**
- * The repository's own convention documents at a commit, read from its history — the local
- * counterpart of ado/conventions.ts, over the same paths, for the same reason: they are
- * what makes the rules' "the repo's conventions override this baseline" enforceable.
+ * The repository's own instruction documents at a commit, read from its history — the local
+ * counterpart of ado/conventions.ts, gathered by the same rules (libs/conventions.ts), for the
+ * same reason: they are what makes the rules' "the repo's conventions override this
+ * baseline" enforceable.
  */
-export async function readLocalConventions(repo: string, commit: string): Promise<ConventionDoc[]> {
-  const found: ConventionDoc[] = [];
-  for (const p of CONVENTION_PATHS) {
-    const rel = p.replace(/^\//, "");
-    const res = await showFile(repo, commit, rel);
-    if ("lines" in res && res.lines.length > 0) found.push({ path: p, text: res.lines.join("\n") });
-  }
-  return found;
+export async function readLocalConventions(repo: string, commit: string, changedPaths: readonly string[] = []): Promise<ConventionDoc[]> {
+  const { docs, failures } = await gatherConventions(
+    {
+      async read(p) {
+        const res = await showFile(repo, commit, p.replace(/^\//, ""));
+        if ("failure" in res) throw new Error(res.failure);
+        return res.lines.length > 0 ? res.lines.join("\n") : undefined;
+      },
+      async list(dir, deep) {
+        // Nothing listed for a directory the commit does not have: ls-tree answers it empty.
+        const out = await git(repo, ["ls-tree", ...(deep ? ["-r"] : []), "--name-only", commit, "--", `${dir.replace(/^\//, "")}/`]);
+        return out.split("\n").filter(Boolean).map((p) => `/${p}`);
+      },
+    },
+    changedPaths,
+  );
+  if (failures.length > 0) log(`[WARN] repo conventions: ${failures.length} could not be read. First: ${failures[0]}`);
+  return docs;
 }
 
 export interface LocalIntakeOptions {

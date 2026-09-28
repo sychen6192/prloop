@@ -753,7 +753,7 @@ export const MAX_DIFF_CHARS = numEnv("PRR_MAX_DIFF_CHARS", 240_000, 1000);
 // The model's context window, in TOKENS. 0 (the default) = off, and off is exactly what
 // every release before this one did: PRR_MAX_DIFF_CHARS counts characters OF THE DIFF
 // ONLY. The system prompt, the rules selected for this PR (up to ~29k chars), the reviewed
-// repo's injected conventions (12k), the PR description and — on a backend with no
+// repo's injected conventions (16k), the PR description and — on a backend with no
 // response_format — the inlined JSON schema all share the window with the diff and were
 // never counted; neither was the output budget. Characters are not tokens either: CJK
 // costs roughly 2.7x more tokens per character than ASCII, so 240k "safe" characters can

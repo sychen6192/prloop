@@ -237,6 +237,15 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
       res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": Buffer.byteLength(content) });
       return void res.end(content);
     }
+    if (method === "GET" && /\/items$/.test(path) && query["scopePath"] !== undefined) {
+      // A directory listing: the files under it, or only its own with recursionLevel=OneLevel.
+      // An empty or absent directory answers 404, as ADO does for a path it does not have.
+      const prefix = `${(query["scopePath"] ?? "").replace(/\/$/, "")}/`;
+      const deep = query["recursionLevel"] === "Full";
+      const under = Object.keys(state.items).filter((p) => p.startsWith(prefix) && (deep || !p.slice(prefix.length).includes("/")));
+      if (under.length === 0) return sendJson(res, 404, { message: "TF401174: the item does not exist" });
+      return sendJson(res, 200, { count: under.length, value: under.map((p) => ({ path: p, isFolder: false, gitObjectType: "blob" })) });
+    }
     if (method === "GET" && /\/items$/.test(path)) {
       const item = state.items[query["path"] ?? ""];
       if (item === undefined) {
