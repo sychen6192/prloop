@@ -75,7 +75,7 @@ import { Semaphore } from "../libs/limit";
 import { describeBadCompletion, describeFetchError, isTransientModelError, redactingErrors } from "../models/runner";
 import { explainSpawnError, planSpawn, planKill, killTree, scrubbedEnv } from "../libs/shell";
 import { spawn as spawnChild } from "node:child_process";
-import { buildInvocation, runFailure, traceEvent, type Acc } from "../models/opencode";
+import { DEFAULT_AGENT_FALLBACK, buildInvocation, reviewerAgentConfig, runFailure, traceEvent, type Acc } from "../models/opencode";
 import { anchorAndDedupe } from "../gates/aggregate";
 import type { FinderOutput } from "../gates/finder";
 import { BASE_SMELLS, checkFinding, citeIsKnown, knownCitesFor, normalizeCite, runFinders, validateFinding } from "../gates/finder";
@@ -1550,6 +1550,18 @@ section("suggested fix rendering");
   check("an unknown language gets a bare fence", unknown.includes("```\nall:"));
 
   check("no fix means no section", !renderFindingComment(base).includes("Suggested fix"));
+
+  // Only the summary used to be redacted. An inline comment quotes the model's claim,
+  // evidence and fix verbatim, and those quote configuration and error text as readily.
+  const leaky = renderFindingComment({
+    ...base,
+    claim: "The client sends Authorization: Bearer abcdefgh12345678 to every host",
+    evidence: "proxy is http://bob:hunter2@proxy.corp:8080",
+    suggested_fix: 'const key = "sk-live0123456789abcdef";',
+  });
+  check("a bearer token in a claim is redacted", !leaky.includes("abcdefgh12345678") && leaky.includes("Bearer [REDACTED]"), leaky);
+  check("...URL credentials in the evidence too", !leaky.includes("hunter2"), leaky);
+  check("...and a key in the suggested fix", !leaky.includes("sk-live0123456789abcdef"), leaky);
 }
 
 section("language profile selection");
@@ -3097,6 +3109,83 @@ section("opencode runner: a field it cannot honour is named, not dropped");
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+section("opencode runner: prloop's own agent, no tools, and nowhere near .env");
+{
+  // `opencode run --agent` falls back to the DEFAULT agent — every tool on — for a subagent,
+  // and prloop's agent file declared itself one; it falls back the same way for an agent it
+  // cannot find. So the agent is defined at run time, and the fallback is a tripwire.
+  const cfg = reviewerAgentConfig("prloop-reviewer", "Answer in JSON.") as {
+    agent: Record<string, { mode?: string; prompt?: string; permission?: Record<string, string>; tools?: Record<string, boolean> }>;
+  };
+  const agent = cfg.agent["prloop-reviewer"]!;
+  eq("the agent is primary, so `run --agent` does not fall back past it", agent.mode, "primary");
+  eq("every permission is denied, by name and by wildcard",
+    Object.values(agent.permission ?? {}).every((v) => v === "deny") && agent.permission?.["*"] === "deny" && agent.permission?.["bash"] === "deny" && agent.permission?.["read"] === "deny",
+    true);
+  check("...and the older tools spelling says the same", Object.values(agent.tools ?? {}).every((v) => v === false));
+  const own = (reviewerAgentConfig("team-agent") as { agent: Record<string, { prompt?: string; permission?: Record<string, string> }> }).agent["team-agent"]!;
+  check("an operator's own agent keeps its instructions", own.prompt === undefined);
+  eq("...but not its tools", own.permission?.["bash"], "deny");
+  check("a fallback line is recognised", DEFAULT_AGENT_FALLBACK.test('! agent "prloop-reviewer" is a subagent, not a primary agent. Falling back to default agent'));
+  check("...and turned into a refusal, whatever the run produced",
+    (runFailure({ timedOut: false, timeoutMs: 1, code: 0, signal: null, text: '{"findings":[]}', killedOn: "Falling back to default agent" }) ?? "").includes("fell back to its default one"));
+
+  if (process.platform !== "win32") {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prloop-sandbox-"));
+    try {
+      // A child that announces the wrong thing and would then go on doing it for 30s.
+      const loud = path.join(dir, "loud.sh");
+      fs.writeFileSync(loud, "#!/bin/sh\necho 'about to use the default agent'\nsleep 30\n", { mode: 0o755 });
+      const t0 = Date.now();
+      const killed = await run(loud, [], 60_000, dir, { killOn: /default agent/ });
+      check("a child is killed on the line it was told to watch for", killed.killedOn === "about to use the default agent", JSON.stringify(killed));
+      check("...at once, not after its 30 seconds", Date.now() - t0 < 10_000, `${Date.now() - t0}ms`);
+      check("...and the run reports failure", killed.code !== 0);
+
+      // The real runner against a fake opencode that reports what it was given.
+      const fake = path.join(dir, "opencode");
+      fs.writeFileSync(
+        fake,
+        "#!/usr/bin/env node\n" +
+          "const fs = require('fs');\n" +
+          "fs.readFileSync(0);\n" +
+          "const seen = { cwd: process.cwd(), inline: process.env.OPENCODE_CONFIG_CONTENT ?? null,\n" +
+          "  project: fs.existsSync('opencode.json') ? fs.readFileSync('opencode.json', 'utf8') : null,\n" +
+          "  pat: Object.values(process.env).includes('pat-that-must-not-reach-the-child'), env: fs.existsSync('.env') };\n" +
+          "console.log(JSON.stringify({ type: 'text', part: { type: 'text', text: JSON.stringify(seen) } }));\n",
+        { mode: 0o755 },
+      );
+      const probe = path.join(dir, "probe.mts");
+      const mod = pathToFileURL(path.join(PRLOOP_ROOT, "models", "opencode.ts")).href;
+      fs.writeFileSync(probe, `import { OpencodeRunner } from ${JSON.stringify(mod)};\nconst r = new OpencodeRunner();\nconst res = await r.chat({ model: "m", system: "s", user: "u" });\nconsole.log("SEEN " + res.text);\n`);
+      const res = spawnSync(process.execPath, [path.join(PRLOOP_ROOT, "node_modules", "tsx", "dist", "cli.mjs"), probe], {
+        encoding: "utf8",
+        cwd: PRLOOP_ROOT,
+        env: { ...process.env, PRR_OPENCODE_BIN: fake, PRR_ADO_PAT: "pat-that-must-not-reach-the-child" },
+        timeout: 60_000,
+      });
+      const line = `${res.stdout ?? ""}`.split("\n").find((l) => l.startsWith("SEEN ")) ?? "";
+      const seen = (() => {
+        try {
+          return JSON.parse(line.slice(5)) as { cwd: string; inline: string | null; project: string | null; pat: boolean; env: boolean };
+        } catch {
+          return undefined;
+        }
+      })();
+      check("the fake opencode ran", seen !== undefined, `${res.stdout ?? ""}${res.stderr ?? ""}`.slice(0, 400));
+      if (seen) {
+        check("opencode runs outside prloop's directory", path.resolve(seen.cwd) !== path.resolve(PRLOOP_ROOT), seen.cwd);
+        check("...in one with no .env beside it", !seen.env);
+        check("the inline config denies every tool", (seen.inline ?? "").includes('"*": "deny"'), seen.inline ?? "(none)");
+        eq("...and the directory's own opencode.json says the same", seen.project, seen.inline);
+        eq("the credential scrub still holds", seen.pat, false);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}
+
 section("unusable completions are named, not left to the JSON parser");
 {
   const ok = { message: { content: '{"findings":[]}' }, finish_reason: "stop" };
@@ -3920,6 +4009,15 @@ section("secret redaction at every egress (libs/redact.ts)");
     eq("artifact writer redacts text", raw, "HTTP 401: Bearer [REDACTED]");
     check("artifact writer redacts serialised JSON", json.includes("[REDACTED]") && !json.includes("sk-abcdefgh"), json);
     eq("...and still serialises Sets as arrays", (JSON.parse(json) as { keep: string[] }).keep, ["a"]);
+    // runs/ holds the reviewed source. Created 0755, every account on a shared build agent
+    // could read it; the parents a run creates are the owner's alone too.
+    if (process.platform !== "win32") {
+      const nested = path.join(dir, "org", "proj", "repo", "pr-1", "iter-1-x");
+      openRunDir(nested);
+      const mode = (p: string) => fs.statSync(p).mode & 0o777;
+      eq("a run directory is its owner's alone", mode(nested).toString(8), "700");
+      eq("...and so is every parent the run created", mode(path.join(dir, "org")).toString(8), "700");
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

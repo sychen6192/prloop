@@ -17,7 +17,9 @@ diff inside them, each model's raw output, the skeptic verdicts, and `config.jso
 settings the run used and where each value came from. **These files contain the reviewed
 code.** `runs/` is gitignored, never uploaded anywhere by prloop, and pruned by
 `PRR_RUNS_KEEP` / `PRR_RUNS_MAX_AGE_DAYS`; treat the directory with the same care as a
-checkout of the repositories you review. Two JSONL files sit above the pruned run
+checkout of the repositories you review. prloop creates every directory under it readable by
+its owner only (0700), so another account on a shared build agent cannot list or read it;
+directories that already exist keep their mode. Two JSONL files sit above the pruned run
 directories and outlive them: `dismissals.jsonl`, the findings a reviewer rejected, and
 `outcomes.jsonl`, the ones they fixed. Both hold a fingerprint, a file path and a category —
 no source, no quote — and neither is ever read into a model prompt.
@@ -25,10 +27,11 @@ no source, no quote — and neither is ever read into a model prompt.
 ## What is defended
 
 - **Secrets are redacted where text leaves the process** (`libs/redact.ts`): log lines,
-  `runs/` artifacts, error messages and the summary comment posted on the PR. The motivating
-  leak: gateways that echo the presented credential back inside a 401 body, which was then
-  relayed into the log, into `runs/` and onto the pull request. Redaction is applied at the
-  egress, not per producer, so a new call site cannot forget it.
+  `runs/` artifacts, error messages, `prloop --config`, and every comment posted on the PR —
+  the summary and each inline finding, whose claim, evidence and suggested fix are the model's
+  own words. The motivating leak: gateways that echo the presented credential back inside a
+  401 body, which was then relayed into the log, into `runs/` and onto the pull request.
+  Redaction is applied at the egress, not per producer, so a new call site cannot forget it.
 - **Static analysis runs with a scrubbed environment** (`libs/shell.ts`, `scrubbedEnv`).
   `PRR_WORKDIR` is a checkout of the PR's *source branch*, and linters execute that branch's
   code — an eslint config, a Maven plugin or a lint hook is a program the PR author wrote. Every
@@ -78,12 +81,26 @@ no source, no quote — and neither is ever read into a model prompt.
   of HTML comments and leading markdown structure, and capped. Finding fingerprints hash the
   tool, the rule, the file and the line's own text — never the message — so this changes what
   is displayed and never what is suppressed.
+- **The `opencode` runner cannot hand the model a tool.** A review prompt carries text an
+  attacker can write — the diff, the description, the work items — so the agent that reads it
+  must be able to do nothing but answer. prloop does not trust an installed agent file for
+  that: `opencode run --agent` falls back to opencode's default agent, which has every tool,
+  when the named agent is a subagent or cannot be found, and prloop's own agent file used to
+  declare itself a subagent. Every run now gets prloop's definition — a primary agent with
+  every permission denied by name and by wildcard — through `OPENCODE_CONFIG_CONTENT`, which
+  opencode merges over user and project configs, and again as the `opencode.json` of the
+  empty temporary directory the run is launched from, well away from prloop's `.env`. A
+  run that still prints opencode's fallback warning is killed on that line, and its answer is
+  refused.
+- **Nothing runs at install time.** `.npmrc` sets `ignore-scripts`: none of prloop's
+  dependencies needs an install script, and a compromised release of one would otherwise run
+  with the environment of whoever installs. The CI workflows pin every action to a commit, not
+  a tag that can be moved.
 - **prloop never writes its own configuration** and never votes on a PR. It posts comments and,
   optionally, a status.
 
-Known limit worth stating: `prloop --config` redacts the registered secrets, but a password
-embedded in a proxy or base URL is printed as part of the URL. Scrub that line before sharing
-the output.
+Known limit worth stating: a `runs/` directory created before prloop made them owner-only
+keeps its old mode. On an existing install, run `chmod -R go-rwx runs/` once.
 
 ## Reporting a vulnerability
 

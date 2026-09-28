@@ -107,7 +107,13 @@ export function renderFindingComment(f: AnchoredFinding): string {
   const footer = `<sub>${bits.filter(Boolean).join(" | ")}</sub>`;
   // The prose is defused and the fix is not: inside a fence nothing can close, an HTML
   // comment is literal text, and a fix is contracted to be pasted as it stands.
-  return [findingMarkers(f), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n");
+  //
+  // Redacted as a whole, like the summary: only the summary used to be, and an inline
+  // comment carries the model's claim, evidence and fix verbatim — text that quotes
+  // configuration and error output as readily as the summary's run notes do.
+  return redactSecrets(
+    [findingMarkers(f), defuseHtmlComments(parts.join("\n")), ...fix, "", defuseHtmlComments(footer)].join("\n"),
+  );
 }
 
 export interface SummaryInput {

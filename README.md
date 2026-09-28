@@ -460,7 +460,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_LLM_STRUCTURED` | `1` | `0` = don't send `response_format`; the schema is inlined into the prompt instead |
 | `PRR_RUNNER` | `openai` | `openai` \| `opencode` |
 | `PRR_OPENCODE_BIN` | `opencode` | opencode executable |
-| `PRR_OPENCODE_AGENT` | `prloop-reviewer` | agent definition prloop drives (installed by `npm run setup`) |
+| `PRR_OPENCODE_AGENT` | `prloop-reviewer` | agent prloop drives; whatever its name, prloop denies it every tool at run time |
 | `PRR_OPENCODE_JSON` | `1` | `0` = drop `--format json` for builds without JSONL events; loses tracing |
 | `PRR_AGENT_TIMEOUT_MS` | `900000` | wall clock for one opencode session |
 | `PRR_RULES_DIR` | — | your team's rules as `.md` files with an `applyTo` glob, added to the shipped `rules/`; a file named like a shipped one replaces it |
@@ -524,8 +524,12 @@ loaded exactly once per run.
 **Runner** — `PRR_RUNNER=openai` (default) talks HTTP directly and supports **guided
 decoding**, where the engine enforces the JSON schema at the token level. That is what keeps
 weak models emitting valid JSON. `opencode` reuses your existing provider config but **does
-not forward `response_format`**, dropping schemas to prompt-level only. Run `npm run setup`
-first to install its agent definition. Like every child process it receives a
+not forward `response_format`**, dropping schemas to prompt-level only. prloop hands opencode
+its own agent definition on every run — a primary agent with every tool denied, passed through
+`OPENCODE_CONFIG_CONTENT` and an `opencode.json` in an empty temporary directory the run is
+launched from — so `npm run setup` is optional, and a user or project config cannot give that
+agent tools. If opencode still falls back to its default agent (which has tools), prloop kills
+the run on the warning line and refuses its answer. Like every child process it receives a
 secret-scrubbed environment (see static analysis), so its provider keys must live in
 opencode's own auth store (`opencode auth login`), not in `*_API_KEY` variables.
 

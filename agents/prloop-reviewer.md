@@ -1,6 +1,6 @@
 ---
 description: prloop's review agent. Pure text transformation, reads the injected diff and rules, outputs a JSON verdict.
-mode: subagent
+mode: primary
 tools:
   read: false
   write: false

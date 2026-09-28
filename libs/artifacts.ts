@@ -27,6 +27,17 @@ export const PRLOOP_VERSION = (() => {
   }
 })();
 
+/**
+ * Creates `dir` and any missing parents readable by their owner only. Everything under
+ * runs/ is either the reviewed source — prompts, diffs, raw model output — or a record of
+ * what a team's reviewers rejected, and a default 0755 left all of it readable by every
+ * account on a shared build agent. Directories that already exist keep their mode: a
+ * deployment that shares runs/ on purpose has chosen that. Windows ignores the mode.
+ */
+export function mkdirPrivate(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
 function timestamp(): string {
   const d = new Date();
   const p = (n: number) => String(n).padStart(2, "0");
@@ -210,7 +221,7 @@ export function buildResultSummary(input: ResultSummaryInput): Record<string, un
  * result.json at the end) must not re-open the log sink it already has.
  */
 export function openRunDir(dir: string, tee = false): RunDir {
-  fs.mkdirSync(dir, { recursive: true });
+  mkdirPrivate(dir);
   // Retention runs here, after the new directory exists, so the run being written is always
   // the newest thing in the PR's directory and can never be the one deleted.
   pruneIterations(path.dirname(dir), path.basename(dir));

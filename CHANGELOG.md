@@ -395,3 +395,19 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
   summary, and every HTML comment opener in text prloop quotes is defused before it is posted.
   A suggested fix now gets a fence longer than any backtick run inside it, so the fix cannot
   end its own code block.
+- **The `opencode` runner could review a pull request with every tool enabled.**
+  `opencode run --agent` falls back to opencode's default agent — read, write, bash,
+  webfetch — when the named agent is a subagent or is not installed, and prloop's agent file
+  declared itself a subagent. The fallback is a warning line nobody read, so a prompt carrying
+  attacker-written PR text could run with tools, launched from prloop's own directory beside
+  `.env`. Every run now gets prloop's agent definition at run time: a primary agent with every
+  permission denied by name and by wildcard, through `OPENCODE_CONFIG_CONTENT` and as the
+  `opencode.json` of an empty temporary directory the run starts in. A run that prints the
+  fallback warning anyway is killed on that line and its answer refused. `npm run setup` is
+  now optional.
+- Inline comments are redacted like the summary: the model's claim, evidence and suggested
+  fix were posted verbatim, and they quote configuration and error text as readily.
+- Directories under `runs/` are created owner-only (0700). They hold the reviewed source; an
+  existing `runs/` keeps its mode, so `chmod -R go-rwx runs/` once on an existing install.
+- `.npmrc` sets `ignore-scripts` — no dependency needs an install script — and the CI
+  workflows pin their actions to commits instead of movable tags.
