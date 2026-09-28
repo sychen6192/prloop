@@ -8,9 +8,8 @@ import {
   MIN_INLINE_SEVERITY,
   REQUIRE_CORROBORATION,
   excludedCategories,
-  severityRank,
-  type Severity,
 } from "../config";
+import { severityRank, type Severity } from "../libs/taxonomy";
 import { anchorFinding } from "../anchoring/locate";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { log } from "../libs/log";

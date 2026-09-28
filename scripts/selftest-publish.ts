@@ -48,7 +48,7 @@ try {
   const { watermarkFor, lastReviewedIteration, collectDismissals } = await import("../publish/lifecycle");
   const { selfIdentityId, isSelfIdentity, resetIdentityCache } = await import("../ado/identity");
   const { exitCodeFor } = await import("../orchestrator");
-  const { FINDING_CATEGORIES } = await import("../config");
+  const { FINDING_CATEGORIES } = await import("../libs/taxonomy");
   const { fingerprint } = await import("../gates/aggregate");
   const { FileIndex } = await import("../libs/fileindex");
 

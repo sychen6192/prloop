@@ -17,7 +17,7 @@
 // The bytes are a wire format already sitting on live PRs. Order and spacing are fixed:
 // changing them orphans every thread a previous run left behind.
 import { createHash } from "node:crypto";
-import { FINDING_CATEGORIES, type FindingCategory } from "../config";
+import { FINDING_CATEGORIES, type FindingCategory } from "../libs/taxonomy";
 
 /** Identifies authorship. On every comment prloop writes, first thing in the body. */
 export const BOT_MARKER = "<!-- prloop -->";

@@ -2,7 +2,7 @@
 // never knows which linter a finding came from.
 import { parseJsonObject } from "../libs/json";
 import { log } from "../libs/log";
-import type { Severity } from "../config";
+import type { Severity } from "../libs/taxonomy";
 import type { OutputFormat, ToolFinding, ToolSpec } from "./types";
 
 function rel(p: string, workdir: string): string {

@@ -41,10 +41,12 @@ and closes its server in a `finally`.
   CLOSED (a wrong-line comment is worse than a miss). Keep them.
 - **Two axes stay blind to each other.** The requirement axis and code axis must not see
   each other's output, and their comment budgets stay separate.
-- **Config is SSOT in `config.ts`** — every knob is a `PRR_*` env var read there once, listed
-  in the `KNOWN_KEYS` registry, and documented in `.env.example` and the README table. Add all
-  four or none; `scripts/selftest.ts` fails on any of them missing. A knob read outside
-  `config.ts` has no provenance, no `--config` row and no typo warning, so there are none.
+- **Config is SSOT in `config.ts`** — every knob is a `PRR_*` env var read there once, by a
+  reader that declares it (kind, section, description; `KNOWN_KEYS` is built from those
+  declarations), and documented in `.env.example` and the README table. Add all three or none;
+  `scripts/selftest.ts` fails on any of them missing. A knob read outside `config.ts` has no
+  provenance, no `--config` row and no typo warning, so there are none. What a finding is —
+  severities, categories — is not configuration and lives in `libs/taxonomy.ts`.
 - **Every model call goes through `models/runner.ts`** (concurrency, retries, streaming,
   token accounting). Never call fetch directly for model traffic.
 

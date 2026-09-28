@@ -10,7 +10,7 @@
 // down — and none of those constraints were load-bearing: confidence is clamped and extras
 // are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
 // live in descriptions and in the validators.
-import { FINDER_CATEGORIES, SEVERITIES } from "../config";
+import { FINDER_CATEGORIES, SEVERITIES } from "../libs/taxonomy";
 import { CLAIM_KINDS, REQ_VERDICTS, SKEPTIC_VERDICTS, type ChatRequest } from "../libs/types";
 
 export const FINDINGS_SCHEMA = {

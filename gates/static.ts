@@ -14,15 +14,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   MAX_TRIAGE_ITEMS,
-  SEVERITIES,
   STATIC_TIMEOUT_MS,
   TRIAGE_CONTEXT_LINES,
   TRIAGE_MODEL,
   WORKDIR,
   excludedCategories,
-  severityRank,
-  type Severity,
 } from "../config";
+import { SEVERITIES, severityRank, type Severity } from "../libs/taxonomy";
 import { splitLines } from "../libs/text";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import { arrayField, parseJsonObject } from "../libs/json";

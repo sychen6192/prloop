@@ -9,7 +9,6 @@ import {
   ADO_CONCURRENCY,
   BATCH_PARALLEL,
   FINDER_MODELS,
-  FINDING_CATEGORIES,
   KNOWN_KEYS,
   LLM_CONCURRENCY,
   REPO_OVERRIDES,
@@ -24,6 +23,7 @@ import {
   excludedCategories,
   isDryRun,
 } from "./config";
+import { FINDING_CATEGORIES } from "./libs/taxonomy";
 import { parsePrUrl } from "./ado/client";
 import { postStatus } from "./ado/statuses";
 import { unmetCriteria } from "./gates/requirement";

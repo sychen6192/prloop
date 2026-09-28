@@ -23,7 +23,7 @@ import {
   TRIAGE_SCHEMA,
   VERDICT_SCHEMA,
 } from "../../models/schemas";
-import { type Severity } from "../../config";
+import { type Severity } from "../../libs/taxonomy";
 import * as path from "node:path";
 import { run } from "../../libs/shell";
 import { declares, namesIn, relatedContext } from "../../gates/lookup";

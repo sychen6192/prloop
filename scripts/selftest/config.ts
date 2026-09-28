@@ -19,6 +19,7 @@ import { coverageGaps } from "../../orchestrator";
 import { calibrate } from "../calibrate";
 import {
   KNOWN_KEYS,
+  declare,
   PRLOOP_ROOT,
   applyDotEnv,
   configReport,
@@ -220,6 +221,17 @@ section("config SSOT: registry, readers, .env.example and the README settings ta
   const names = KNOWN_KEYS.map((k) => k.name);
   const known = new Set(names);
   eq("no duplicate registry entries", names.length - known.size, 0);
+  // Declared by the readers, not listed by hand: a second declaration is a mistake to stop at.
+  let twice = "";
+  try {
+    declare("PRR_FINDER_MODELS", "csv", { section: "Model endpoint", description: "again" });
+  } catch (e) {
+    twice = e instanceof Error ? e.message : String(e);
+  }
+  check("a knob cannot be declared twice", twice.includes("PRR_FINDER_MODELS is declared twice"), twice);
+  const sections = KNOWN_KEYS.map((k) => k.section).filter((sec, i, all) => i === 0 || all[i - 1] !== sec);
+  eq("the registry lists each section once, all its knobs together", sections.length, new Set(sections).size);
+  eq("...starting where .env.example does", sections[0], "Azure DevOps");
   check("every entry has a description", KNOWN_KEYS.every((k) => k.description.length > 0 && k.description.length <= 60));
 
   // 1. The registry and the readers describe the same set of knobs. A knob added to

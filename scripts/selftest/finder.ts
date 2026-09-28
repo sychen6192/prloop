@@ -28,12 +28,11 @@ import { coverageGaps } from "../../orchestrator";
 import { rankForVerification } from "../../gates/skeptic";
 import { FINDINGS_SCHEMA } from "../../models/schemas";
 import {
-  FINDER_CATEGORIES,
   PRLOOP_ROOT,
   parseFinderPromptSuffixes,
   parseFinderSeed,
-  type Severity,
 } from "../../config";
+import { FINDER_CATEGORIES, type Severity } from "../../libs/taxonomy";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

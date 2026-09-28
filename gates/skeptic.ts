@@ -14,12 +14,12 @@ import {
   SKEPTIC_MODELS,
   SKEPTIC_ROUNDS,
   SKEPTIC_TIMEOUT_MS,
-  severityRank,
 } from "../config";
+import { severityRank } from "../libs/taxonomy";
 import type { FileIndex } from "../libs/fileindex";
 import { parseJsonObject } from "../libs/json";
 import { log, logVerbose } from "../libs/log";
-import { SEVERITIES, type Severity } from "../config";
+import { SEVERITIES, type Severity } from "../libs/taxonomy";
 import { SKEPTIC_VERDICTS, type AnchoredFinding, type ModelRunner, type SkepticVerdictKind } from "../libs/types";
 import { VERDICT_SCHEMA } from "../models/schemas";
 import { SKEPTIC_SYSTEM, buildSkepticPrompt } from "../prompts/skeptic";

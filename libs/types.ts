@@ -1,5 +1,5 @@
 // Shared types (SSOT: all other modules import from here).
-import type { Severity } from "../config";
+import type { Severity } from "./taxonomy";
 
 // --- Azure DevOps intake ---
 

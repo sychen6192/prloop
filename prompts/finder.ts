@@ -15,7 +15,8 @@
 //    than its middle. So the category list, the severity chain and the headings of the
 //    loaded rules are restated compactly after the diff, right where the model starts
 //    writing — and the rule headings double as the citations the validator accepts.
-import { FINDER_CATEGORIES, FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL, WHOLE_FILE_MAX_LINES } from "../config";
+import { FINDER_MAX_CHUNKS, FINDER_PROMPT_SUFFIX_BY_MODEL, WHOLE_FILE_MAX_LINES } from "../config";
+import { FINDER_CATEGORIES } from "../libs/taxonomy";
 import { buildDiffPayloads } from "../libs/payload";
 import type { FileDiff, PrInfo } from "../libs/types";
 import { neutralizeLine, renderPrDescription, renderRepositoryConventions } from "./untrusted";

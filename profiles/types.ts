@@ -11,7 +11,7 @@
 //              PMD). An LLM judges exploitability in context before anything is posted.
 //   suppress — style and convention noise (checkstyle, most eslint stylistic rules). Never
 //              becomes a comment; summarised as a count so it isn't silently dropped.
-import type { Severity } from "../config";
+import type { Severity } from "../libs/taxonomy";
 
 export type ToolTier = "fact" | "triage" | "suppress";
 

@@ -15,12 +15,10 @@ import {
   REQUIRE_CORROBORATION,
   RISK_TIERS,
   SENSITIVE_PATHS,
-  SEVERITIES,
   SKEPTIC_MODELS,
   SKEPTIC_ROUNDS,
-  severityRank,
-  type Severity,
 } from "../config";
+import { SEVERITIES, severityRank, type Severity } from "./taxonomy";
 import { anyPathMatches } from "./rules";
 import type { FileDiff } from "./types";
 

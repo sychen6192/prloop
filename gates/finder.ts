@@ -4,14 +4,11 @@
 // heterogeneous fleet running in parallel — the only thing that changes is the fan-out,
 // not the parsing or validation.
 import {
-  FINDER_CATEGORIES,
   FINDER_MODELS,
   FINDER_PROMPT_SUFFIX_BY_MODEL,
   FINDER_SEED,
-  SEVERITIES,
-  severityRank,
-  type Severity,
 } from "../config";
+import { FINDER_CATEGORIES, SEVERITIES, severityRank, type Severity } from "../libs/taxonomy";
 import { arrayField, parseJsonObject, salvageArrayItems } from "../libs/json";
 import { log } from "../libs/log";
 import { newRunSeed, seedFor } from "../libs/prng";
