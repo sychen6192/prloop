@@ -92,7 +92,10 @@ function readRuleDir(dir: string, root: string = dir): Rule[] {
     const p = path.join(dir, entry.name);
     if (entry.isDirectory()) out.push(...readRuleDir(p, root));
     else if (entry.name.endsWith(".md")) {
-      out.push(parseRule(path.relative(root, p), fs.readFileSync(p, "utf8")));
+      // Forward slashes on every OS: the name is how a team file replaces a shipped one, what
+      // the summary lists and what the run stamp hashes, and path.relative spells a team's
+      // api/controllers.md as api\controllers.md on Windows.
+      out.push(parseRule(normalizePath(path.relative(root, p)), fs.readFileSync(p, "utf8")));
     }
   }
   return out;
