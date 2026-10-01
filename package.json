@@ -18,12 +18,12 @@
     "prloop": "tsx loop.ts"
   },
   "devDependencies": {
-    "@types/node": "^26.4.1",
-    "tsx": "^4.23.13",
+    "@types/node": "^26.6.3",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "undici": "^8.10.2"
+    "undici": "^8.11.2"
   },
   "license": "MIT",
   "repository": {
