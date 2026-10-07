@@ -347,8 +347,10 @@ again. So a run takes a **lease** on the pull request first: a timestamped marke
 prloop's own summary comment, honoured by any other run for `PRR_RUN_LEASE_MS` (one hour by
 default). A run that finds the PR held reviews nothing, spends nothing, and exits `0`; the
 review is already happening. The lease is given back by the summary the run posts, so the
-normal path costs no extra write, and an expired one is taken over with a warning naming the
-knob — if reviews here legitimately run longer than the window, raise it. `0` turns it off.
+normal path costs no extra write; a run that crashes gives it back on its way out, and so does
+one interrupted with Ctrl-C or a cancelled pipeline job (a second Ctrl-C exits at once, lease
+and all). An expired one is taken over with a warning naming the knob — if reviews here
+legitimately run longer than the window, raise it. `0` turns it off.
 And a run whose lease ran out and was taken over while it was still reviewing finds that out
 just before posting, and posts nothing (exit `3`, reason named) rather than interleave its
 comments and summary with the run that took over.

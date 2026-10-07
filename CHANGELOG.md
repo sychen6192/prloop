@@ -415,6 +415,13 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **Ctrl-C no longer locks the pull request for an hour.** An interrupted run exited at once and
+  left its lease in the summary comment, so every run on that pull request for the next
+  `PRR_RUN_LEASE_MS` stood down with "run … still holds this pull request" — what somebody
+  meets first who stops a run to fix a setting. On SIGINT or SIGTERM (a cancelled pipeline
+  job) the run now kills its children, gives the lease back and removes its worktrees, as a
+  crash already did, within 15 seconds, then exits `130` / `143`. A second Ctrl-C exits at
+  once.
 - **The identity check works on Azure DevOps Server.** `connectionData` is a preview-only
   resource, and the server answered prloop's plain `api-version=7.1` with 400 ("the requested
   version is under preview"), so every run warned and reviewed with its identity check off —

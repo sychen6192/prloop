@@ -21,7 +21,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { fakeAdo, type ChangePage } from "./fakes/ado";
 import { completion, fakeOpenAI, httpError, type RecordedCall, type Responder } from "./fakes/openai";
-import { capture, check, eq, report, section } from "./selftest/harness";
+import { capture, check, eq, report, section, skip } from "./selftest/harness";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -342,7 +342,7 @@ try {
   const { runReview, exitCodeFor } = await import("../orchestrator");
   const { createRunner } = await import("../models/runner");
   const { resolveLastReviewedIteration } = await import("../publish/lifecycle");
-  const { readMarkers } = await import("../publish/markers");
+  const { BOT_MARKER, SUMMARY_MARKER, readMarkers } = await import("../publish/markers");
 
   const ref = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4821");
   const host = adoHost(ref);
@@ -622,6 +622,54 @@ try {
     eq("the status passes", status?.["state"], "succeeded");
     check("...without claiming it reviewed anything", !String(status?.["description"] ?? "").includes("Reviewed 0 files"), String(status?.["description"]));
     eq("...and the exit code agrees", exitCodeFor(result), 0);
+  }
+
+  section("an interrupted run gives the pull request back, instead of holding it for an hour");
+  {
+    // Ctrl-C mid-review exited at once and left the run's lease in the summary, so every run on
+    // that pull request for the next PRR_RUN_LEASE_MS stood down with "run … still holds this
+    // pull request" — the first thing somebody meets who stops a run to fix a setting. The CLI
+    // in its own process, as a person runs it, interrupted while its models are answering.
+    if (process.platform === "win32") {
+      skip("an interrupted run gives the lease back", "a test cannot send Windows a Ctrl-C: child.kill is TerminateProcess, which runs no handler");
+    } else {
+      nextPr("Retry the refund", { "src/pay.ts": { blob: BLOB.pay1, text: PAY_1 } }, story(4714, ["A refund is retried"]));
+      // A lease lives in the summary an earlier run left; a pull request with none has no lease.
+      ado.state.threads = [
+        {
+          id: 4900,
+          status: "closed",
+          comments: [{ id: 990, content: `${BOT_MARKER}${SUMMARY_MARKER}\n## prloop review\n\nNothing blocking.\n<!-- prloop:iteration=1 -->`, author: { id: BOT } }],
+        },
+      ];
+      // Every model call gets its headers and then nothing, so the run is mid-review.
+      models.answerBy(() => (res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+      });
+      const held = () => readMarkers(summaryOf()).run;
+      const child = spawn(
+        process.execPath,
+        [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), path.join(root, "loop.ts"), "https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4824"],
+        { env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let out = "";
+      child.stdout.on("data", (c: Buffer) => (out += c.toString()));
+      child.stderr.on("data", (c: Buffer) => (out += c.toString()));
+      const exited = new Promise<number | null>((resolve) => child.on("close", (code) => resolve(code)));
+      const deadline = Date.now() + 60_000;
+      while (!(held() && models.calls.length > 0) && child.exitCode === null && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      check("the run takes the pull request and starts asking its models", held() !== undefined && models.calls.length > 0, out.slice(-800));
+      child.kill("SIGINT");
+      const killer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+      const code = await exited;
+      clearTimeout(killer);
+      eq("Ctrl-C exits 130", code, 130);
+      eq("...after giving the pull request back", held(), undefined);
+      check("...and says what it is doing", out.includes("interrupted: giving the pull request back"), out.slice(-800));
+      models.answerBy(reviewer);
+    }
   }
 
   section("a local branch, reviewed end to end: real pipeline, no pull request, nothing posted");

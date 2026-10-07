@@ -3,7 +3,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logVerbose } from "./log";
+import { log, logVerbose } from "./log";
 
 export interface ExecResult {
   stdout: string;
@@ -466,23 +466,71 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"
 const liveChildren = new Set<ChildProcess>();
 let shutdownHooked = false;
 
+const killAll = () => {
+  for (const c of liveChildren) killTree(c, "SIGKILL");
+  liveChildren.clear();
+};
+
 /** Registers `child` so an interrupted run still takes its process tree down with it. */
 export function trackForShutdown(child: ChildProcess): void {
   liveChildren.add(child);
   child.once("exit", () => liveChildren.delete(child));
+  hookShutdown();
+}
+
+// What an interrupted run still owes before it exits, beyond its children: the run lease
+// it holds on the pull request, the worktrees it cut. Exiting at once used to leave the
+// lease marker in the PR's summary, and every run on that PR for the next PRR_RUN_LEASE_MS
+// (an hour by default) stood down with "run … still holds this pull request" — the first
+// thing somebody pressing Ctrl-C to fix a setting and run again ran into.
+type Cleanup = () => unknown;
+const cleanups: Cleanup[] = [];
+let interrupted = false;
+
+/** How long an interrupted run waits for its cleanups before it exits anyway. */
+export const INTERRUPT_CLEANUP_MS = 15_000;
+
+/** Work to do before an interrupted run exits. Registered once; runs on SIGINT and SIGTERM. */
+export function onInterrupt(cleanup: Cleanup): void {
+  cleanups.push(cleanup);
+  hookShutdown();
+}
+
+/**
+ * Runs every cleanup — one that throws or rejects does not stop the others — but never for
+ * longer than `ms`: somebody who pressed Ctrl-C is waiting, and a cleanup that needs the
+ * network may be the very thing that hangs. Exported for the selftest.
+ */
+export async function runCleanups(list: readonly Cleanup[], ms: number): Promise<"done" | "timed out"> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<"timed out">((resolve) => {
+    timer = setTimeout(() => resolve("timed out"), ms);
+  });
+  const all = Promise.allSettled(list.map((f) => Promise.resolve().then(f))).then(() => "done" as const);
+  try {
+    return await Promise.race([all, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function hookShutdown(): void {
   if (shutdownHooked) return;
   shutdownHooked = true;
-
-  const killAll = () => {
-    for (const c of liveChildren) killTree(c, "SIGKILL");
-    liveChildren.clear();
-  };
   // 'exit' handlers must be synchronous; process.kill is, so the POSIX path is safe here.
   process.on("exit", killAll);
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
+      const code = sig === "SIGINT" ? 130 : 143;
       killAll();
-      process.exit(sig === "SIGINT" ? 130 : 143);
+      // The second signal means now, and so does a process with nothing to give back.
+      if (interrupted || cleanups.length === 0) process.exit(code);
+      interrupted = true;
+      log(`[WARN] interrupted: giving the pull request back before exiting (${sig === "SIGINT" ? "Ctrl-C" : sig} again exits at once)`);
+      void runCleanups(cleanups, INTERRUPT_CLEANUP_MS).then((how) => {
+        if (how === "timed out") log(`[WARN] cleanup did not finish in ${INTERRUPT_CLEANUP_MS / 1000}s; exiting anyway`);
+        process.exit(code);
+      });
     });
   }
 }
