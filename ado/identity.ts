@@ -12,6 +12,7 @@
 // extra scope beyond the one prloop already uses, and it answers for whichever credential
 // is in play — a PAT, a pipeline's $(System.AccessToken), or an `az login` token — without
 // prloop having to know which.
+import { ADO_API_VERSION } from "../config";
 import { adoGet } from "./client";
 import { log, logVerbose } from "../libs/log";
 import type { PrRef } from "../libs/types";
@@ -21,6 +22,18 @@ interface ConnectionData {
 }
 
 let cached: Promise<string | undefined> | undefined;
+
+/**
+ * The api-version connectionData is asked for: the configured one, as a preview.
+ *
+ * connectionData has only ever been a preview resource. Azure DevOps Server answers a plain
+ * `7.1` with 400 — 'The requested version "7.1" of the resource is under preview. The
+ * -preview flag must be supplied in the api-version for such requests' — and prloop then
+ * reviewed with its identity check off, trusting any comment that carried its markers.
+ */
+export function connectionDataVersion(version: string = ADO_API_VERSION): string {
+  return /-preview/i.test(version) ? version : `${version}-preview`;
+}
 
 /** Forgets the cached answer. For the selftest; a real run asks once and keeps it. */
 export function resetIdentityCache(): void {
@@ -42,7 +55,9 @@ export function resetIdentityCache(): void {
 export function selfIdentityId(ref: PrRef): Promise<string | undefined> {
   cached ??= (async () => {
     try {
-      const data = await adoGet<ConnectionData>(`${ref.baseUrl}/_apis/connectionData`);
+      const data = await adoGet<ConnectionData>(`${ref.baseUrl}/_apis/connectionData`, {
+        apiVersion: connectionDataVersion(),
+      });
       const id = data.authenticatedUser?.id?.trim();
       if (!id) {
         log(

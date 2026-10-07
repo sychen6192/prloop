@@ -415,6 +415,12 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **The identity check works on Azure DevOps Server.** `connectionData` is a preview-only
+  resource, and the server answered prloop's plain `api-version=7.1` with 400 ("the requested
+  version is under preview"), so every run warned and reviewed with its identity check off —
+  trusting any comment that carried prloop's markers, forged or not. It is now asked for as
+  `<PRR_ADO_API_VERSION>-preview`. The fake Azure DevOps in the selftests refuses a plain
+  version the same way.
 - The README's cost formula: the requirement axis disputes its accusations in one batched
   call, and `partial` is one of them — `1 + D` calls, not `1 + A`.
 - **A local review no longer shows the base branch's later changes as the branch reverting

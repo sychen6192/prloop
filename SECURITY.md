@@ -66,8 +66,10 @@ no source, no quote — and neither is ever read into a model prompt.
   `&lt;!-- prloop:iteration=5 --&gt;` reached the summary as a live marker once the work item
   was flattened to text. So every HTML comment opener in the quoted text is also defused on
   its way to the PR (`defuseHtmlComments`), which keeps it readable and keeps it from hiding
-  the rest of the comment. Where `connectionData` is unavailable (some on-prem Server
-  versions) prloop falls back to trusting the markers alone and says so, once, in the run log.
+  the rest of the comment. `connectionData` is a preview-only resource and is asked for with
+  the `-preview` api-version it requires (a plain `7.1` is a 400 on Azure DevOps Server).
+  Where it is still unavailable (some on-prem Server versions) prloop falls back to trusting
+  the markers alone and says so, once, in the run log.
 - **Text prloop did not write is fenced before it reaches a model.** The PR description, the
   reviewed repository's own convention documents, the linked work items (title, description
   and every acceptance criterion) and the static-analysis reports each go into their prompt
