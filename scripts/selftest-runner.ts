@@ -139,6 +139,52 @@ try {
     check("...and is reported as itself", (rejected.error ?? "").includes("model not found"), rejected.error);
   }
 
+  section("a model that refuses a temperature: one refused call per model per run, and the call still answers");
+  {
+    // The first run of a fleet with an Azure reasoning model lost that finder outright: every
+    // one of its calls carried PRR_LLM_TEMPERATURE's 0.2 and every one came back a 400.
+    endpoint.reset();
+    const refusal = httpError(
+      400,
+      JSON.stringify({
+        error: {
+          message: "litellm.BadRequestError: AzureException BadRequestError - Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported.",
+        },
+      }),
+    );
+    // Answered the way that backend answers: any call to the reasoner that carries a
+    // temperature is refused, whatever it asks.
+    let answered = 0;
+    const answers = ["first answer", "second answer", "another model"];
+    endpoint.answerBy((call) =>
+      call.body["model"] === "gpt-reasoner" && "temperature" in call.body ? refusal : completion(answers[answered++] ?? "?"),
+    );
+    const runner = new OpenAICompatRunner(endpoint.baseUrl, "test-key");
+    const reasoner = { ...ask, model: "gpt-reasoner" };
+
+    const first = await runner.chat(reasoner);
+    eq("the refused call is sent again and answers", [first.text, first.error], ["first answer", undefined]);
+    eq("...at the cost of one extra round trip", endpoint.calls.length, 2);
+    eq("the refused attempt carried the configured temperature", endpoint.calls[0]?.body["temperature"], 0.2);
+    check("...and the second carried none", !("temperature" in (endpoint.calls[1]?.body ?? {})));
+
+    const second = await runner.chat(reasoner);
+    eq("the next call to that model goes without — no second refusal to pay for", [second.text, endpoint.calls.length], ["second answer", 3]);
+    check("...none on the wire", !("temperature" in (endpoint.calls[2]?.body ?? {})));
+
+    await runner.chat(ask);
+    eq("another model keeps the configured temperature", endpoint.calls[3]?.body["temperature"], 0.2);
+
+    // A 400 that complains about the value is a request that is wrong, not a field the model
+    // refuses: sending it again without one would hide the mistake.
+    endpoint.answerBy(undefined);
+    endpoint.reset();
+    endpoint.script(httpError(400, '{"error":{"message":"temperature must be between 0 and 2"}}'));
+    const wrong = await new OpenAICompatRunner(endpoint.baseUrl, "test-key").chat(reasoner);
+    eq("a complaint about the value is not sent again", endpoint.calls.length, 1);
+    check("...and is reported as itself", (wrong.error ?? "").includes("between 0 and 2"), wrong.error);
+  }
+
   section("the per-call deadline: the last defence when the stall timer is off");
   {
     // The stall timer (PRR_LLM_STALL_TIMEOUT_MS=0 disables it) is not the only thing
