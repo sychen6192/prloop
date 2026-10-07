@@ -489,6 +489,14 @@ try {
     resetIdentityCache();
     const selfId = await selfIdentityId(ref);
     eq("prloop can learn which identity it posts as", selfId, BOT.toLowerCase());
+    // connectionData is preview-only, and the fake answers a plain version the way Azure
+    // DevOps Server does: 400, and a run with its identity check off.
+    const asked = ado.matching("GET", /\/_apis\/connectionData$/);
+    check(
+      "...asking connectionData with the preview flag it requires",
+      asked.length > 0 && asked.every((r) => /-preview$/.test(r.query["api-version"] ?? "")),
+      JSON.stringify(asked.map((r) => r.query)),
+    );
     eq(
       "a resume point in someone else's comment is not believed",
       lastReviewedIteration(ado.state.threads as unknown as Parameters<typeof lastReviewedIteration>[0], selfId),

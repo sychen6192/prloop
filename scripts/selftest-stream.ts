@@ -11,6 +11,7 @@ import {
   buildChatBody,
   describeStreamedCompletion,
   isStreamingRejection,
+  isTemperatureRejection,
   isTransient,
   streamedCompletionFailure,
   parseRetryAfter,
@@ -129,6 +130,18 @@ section("streamed completion taxonomy: cut streams fail, a missing [DONE] alone 
   check("a 5xx does not (already transient)", !isStreamingRejection(http(500, "HTTP 500: stream backend crashed")));
   check("a timeout does not", !isStreamingRejection({ error: "timeout (900s)", errorKind: "timeout" }));
   check("...nor a message that merely reads like one", !isStreamingRejection({ error: "HTTP 400: stream_options", errorKind: "api" }));
+
+  // The same compromise for a temperature the model refuses: a reasoning model answers
+  // prloop's 0.2 with a 400, and only the message says why.
+  check(
+    "Azure's refusal of a temperature is one",
+    isTemperatureRejection(http(400, `HTTP 400: {"error":{"message":"litellm.BadRequestError: AzureException BadRequestError - Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported."}}`)),
+  );
+  check("...and so is OpenAI's", isTemperatureRejection(http(400, "HTTP 400: Unsupported parameter: 'temperature' is not supported with this model.")));
+  check("a complaint about the value's range is not", !isTemperatureRejection(http(400, "HTTP 400: temperature must be between 0 and 2")));
+  check("a refusal that is not about temperature is not", !isTemperatureRejection(http(400, "HTTP 400: Unsupported parameter: 'top_k'")));
+  check("a 5xx that mentions it is not", !isTemperatureRejection(http(500, "HTTP 500: temperature is not supported right now")));
+  check("...nor an in-band error that reads like one", !isTemperatureRejection({ error: "temperature is not supported", errorKind: "api" }));
 }
 
 section("request body assembly: PRR_LLM_EXTRA_BODY adds engine knobs, never breaks the shape");

@@ -177,6 +177,13 @@ export async function fakeAdo(overrides: Partial<FakeAdoState> = {}): Promise<Fa
     }
     // --- identity --------------------------------------------------------------------
     if (method === "GET" && /\/_apis\/connectionData$/.test(path)) {
+      // What Azure DevOps Server says to a plain version: the resource is preview-only.
+      const version = query["api-version"] ?? "";
+      if (!/-preview/i.test(version)) {
+        return sendJson(res, 400, {
+          message: `The requested version "${version}" of the resource is under preview. The -preview flag must be supplied in the api-version for such requests. For example: "${version}-preview"`,
+        });
+      }
       if (state.selfIdentityId === undefined) {
         return sendJson(res, 404, { message: "VS402844: connectionData is not available" });
       }

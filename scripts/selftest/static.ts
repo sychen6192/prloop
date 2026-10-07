@@ -19,7 +19,7 @@ import { categoryForRule, parseTriageVerdicts, triageAndConvert } from "../../ga
 import type { ToolFinding } from "../../profiles/types";
 import type { AnchoredFinding, FileDiff } from "../../libs/types";
 import { buildTriagePrompt } from "../../prompts/triage";
-import { killTree, scrubbedEnv } from "../../libs/shell";
+import { killTree, runCleanups, scrubbedEnv } from "../../libs/shell";
 import { spawn as spawnChild } from "node:child_process";
 import { PRLOOP_ROOT } from "../../config";
 import * as fs from "node:fs";
@@ -818,6 +818,38 @@ section("static-tool subprocesses: the timeout kills the tree, not just the chil
       }
     }
   }
+}
+
+section("an interrupted run's cleanups: every one runs, and none holds the exit hostage");
+{
+  // On Ctrl-C the run gives its lease back and removes its worktrees before it exits. Both
+  // can fail and both need the network or a disk, so one failing must not skip the other,
+  // and one hanging must not keep somebody who pressed Ctrl-C waiting forever.
+  const ran: string[] = [];
+  const how = await runCleanups(
+    [
+      () => {
+        throw new Error("thrown before any await");
+      },
+      async () => {
+        ran.push("after a throw");
+      },
+      async () => {
+        throw new Error("rejected");
+      },
+      async () => {
+        ran.push("after a rejection");
+      },
+    ],
+    1_000,
+  );
+  eq("a cleanup that fails does not stop the others", ran, ["after a throw", "after a rejection"]);
+  eq("...and a run whose cleanups all settled says so", how, "done");
+  const started = Date.now();
+  const hung = await runCleanups([() => new Promise(() => undefined), async () => ran.push("beside a hang")], 200);
+  eq("a cleanup that never settles is cut off at the deadline", hung, "timed out");
+  check("...on time", Date.now() - started < 2_000, `${Date.now() - started}ms`);
+  check("...and the others beside it still ran", ran.includes("beside a hang"));
 }
 
 section("what the tools established: the evidence a tool comment closes on");

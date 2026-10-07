@@ -40,6 +40,7 @@ import type { ReviewHost } from "./libs/host";
 import type { ModelRunner } from "./libs/types";
 import { NO_TOKENS, createRunner, tokensOf } from "./models/runner";
 import { cleanupAllWorktrees } from "./git/worktree";
+import { onInterrupt } from "./libs/shell";
 import { exitCodeFor, runReview } from "./orchestrator";
 
 const USAGE = `Usage: prloop <PR URL> [options]
@@ -180,6 +181,10 @@ async function main() {
   // status at all, so whatever an earlier run left on the PR still stands — and on a re-run
   // of the same iteration that is quite possibly a green one gating the merge.
   fatalHost = host;
+  // Ctrl-C, or a pipeline cancelling the job, mid-review: the lease goes back and the
+  // worktrees go, as they do on a crash (libs/shell.ts, onInterrupt, says what it cost).
+  onInterrupt(() => releaseRunLease(host, heldLease));
+  onInterrupt(cleanupAllWorktrees);
   banner(`prloop: ${ref.org}/${ref.project}/${ref.repoId} PR !${ref.prId}`);
   // Said once, before anything is spent: an edit to .env that a shell export is quietly
   // discarding, and a setting name that configures nothing. Both used to be visible only to

@@ -415,6 +415,27 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **A model that refuses the temperature no longer loses its calls.** Reasoning models behind
+  Azure OpenAI answer prloop's default `0.2` with 400 "Unsupported value: 'temperature' does
+  not support 0.2 with this model", and a 4xx is never retried, so every call to such a model
+  failed and a finder of that kind contributed nothing to the run. A 4xx that refuses the
+  temperature is now sent again without one, and that model gets none for the rest of the run:
+  one refused call per model per run, with a warning naming the
+  `PRR_LLM_TEMPERATURE_BY_MODEL` entry that saves it. A complaint about the value's range is
+  not a refusal and is reported as before.
+- **Ctrl-C no longer locks the pull request for an hour.** An interrupted run exited at once and
+  left its lease in the summary comment, so every run on that pull request for the next
+  `PRR_RUN_LEASE_MS` stood down with "run … still holds this pull request" — what somebody
+  meets first who stops a run to fix a setting. On SIGINT or SIGTERM (a cancelled pipeline
+  job) the run now kills its children, gives the lease back and removes its worktrees, as a
+  crash already did, within 15 seconds, then exits `130` / `143`. A second Ctrl-C exits at
+  once.
+- **The identity check works on Azure DevOps Server.** `connectionData` is a preview-only
+  resource, and the server answered prloop's plain `api-version=7.1` with 400 ("the requested
+  version is under preview"), so every run warned and reviewed with its identity check off —
+  trusting any comment that carried prloop's markers, forged or not. It is now asked for as
+  `<PRR_ADO_API_VERSION>-preview`. The fake Azure DevOps in the selftests refuses a plain
+  version the same way.
 - The README's cost formula: the requirement axis disputes its accusations in one batched
   call, and `partial` is one of them — `1 + D` calls, not `1 + A`.
 - **A local review no longer shows the base branch's later changes as the branch reverting

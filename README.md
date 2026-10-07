@@ -347,8 +347,10 @@ again. So a run takes a **lease** on the pull request first: a timestamped marke
 prloop's own summary comment, honoured by any other run for `PRR_RUN_LEASE_MS` (one hour by
 default). A run that finds the PR held reviews nothing, spends nothing, and exits `0`; the
 review is already happening. The lease is given back by the summary the run posts, so the
-normal path costs no extra write, and an expired one is taken over with a warning naming the
-knob — if reviews here legitimately run longer than the window, raise it. `0` turns it off.
+normal path costs no extra write; a run that crashes gives it back on its way out, and so does
+one interrupted with Ctrl-C or a cancelled pipeline job (a second Ctrl-C exits at once, lease
+and all). An expired one is taken over with a warning naming the knob — if reviews here
+legitimately run longer than the window, raise it. `0` turns it off.
 And a run whose lease ran out and was taken over while it was still reviewing finds that out
 just before posting, and posts nothing (exit `3`, reason named) rather than interleave its
 comments and summary with the run that took over.
@@ -545,7 +547,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_REQ_MODEL` | first finder | requirement axis model; set it when acceptance criteria need a stronger one |
 | `PRR_LLM_TIMEOUT_MS` | `900000` | deadline for one model call, first byte to last |
 | `PRR_LLM_STALL_TIMEOUT_MS` | `120000` | abort a *stream* that goes silent this long (every chunk resets it). Without it, an engine that dies without closing the socket costs the full deadline — twice, with the retry. `0` = disabled |
-| `PRR_LLM_TEMPERATURE` | `0.2` | low on purpose: review is not a creative task. `none` omits the field, for backends that reject it |
+| `PRR_LLM_TEMPERATURE` | `0.2` | low on purpose: review is not a creative task. `none` omits the field, for backends that reject it; a model that refuses it with a 400 is sent none for the rest of the run anyway, after one refused call |
 | `PRR_LLM_TEMPERATURE_BY_MODEL` | — | JSON `model → number \| "none"` |
 | `PRR_LLM_API_FLAVOR` | `auto` | dialect for the reasoning translation: `auto` \| `openai` \| `anthropic` \| `qwen` \| `ollama`. `auto` infers per model from the name |
 | `PRR_LLM_STRUCTURED` | `1` | `0` = don't send `response_format`; the schema is inlined into the prompt instead |
@@ -607,8 +609,11 @@ dialect; `auto` reads it off each model's name, which is what a LiteLLM proxy fr
 several vendors needs. **Temperature is part of that trap**: Anthropic extended thinking
 accepts only `temperature: 1` (prloop forces it, and says so once), newer Anthropic models
 and OpenAI reasoning models reject the field entirely — that is what `PRR_LLM_TEMPERATURE=none`
-is for. `PRR_LLM_EXTRA_BODY` still wins over all of it, temperature included: it is the
-escape hatch for anything this vocabulary cannot say.
+is for. A model that refuses the temperature it was sent (a 400 saying so, as Azure's
+reasoning models answer `0.2`) is asked again without one, and gets none for the rest of the
+run, with a warning naming the `PRR_LLM_TEMPERATURE_BY_MODEL` entry that saves the refused
+call. `PRR_LLM_EXTRA_BODY` still wins over all of it, temperature included: it is the escape
+hatch for anything this vocabulary cannot say, and a temperature set there is never dropped.
 
 **Single-GPU / one-model-at-a-time backends** (a plain Ollama host) need
 `PRR_LLM_CONCURRENCY=1`. The finder fan-out otherwise interleaves requests for different

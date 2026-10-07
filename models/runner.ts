@@ -231,6 +231,22 @@ export function isStreamingRejection(res: Pick<ChatResponse, "error" | "errorKin
   return res.errorKind === "http" && status >= 400 && status < 500 && /stream/i.test(res.error ?? "");
 }
 
+/**
+ * True for a request refused because of the temperature it carried. A reasoning model behind
+ * Azure OpenAI answers prloop's 0.2 with 400 "Unsupported value: 'temperature' does not
+ * support 0.2 with this model. Only the default (1) value is supported", and OpenAI's own API
+ * with "Unsupported parameter: 'temperature' is not supported with this model". Read off the
+ * message because no gateway gives the refusal a code of its own — the same compromise as
+ * isStreamingRejection. A complaint about the value's range is not a refusal: that request
+ * is wrong, and sending it again without the field would hide the mistake.
+ */
+export function isTemperatureRejection(res: Pick<ChatResponse, "error" | "errorKind" | "status">): boolean {
+  const status = res.status ?? 0;
+  if (res.errorKind !== "http" || status < 400 || status >= 500) return false;
+  const error = res.error ?? "";
+  return /temperature/i.test(error) && /unsupported|not supported|does not support|only the default/i.test(error);
+}
+
 // ─── Reasoning ───────────────────────────────────────────────────────────────
 // One intent (PRR_REASONING), four incompatible spellings. Getting the spelling wrong is a
 // hard 400 on every call of a run, so the translation lives in one pure place with the
@@ -384,6 +400,11 @@ export class OpenAICompatRunner implements ModelRunner {
   // Set after a backend rejects the streaming request shape itself; the rest of the run
   // goes buffered rather than paying a failed round trip on every call.
   private buffered = false;
+  // Models that refused a temperature this run. Every later call to one sends none, so a
+  // refusal costs one round trip per model per run — and the review goes on, where the
+  // refusal used to fail that model's every call: the first run of a fleet with an Azure
+  // reasoning model in it lost that finder outright.
+  private readonly noTemperature = new Set<string>();
 
   constructor(
     private readonly baseUrl: string = LLM_BASE_URL,
@@ -394,21 +415,35 @@ export class OpenAICompatRunner implements ModelRunner {
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
     const wantStream = LLM_STREAM && !this.buffered;
-    const res = await this.request(req, wantStream);
+    let res = await this.request(req, wantStream);
     if (wantStream && res.error !== undefined && isStreamingRejection(res)) {
       this.buffered = true;
       logVerbose(
         `${req.model}: backend rejected streaming (${res.error.slice(0, 120)}); buffered mode for the rest of this run`,
       );
-      return this.request(req, false);
+      res = await this.request(req, false);
+    }
+    if (res.error !== undefined && isTemperatureRejection(res) && this.sendsTemperature(req.model)) {
+      this.noTemperature.add(req.model);
+      log(
+        `[WARN] ${req.model} refused the temperature it was sent; sending none to it for the rest of this run. ` +
+          `PRR_LLM_TEMPERATURE_BY_MODEL={"${req.model}":"none"} saves the refused call`,
+      );
+      res = await this.request(req, LLM_STREAM && !this.buffered);
     }
     return res;
+  }
+
+  /** Whether a call to `model` carries a temperature prloop chose, and so could drop. */
+  private sendsTemperature(model: string): boolean {
+    const extra = extraBodyFor(model);
+    return !this.noTemperature.has(model) && temperatureFor(model) !== "none" && !(extra && "temperature" in extra);
   }
 
   private async request(req: ChatRequest, stream: boolean): Promise<ChatResponse> {
     const reasoning = reasoningFor(req.model);
     const flavor = resolveFlavor(LLM_API_FLAVOR, req.model);
-    const temperature = temperatureFor(req.model);
+    const temperature = this.noTemperature.has(req.model) ? "none" : temperatureFor(req.model);
     if (thinkingForcesTemperature(reasoning, flavor)) {
       noteOnce(
         req.model,
