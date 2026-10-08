@@ -5,9 +5,11 @@ import { htmlToText } from "../../libs/html";
 import { renderConventions } from "../../libs/rules";
 import { log } from "../../libs/log";
 import { renderSummary } from "../../publish/format";
-import { buildRequirementPrompt } from "../../prompts/requirement";
+import { buildRequirementPrompt, openSpecDocList } from "../../prompts/requirement";
+import { isOpenSpecDoc } from "../../libs/openspec";
 import { validateFinding } from "../../gates/finder";
 import {
+  OPENSPEC_NOT_EVIDENCE_NOTE,
   applyReqSkepticVerdicts,
   resolveDisputeVerdicts,
   demoteUnseenMissing,
@@ -26,6 +28,7 @@ import type { AggregateResult } from "../../gates/aggregate";
 import type {
   ChatRequest,
   CriterionCheck,
+  FileDiff,
   ModelRunner,
   ReqVerdict,
   RequirementResult,
@@ -379,45 +382,55 @@ section("requirement dispute: one batched call, verdicts bound by id");
   );
 }
 
+// --- the gate end to end, over a stub runner ---
+// Answers by schemaName; every request is recorded, so a section can ask what was sent.
+const calls: ChatRequest[] = [];
+const stub = (answers: Record<string, (r: ChatRequest) => string | { error: string }>): ModelRunner => ({
+  chat: async (r) => {
+    calls.push(r);
+    const a = answers[r.schemaName ?? ""]?.(r) ?? "";
+    return typeof a === "string" ? { model: r.model, text: a } : { model: r.model, text: "", error: a.error };
+  },
+});
+const gatePr = { title: "OTP expiry", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" };
+const wi = (acceptanceCriteria: string): WorkItem => ({
+  id: 7,
+  title: "OTP",
+  type: "User Story",
+  state: "Active",
+  description: "",
+  acceptanceCriteria,
+  specSource: "acceptance-criteria",
+  url: "",
+});
+const otp = mkFile(
+  "src/otp.ts",
+  ["export function verify(now: number, issuedAt: number) {", "  if (now - issuedAt > 5 * 60_000) return false;", "  return true;", "}"],
+  [1, 2, 3, 4],
+);
+const gate = (
+  runner: ModelRunner,
+  item = wi("- Expired codes are rejected"),
+  extra: Partial<RequirementGateInput> = {},
+  files: FileDiff[] = [otp],
+) =>
+  capture(() =>
+    runRequirementGate({
+      pr: gatePr,
+      runner,
+      diff: async () => ({ files }),
+      requirements: async () => ({ items: [item], inheritedFrom: [] }),
+      ...extra,
+    }),
+  );
+const judged = (verdict: string, quote: string | null = null, file: string | null = null) =>
+  JSON.stringify({ criteria: [{ criterionId: "7-AC1", verdict, note: "n", quote, file }], extras: [] });
+
 section("requirement gate: an answer it cannot bind fails, never passes");
 {
   // A gateway that accepts response_format without enforcing it hands back parseable JSON in
   // some other shape. The axis read that as "every criterion not judged": nothing unmet,
   // exit 0, and a headline saying every criterion was implemented.
-  const calls: ChatRequest[] = [];
-  const stub = (answers: Record<string, (r: ChatRequest) => string | { error: string }>): ModelRunner => ({
-    chat: async (r) => {
-      calls.push(r);
-      const a = answers[r.schemaName ?? ""]?.(r) ?? "";
-      return typeof a === "string" ? { model: r.model, text: a } : { model: r.model, text: "", error: a.error };
-    },
-  });
-  const pr = { title: "OTP expiry", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" };
-  const wi = (acceptanceCriteria: string): WorkItem => ({
-    id: 7,
-    title: "OTP",
-    type: "User Story",
-    state: "Active",
-    description: "",
-    acceptanceCriteria,
-    specSource: "acceptance-criteria",
-    url: "",
-  });
-  const otp = mkFile(
-    "src/otp.ts",
-    ["export function verify(now: number, issuedAt: number) {", "  if (now - issuedAt > 5 * 60_000) return false;", "  return true;", "}"],
-    [1, 2, 3, 4],
-  );
-  const gate = (runner: ModelRunner, item = wi("- Expired codes are rejected"), extra: Partial<RequirementGateInput> = {}) =>
-    capture(() =>
-      runRequirementGate({
-        pr,
-        runner,
-        diff: async () => ({ files: [otp], fileIndex: new FileIndex([otp]) }),
-        requirements: async () => ({ items: [item], inheritedFrom: [] }),
-        ...extra,
-      }),
-    );
 
   const bare = (await gate(stub({ requirements: () => '[{"criterionId":"7-AC1","verdict":"missing"}]' }))).value.result;
   eq("a bare array is an error", bare.error, "response has no criteria array");
@@ -482,5 +495,88 @@ section("requirement gate: an answer it cannot bind fails, never passes");
     "a wrong-shape answer makes the run incomplete (exit 3), not clean",
     exitCodeFor({ agg, req: bare, incomplete: [`requirement axis (${bare.error})`] }),
     3,
+  );
+}
+
+section("OpenSpec documents: named to the model, never shown, never evidence");
+{
+  const tasks = mkFile(
+    "openspec/changes/x/tasks.md",
+    ["## 1. Tasks", "- [x] 1.1 Reject expired codes", "- [x] 1.2 Lock the account after five failed codes"],
+    [1, 2, 3],
+  );
+  check("isOpenSpecDoc: a task list is intent", isOpenSpecDoc("openspec/changes/x/tasks.md") && isOpenSpecDoc("/svc/openspec/specs/a/spec.md"));
+  check(
+    "...code under openspec/, a doc named openspec.md, and another casing are not",
+    !isOpenSpecDoc("openspec/tools/gen.ts") && !isOpenSpecDoc("docs/openspec.md") && !isOpenSpecDoc("OpenSpec/changes/x/tasks.md"),
+  );
+
+  // The motivating failure: the model quoted the ticked task and the quote anchored, because
+  // tasks.md was in the diff the evidence index was built from.
+  calls.length = 0;
+  const ticked = (
+    await gate(
+      stub({ requirements: () => judged("satisfied", "- [x] 1.2 Lock the account after five failed codes", "openspec/changes/x/tasks.md") }),
+      wi("- Lock the account after five failed codes"),
+      {},
+      [otp, tasks],
+    )
+  ).value.result;
+  eq("a satisfied verdict quoting tasks.md is taken back", ticked.criteria[0]?.verdict, "not-verifiable");
+  check("...with the note saying why", (ticked.criteria[0]?.note ?? "").startsWith(OPENSPEC_NOT_EVIDENCE_NOTE), ticked.criteria[0]?.note);
+  const p = calls.find((c) => c.schemaName === "requirements")?.user ?? "";
+  check(
+    "the prompt names the task list but never shows it",
+    p.includes("Not shown: 1 OpenSpec document this pull request changes (openspec/changes/x/tasks.md)") && !p.includes("- [x] 1.2"),
+    p.slice(p.indexOf("## The actual code change"), p.indexOf("## The actual code change") + 400),
+  );
+  check("...and still shows the code", p.includes("src/otp.ts"));
+
+  const control = (
+    await gate(stub({ requirements: () => judged("satisfied", "if (now - issuedAt > 5 * 60_000) return false;", "src/otp.ts") }), undefined, {}, [
+      otp,
+      tasks,
+    ])
+  ).value.result;
+  eq("control: a quote from the code stays satisfied", control.criteria[0]?.verdict, "satisfied");
+
+  // Packed into the payload, an oversized design.md was "omitted for size", and its omission
+  // then took a real "missing" back (demoteUnseenMissing): the model could not have seen it.
+  const design = mkFile(
+    "openspec/changes/x/design.md",
+    Array.from({ length: 6000 }, (_, i) => `Design line ${String(i).padStart(5, "0")} ${"x".repeat(30)}`),
+    Array.from({ length: 6000 }, (_, i) => i + 1),
+  );
+  const missing = (await gate(stub({ requirements: () => judged("missing") }), undefined, {}, [otp, design])).value.result;
+  eq("an oversized design.md no longer takes a missing back", missing.criteria[0]?.verdict, "missing");
+
+  calls.length = 0;
+  await gate(stub({ requirements: () => judged("missing"), req_dispute: () => '{"verdicts":[]}' }), undefined, { disputeModel: "sk" }, [
+    otp,
+    tasks,
+  ]);
+  const dispute = calls.find((c) => c.schemaName === "req_dispute");
+  check(
+    "the dispute is shown code only",
+    dispute !== undefined && dispute.user.includes("src/otp.ts") && !dispute.user.includes("openspec/changes/x/tasks.md"),
+  );
+
+  calls.length = 0;
+  const proposalOnly = (await gate(stub({}), undefined, {}, [tasks])).value.result;
+  eq(
+    "only OpenSpec documents changed: skipped, no model call",
+    [proposalOnly.skipped, calls.length],
+    ["only OpenSpec documents changed: there is no code or configuration yet to judge the criteria against", 0],
+  );
+
+  const input = { pr: gatePr, workItems: [wi("- Expired codes are rejected")], files: [otp], criteria: extractCriteria(wi("- Expired codes are rejected")), maxExtras: 5 };
+  check(
+    "no OpenSpec documents: the prompt is unchanged",
+    buildRequirementPrompt(input) === buildRequirementPrompt({ ...input, intentDocs: [] }) && !buildRequirementPrompt(input).includes("OpenSpec"),
+  );
+  eq(
+    "a long list names ten and counts the rest",
+    openSpecDocList(Array.from({ length: 12 }, (_, i) => `openspec/changes/c${i}/tasks.md`)).endsWith("openspec/changes/c9/tasks.md, and 2 more"),
+    true,
   );
 }

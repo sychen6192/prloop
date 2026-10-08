@@ -7,9 +7,10 @@ import { createHash } from "node:crypto";
 import { MAX_EXTRAS, MAX_INLINE_REQ_COMMENTS, REQ_MODEL, SKEPTIC_MODELS } from "../config";
 import { anchorFinding } from "../anchoring/locate";
 import { extractCriteria, type CriterionRef } from "../libs/criteria";
-import { normalizePath, type FileIndex } from "../libs/fileindex";
+import { FileIndex, normalizePath } from "../libs/fileindex";
 import type { LinkedRequirements } from "../libs/host";
 import { arrayField, describeShape, parseJsonObject } from "../libs/json";
+import { isOpenSpecDoc } from "../libs/openspec";
 import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
 import { parseVerdict, type Verdict } from "./skeptic";
@@ -125,9 +126,9 @@ function validateExtra(v: unknown): ExtraChange | undefined {
 
 /** What the requirement axis judges: every changed file a criterion could be met in. */
 export interface RequirementDiff {
+  // The WHOLE pull request's code and text. The gate sets OpenSpec documents apart and builds
+  // the evidence index itself, because only it knows which files may be evidence.
   files: FileDiff[];
-  // Anchors the evidence quote behind every "satisfied" verdict (verifySatisfiedEvidence).
-  fileIndex: FileIndex;
 }
 
 export interface RequirementGateInput {
@@ -183,7 +184,7 @@ export async function runRequirementGate(
 
   log(`requirement axis: checking ${withSpec.length} work items (${withSpec.map((w) => `#${w.id}`).join(", ")})`);
 
-  const { files, fileIndex } = await input.diff();
+  const { files } = await input.diff();
   if (files.length === 0) {
     // Judged against an empty diff, every criterion comes back "missing" and the status fails
     // a PR that — deleting files, say — may well have done what was asked.
@@ -192,6 +193,25 @@ export async function runRequirementGate(
       result: { workItems: withSpec, criteria: [], extras: [], skipped: "no changed text in this PR to judge the criteria against" },
     };
   }
+  // Evidence is code, configuration and documentation. An OpenSpec document says what the
+  // change is meant to do: a ticked "- [x] 1.2 …" in tasks.md anchored as evidence and closed
+  // a criterion, and a 120-line design.md packed ahead of the 25-line file it described.
+  const shown = files.filter((f) => !isOpenSpecDoc(f.path));
+  const intentDocs = files.filter((f) => isOpenSpecDoc(f.path)).map((f) => f.path);
+  if (shown.length === 0) {
+    // A proposal-only PR: the change is written down and not yet made. Every criterion would
+    // come back missing against a plan, and accuse the author of skipping work not yet due.
+    log("requirement axis: only OpenSpec documents changed; skipping");
+    return {
+      result: {
+        workItems: withSpec,
+        criteria: [],
+        extras: [],
+        skipped: "only OpenSpec documents changed: there is no code or configuration yet to judge the criteria against",
+      },
+    };
+  }
+  const evidence = new FileIndex(shown);
 
   // The unit of judgment is fixed HERE, before any model runs: same work items → same
   // criterion list → same denominator every run (see libs/criteria.ts for why).
@@ -199,7 +219,8 @@ export async function runRequirementGate(
   const promptInput = {
     pr: input.pr,
     workItems: withSpec,
-    files,
+    files: shown,
+    intentDocs,
     criteria: refs,
     maxExtras: MAX_EXTRAS,
     // A parent's criteria arrive here whole (ado/workitems.ts walks up one level when the
@@ -213,7 +234,7 @@ export async function runRequirementGate(
   // alone: this axis reads the whole pull request on every run, so it is the one request
   // most likely to outgrow a context window — and a backend that truncates a prompt silently
   // turns "shown the implementation" into "the implementation is missing".
-  const payload = buildDiffPayload(files, undefined, undefined, {
+  const payload = buildDiffPayload(shown, undefined, undefined, {
     model: REQ_MODEL,
     fixed: `${REQUIREMENT_SYSTEM}\n${JSON.stringify(REQUIREMENT_SCHEMA)}\n${buildRequirementPrompt({ ...promptInput, payload: NO_DIFF })}`,
   });
@@ -301,8 +322,8 @@ export async function runRequirementGate(
         `(${payload.omittedFiles.length} changed files were too large to show the model)`,
     );
   }
-  await disputeAccusations(input.runner, files, criteria, input.disputeModel ?? SKEPTIC_MODELS[0]);
-  const demoted = verifySatisfiedEvidence(criteria, fileIndex);
+  await disputeAccusations(input.runner, shown, criteria, input.disputeModel ?? SKEPTIC_MODELS[0]);
+  const demoted = verifySatisfiedEvidence(criteria, evidence);
   if (demoted > 0) {
     log(`requirement axis: ${demoted} satisfied verdicts demoted → not-verifiable (evidence quote not found in the diff)`);
   }
@@ -482,6 +503,8 @@ export function demoteUnseenMissing(criteria: CriterionCheck[], omitted: readonl
 }
 
 export const UNVERIFIED_SATISFIED_NOTE = "claimed satisfied, but the evidence quote was not found in the diff";
+export const OPENSPEC_NOT_EVIDENCE_NOTE =
+  "claimed satisfied by quoting an OpenSpec document, which states what the change is meant to do, not that the code does it";
 
 /**
  * Holds every "satisfied" verdict to the same quote contract as a code finding, in place.
@@ -517,7 +540,10 @@ export function verifySatisfiedEvidence(criteria: CriterionCheck[], index: FileI
       ).anchor !== undefined;
     if (anchored) continue;
     c.verdict = "not-verifiable";
-    c.note = `${UNVERIFIED_SATISFIED_NOTE}${c.note ? ` — original note: ${c.note}` : ""}`;
+    // The model was never shown one, but it can still quote the PR description's copy of a
+    // task list, or recall the path from the "Not shown" line; say which mistake it was.
+    const why = c.file && isOpenSpecDoc(normalizePath(c.file)) ? OPENSPEC_NOT_EVIDENCE_NOTE : UNVERIFIED_SATISFIED_NOTE;
+    c.note = `${why}${c.note ? ` — original note: ${c.note}` : ""}`;
     demoted++;
   }
   return demoted;

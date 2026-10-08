@@ -671,7 +671,9 @@ Which files are reviewed at all is one table, `libs/lang.ts`: the code axis read
 the common languages (C#, Java, Kotlin, Python, TypeScript/JavaScript, Go, Rust, C/C++, PHP,
 Ruby, Swift, Scala, SQL, shell, PowerShell, Terraform, Bicep, Dockerfiles and more), while
 configuration, markup and documentation go to the requirement axis only — a criterion is
-often met in a config file. A changed file of a type the table does not list is named in the
+often met in a config file — except OpenSpec's own documents under `openspec/`, which state
+intent rather than implementation and are named to the requirement model, never shown to it.
+A changed file of a type the table does not list is named in the
 summary rather than silently dropped.
 
 ## Development

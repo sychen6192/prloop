@@ -307,6 +307,14 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Changed
 
+- **OpenSpec documents are never evidence, and are named to the requirement model rather than
+  shown.** A ticked `- [x] 1.2 Lock the account after five failed codes` in `tasks.md` anchored
+  as evidence and closed a work item's criterion, and a 120-line `design.md` sorted ahead of the
+  25-line file it described and, over budget, pushed it out. Text files under `openspec/` are
+  now listed by name in the requirement prompt and kept out of its diff, its dispute pass and its
+  evidence; a satisfied verdict quoting one is taken back with a note saying why. A pull request
+  that changes only OpenSpec documents skips the work-item check instead of judging code it does
+  not have yet. Repositories without `openspec/` see no change.
 - **Azure DevOps sits behind one interface, `ReviewHost` (`libs/host.ts`).** The orchestrator,
   the requirement axis and three `publish/` modules used to import `ado/` directly, and the
   seams that grew around that one at a time — an intake, a conventions reader, a work-item

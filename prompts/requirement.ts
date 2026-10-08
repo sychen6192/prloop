@@ -88,9 +88,12 @@ export interface RequirementPromptInput {
   // The diff, already budgeted for the model that will read it (gates/requirement.ts). Absent
   // = packed here against the character ceiling alone.
   payload?: DiffPayload;
+  // OpenSpec documents the PR changes: named, never shown (gates/requirement.ts).
+  intentDocs?: readonly string[];
 }
 
-const SPEC_HEADING: Record<string, string> = {
+// Keyed by the type, so a new specSource cannot render "**undefined**".
+const SPEC_HEADING: Record<WorkItem["specSource"], string> = {
   "acceptance-criteria": "Acceptance criteria to judge",
   description: "Requirements to judge (taken from the description — this work item has no acceptance criteria field)",
   "repro-steps": "Reproduction steps to judge (this is a Bug — read the note below before judging)",
@@ -116,6 +119,22 @@ criteria of its own. A parent's criteria are delivered across several sibling ta
 of them are somebody else's work: a criterion this diff shows no sign of attempting is
 \`not-this-pr\`, not \`missing\`. Reserve \`missing\` for criteria this PR was evidently trying
 to deliver.`;
+}
+
+/** OpenSpec document paths for a "Not shown" sentence: neutralised, at most 10, then "and N more". */
+export function openSpecDocList(paths: readonly string[]): string {
+  const named = paths.slice(0, 10).map((p) => neutralizeLine(p)).join(", ");
+  return paths.length > 10 ? `${named}, and ${paths.length - 10} more` : named;
+}
+
+// Named rather than silently dropped: a criterion that asks for the design to be written
+// down is met by exactly these files, and without the line it reads as missing.
+function intentDocsNote(paths: readonly string[]): string {
+  const n = paths.length;
+  return `Not shown: ${n} OpenSpec document${n === 1 ? "" : "s"} this pull request changes (${openSpecDocList(paths)}). They state
+what the author intends (proposals, designs, task lists, spec deltas), not what the code does,
+so nothing in them can satisfy a criterion and none of them is here to quote. A criterion that
+asks for such a document to be written is not-verifiable, never missing.`;
 }
 
 export function buildRequirementPrompt(input: RequirementPromptInput): string {
@@ -167,7 +186,7 @@ ${wiBlocks}
 
 ## The actual code change
 
-${payload.text}
+${input.intentDocs?.length ? `${intentDocsNote(input.intentDocs)}\n\n` : ""}${payload.text}
 
 ## Your output
 

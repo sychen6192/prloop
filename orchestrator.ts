@@ -312,8 +312,7 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           pr: ctx.pr,
           diff: async () => {
             const whole = await wholePr();
-            const files = [...whole.files, ...(whole.textFiles ?? [])];
-            return { files, fileIndex: new FileIndex(files) };
+            return { files: [...whole.files, ...(whole.textFiles ?? [])] };
           },
           runner: opts.runner,
           requirements: () => host.requirements(),

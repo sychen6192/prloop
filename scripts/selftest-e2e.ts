@@ -494,6 +494,7 @@ try {
     // work it already contained.
     const reqPrompt = userPrompt(stageCalls("requirements")[0] ?? ({ body: {} } as RecordedCall));
     check("the requirement axis is shown the file push 2 left alone", reqPrompt.includes("src/export.ts"), reqPrompt.slice(0, 300));
+    check("a pull request with no OpenSpec documents gets no Not-shown line", !reqPrompt.includes("Not shown:"));
     eq("...so both criteria are still implemented", result.req?.criteria.map((c) => c.verdict), ["satisfied", "satisfied"]);
     eq("...and there is no accusation to dispute", stageCalls("req_dispute").length, 0);
     check("the summary says so, and on what basis", summaryOf().includes("All 2 acceptance criteria for #4711 are implemented") && summaryOf().includes("Judged against the whole pull request"), summaryOf());
