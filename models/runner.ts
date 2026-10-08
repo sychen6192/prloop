@@ -27,7 +27,7 @@ import { log, logVerbose } from "../libs/log";
 import { USER_AGENT, dispatcherFor, fetch } from "../libs/proxy";
 import { redactSecrets } from "../libs/redact";
 import type { ChatRequest, ChatResponse, ModelRunner, ModelErrorKind, TokenTotals } from "../libs/types";
-import { inlineSchema } from "./schemas";
+import { inlineSchema, withEnvelope } from "./schemas";
 
 interface OpenAIChoice {
   // `reasoning` (LiteLLM/OpenRouter) / `reasoning_content` (vLLM) is where thinking models
@@ -349,7 +349,9 @@ export function buildChatBody(
   extra?: Record<string, unknown>,
   // Whether the backend enforces the schema (response_format). When it does not, the
   // schema goes into the prompt text instead — a prompt saying "per the schema" must never
-  // reach a model that was shown no schema. Parameterised for the selftest.
+  // reach a model that was shown no schema. When it does, the prompt still ends with one
+  // sentence naming the answer's keys (models/schemas.ts envelopeLine), because a gateway can
+  // accept response_format without enforcing it. Parameterised for the selftest.
   structured: boolean = LLM_STRUCTURED_OUTPUT,
   shape: BodyShape = {},
 ): Record<string, unknown> {
@@ -361,7 +363,7 @@ export function buildChatBody(
     model: req.model,
     messages: [
       { role: "system", content: req.system },
-      { role: "user", content: structured ? req.user : inlineSchema(req) },
+      { role: "user", content: structured ? withEnvelope(req) : inlineSchema(req) },
     ],
     max_tokens: maxTokens,
     stream,

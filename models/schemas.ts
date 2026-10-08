@@ -11,6 +11,7 @@
 // are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
 // live in descriptions and in the validators.
 import { FINDER_CATEGORIES, SEVERITIES } from "../libs/taxonomy";
+import { parseJsonObject } from "../libs/json";
 import { CLAIM_KINDS, REQ_VERDICTS, SKEPTIC_VERDICTS, type ChatRequest } from "../libs/types";
 
 export const FINDINGS_SCHEMA = {
@@ -252,6 +253,72 @@ export const JUDGE_SCHEMA = {
     reason: { type: "string", description: "One sentence." },
   },
 } as const;
+
+interface SchemaNode {
+  type?: unknown;
+  properties?: Record<string, SchemaNode>;
+  items?: SchemaNode;
+  additionalProperties?: unknown;
+}
+
+/**
+ * The answer's top-level JSON shape as one sentence, for a request whose schema rides in
+ * response_format. A gateway can accept that field without enforcing it: LiteLLM in front of
+ * google/gemini-37-flash returned 200 and 1389 characters of parseable JSON with no findings
+ * array, to a prompt that said only "Emit JSON per the schema" — a schema the model was never
+ * shown — and the run exited 3. Built from the schema the parser reads, so it cannot drift from
+ * it. It is not the schema (inlineSchema still carries that where nothing enforces one), and it
+ * names keys, never enum values: doctor's enforcement probe depends on that. Undefined for a
+ * schema with no properties.
+ */
+export function envelopeLine(schema: object): string | undefined {
+  const s = schema as SchemaNode;
+  const entries = Object.entries(s.properties ?? {});
+  if (entries.length === 0) return undefined;
+  const keys = entries.map(([k, p]) => {
+    if (p.type !== "array") return `"${k}"`;
+    const inner = Object.keys(p.items?.properties ?? {});
+    return inner.length > 0
+      ? `"${k}" (an array of objects, each with the keys ${inner.map((q) => `"${q}"`).join(", ")})`
+      : `"${k}" (an array)`;
+  });
+  // A finder told "an empty findings array is correct only after…" answers a bare [] often
+  // enough to name the empty case: the list still goes inside the object.
+  const only = entries.length === 1 && entries[0]![1].type === "array" ? entries[0]![0] : undefined;
+  const empty = only === undefined ? "" : ` Even an empty list goes inside that object: {"${only}": []}.`;
+  return (
+    `Answer with a single JSON object — not a bare array, and nothing before or after it — whose top-level keys are ` +
+    `${s.additionalProperties === false ? "exactly" : "at least"}: ${keys.join(", ")}.${empty}`
+  );
+}
+
+/** The user message for a request whose schema goes out as response_format. */
+export function withEnvelope(req: ChatRequest): string {
+  const line = req.schema ? envelopeLine(req.schema) : undefined;
+  return line ? `${req.user}\n\n${line}` : req.user;
+}
+
+/**
+ * A request only an enforcing endpoint answers right: its one allowed value is in the enum,
+ * which travels in response_format alone (envelopeLine names keys, never values). doctor
+ * --smoke asks it of each finder model.
+ */
+export const ENFORCEMENT_PROBE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["probe"],
+  properties: { probe: { type: "string", enum: ["prloop-enforced-7f3a"] } },
+} as const;
+
+/** What an answer to the enforcement probe says about the endpoint. */
+export function readEnforcementProbe(text: string): "enforced" | "ignored" | "unparseable" {
+  const parsed = parseJsonObject<{ probe?: unknown }>(text);
+  if (!parsed.ok) return "unparseable";
+  const v = parsed.value as unknown;
+  return typeof v === "object" && v !== null && !Array.isArray(v) && (v as { probe?: unknown }).probe === "prloop-enforced-7f3a"
+    ? "enforced"
+    : "ignored";
+}
 
 /**
  * The schema as prompt text, for paths that cannot enforce it at the token layer: the

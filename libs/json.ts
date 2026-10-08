@@ -111,6 +111,21 @@ export function arrayField(value: unknown, key: string): unknown[] | undefined {
 }
 
 /**
+ * What a parsed answer is, for a wrong-shape log line. "response has no findings array" alone
+ * cannot tell a bare `[]` from a list under another key from a refusal in a JSON string, and
+ * the fix differs for each. Log lines only: the error strings stay fixed, because tests and
+ * the summary read them.
+ */
+export function describeShape(value: unknown): string {
+  if (Array.isArray(value)) return `a top-level array of ${value.length}`;
+  if (value === null) return "a JSON null";
+  if (typeof value !== "object") return `a JSON ${typeof value}`;
+  const keys = Object.keys(value);
+  if (keys.length === 0) return "an empty object";
+  return `an object with keys ${keys.slice(0, 8).join(", ")}${keys.length > 8 ? ", …" : ""}`;
+}
+
+/**
  * Every COMPLETE object inside the `"<field>": [ … ]` array of a possibly-truncated
  * response, in order; the trailing partial one is ignored.
  *

@@ -393,6 +393,13 @@ try {
       [true, "claim-check", "`MAX_RETRIES` is used at src/pay.ts:4"],
     );
     eq("the requirement axis is asked once, with no accusation to dispute", [stageCalls("requirements").length, stageCalls("req_dispute").length], [1, 0]);
+    // response_format alone did not reach a gateway that accepts it without enforcing it; the
+    // prompt names the shape too.
+    const structured = [...stageCalls("findings"), ...stageCalls("requirements"), ...stageCalls("verdict")];
+    check(
+      "every structured call names its answer's keys",
+      structured.length > 0 && structured.every((c) => userPrompt(c).includes("whose top-level keys are exactly")),
+    );
 
     const posted = inlinePosts();
     eq("two comments are posted: the two findings both finders made and no skeptic refuted", posted.length, 2);

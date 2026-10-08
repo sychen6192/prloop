@@ -1,6 +1,6 @@
 // The finder stage: model output parsed fail-closed, the diff budget and what it leaves
 // unread, each finder's order, stance and knobs, and the shape of the prompt itself.
-import { arrayField, escapeControlCharsInStrings, parseJsonObject, salvageArrayItems } from "../../libs/json";
+import { arrayField, describeShape, escapeControlCharsInStrings, parseJsonObject, salvageArrayItems } from "../../libs/json";
 import { detectLanguage, fileKind, isNoiseFile, isReviewable } from "../../libs/lang";
 import { buildDiffPayload, buildDiffPayloads } from "../../libs/payload";
 import { loadRules, renderRules, ruleHeadings, selectRules } from "../../libs/rules";
@@ -44,7 +44,7 @@ import { isTestPath } from "../../libs/lang";
 import { MAX_DIFF_CHARS, parseContextTokensByModel } from "../../config";
 import { buildHunks, diffLines, renderUnifiedDiff } from "../../libs/diff";
 import { enclosingScope, hunkScope } from "../../libs/scope";
-import { check, eq, section, skip } from "./harness";
+import { capture, check, eq, section, skip } from "./harness";
 import { mkFile } from "./fixtures";
 
 // --- JSON parsing ---
@@ -129,6 +129,21 @@ section("finder: an answer without a findings array is an error, not a clean PR"
   eq("a list under another key is an error", (await runFinders(answering('{"items":[]}'), input, ["m"])).outputs[0]?.error, "response has no findings array");
   const clean = (await runFinders(answering('{"findings":[]}'), input, ["m"])).outputs[0];
   check("an explicit empty findings array is a clean result", clean?.error === undefined && clean?.findings.length === 0);
+
+  // "no findings array" alone cannot tell a bare [] from a list under another key from a
+  // refusal in a JSON string, and each has a different fix.
+  eq("describeShape names a bare array", describeShape([1, 2]), "a top-level array of 2");
+  eq("...and the keys an object had", describeShape({ items: [] }), "an object with keys items");
+  eq("...an empty object", describeShape({}), "an empty object");
+  eq("...a scalar", describeShape("sorry"), "a JSON string");
+  eq("...null", describeShape(null), "a JSON null");
+  eq(
+    "...and at most eight keys",
+    describeShape(Object.fromEntries("abcdefghij".split("").map((k) => [k, 1]))),
+    "an object with keys a, b, c, d, e, f, g, h, …",
+  );
+  const { lines } = await capture(() => runFinders(answering("[]"), input, ["m"]));
+  check("the log line says what came back", lines.some((l) => l.includes("no findings array (got a top-level array of 0)")), lines.join(" | "));
 }
 
 section("salvage: a response cut at the token limit still holds complete findings");

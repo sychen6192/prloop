@@ -29,6 +29,17 @@ import {
   parseTemperatureByModel,
   resolveExtraBody,
 } from "../config";
+import {
+  ENFORCEMENT_PROBE_SCHEMA,
+  FINDINGS_SCHEMA,
+  JUDGE_SCHEMA,
+  REQ_DISPUTE_SCHEMA,
+  REQUIREMENT_SCHEMA,
+  TRIAGE_SCHEMA,
+  VERDICT_SCHEMA,
+  envelopeLine,
+  readEnforcementProbe,
+} from "../models/schemas";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { check, eq, report, section } from "./selftest/harness";
@@ -187,7 +198,25 @@ section("schema delivery: enforced by the backend, or inlined into the prompt â€
   const enforced = buildChatBody(req, false, undefined, true);
   const enforcedUser = (enforced["messages"] as Array<{ content: string }>)[1]!.content;
   check("structured on: response_format carries the schema", JSON.stringify(enforced["response_format"]).includes('"findings"'));
-  eq("structured on: prompt untouched", enforcedUser, "review this");
+  eq("structured on, a schema with no properties: prompt untouched", enforcedUser, "review this");
+
+  // A gateway can accept response_format and not enforce it (LiteLLM in front of Gemini:
+  // parseable JSON, no findings array, exit 3). The prompt then has to say the shape itself.
+  const real = { ...req, schema: FINDINGS_SCHEMA };
+  const body = buildChatBody(real, false, undefined, true);
+  const u = (body["messages"] as Array<{ content: string }>)[1]!.content;
+  check(
+    "structured on: the prompt ends by naming the answer's keys",
+    u.startsWith("review this\n\n") &&
+      u.includes('"findings" (an array of objects, each with the keys "category"') &&
+      u.includes("not a bare array") &&
+      u.endsWith('{"findings": []}.'),
+    u.slice(-200),
+  );
+  check("...in one sentence, not the schema", !u.includes("JSON Schema") && u.length < "review this".length + 450, String(u.length));
+  check("...and response_format still carries the schema", JSON.stringify(body["response_format"]).includes('"claim_subject"'));
+  const inl = (buildChatBody(real, false, undefined, false)["messages"] as Array<{ content: string }>)[1]!.content;
+  check("structured off: the whole schema inlined, no envelope sentence", inl.includes("JSON Schema") && !inl.includes("whose top-level keys are"));
 
   // PRR_LLM_STRUCTURED=0 (or a backend that cannot enforce): the schema rides in the prompt.
   // Seen live without this: Claude invented field names and every finding was dropped.
@@ -197,6 +226,38 @@ section("schema delivery: enforced by the backend, or inlined into the prompt â€
   check("structured off: schema text in the prompt", inlinedUser.includes('"findings"') && inlinedUser.includes("JSON Schema"));
   check("structured off: original prompt kept", inlinedUser.startsWith("review this"));
   eq("no schema, structured off: prompt untouched", (buildChatBody({ model: "m", system: "s", user: "u" }, false, undefined, false)["messages"] as Array<{ content: string }>)[1]!.content, "u");
+}
+
+section("every schema's envelope names its keys");
+{
+  // Built from the schema the parser reads, so a key added to a schema reaches the sentence
+  // with no second edit. Checked against `required`, which is what the validators reject on.
+  type Node = { required?: readonly string[]; properties?: Record<string, { type?: unknown; items?: { type?: unknown; required?: readonly string[] } }> };
+  const schemas: Array<[string, Node]> = [
+    ["findings", FINDINGS_SCHEMA],
+    ["requirements", REQUIREMENT_SCHEMA],
+    ["verdict", VERDICT_SCHEMA],
+    ["req_dispute", REQ_DISPUTE_SCHEMA],
+    ["triage", TRIAGE_SCHEMA],
+    ["judge", JUDGE_SCHEMA],
+  ];
+  for (const [name, schema] of schemas) {
+    const line = envelopeLine(schema) ?? "";
+    const keys = [
+      ...(schema.required ?? []),
+      ...Object.values(schema.properties ?? {}).flatMap((p) => (p.type === "array" ? [...(p.items?.required ?? [])] : [])),
+    ];
+    const missing = keys.filter((k) => !line.includes(`"${k}"`));
+    check(`${name}: every required key is named`, keys.length > 0 && missing.length === 0, missing.join(", ") || line);
+    check(`${name}: ...and the answer is an object`, line.includes("not a bare array"));
+  }
+  eq("a schema with no properties has no sentence", envelopeLine({ type: "object" }), undefined);
+  const probe = envelopeLine(ENFORCEMENT_PROBE_SCHEMA) ?? "";
+  check("the probe's value is never in the prompt", probe.includes('"probe"') && !probe.includes("prloop-enforced-7f3a"), probe);
+  eq("an answer with the enum value: enforced", readEnforcementProbe('{"probe":"prloop-enforced-7f3a"}'), "enforced");
+  eq("the right key, a guessed value: ignored", readEnforcementProbe('{"probe":"hello"}'), "ignored");
+  eq("another key: ignored", readEnforcementProbe('{"greeting":"hi"}'), "ignored");
+  eq("prose: unparseable", readEnforcementProbe("hello"), "unparseable");
 }
 
 section("PRR_LLM_EXTRA_BODY parsing fails fast at startup, not as HTTP 400 mid-run");

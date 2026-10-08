@@ -12,17 +12,28 @@ import {
   resolveDisputeVerdicts,
   demoteUnseenMissing,
   resolveJudgments,
+  runRequirementGate,
   toRequirementFindings,
   unmetCriteria,
   verifySatisfiedEvidence,
+  type RequirementGateInput,
 } from "../../gates/requirement";
+import { exitCodeFor } from "../../orchestrator";
 import { REQUIREMENT_SYSTEM } from "../../prompts/requirement";
 import { buildReqDisputePrompt } from "../../prompts/skeptic";
 import { extractCriteria, splitCriteria } from "../../libs/criteria";
-import type { CriterionCheck, ReqVerdict, RequirementResult, WorkItem } from "../../libs/types";
+import type { AggregateResult } from "../../gates/aggregate";
+import type {
+  ChatRequest,
+  CriterionCheck,
+  ModelRunner,
+  ReqVerdict,
+  RequirementResult,
+  WorkItem,
+} from "../../libs/types";
 import * as path from "node:path";
 import { run } from "../../libs/shell";
-import { check, eq, section } from "./harness";
+import { capture, check, eq, section } from "./harness";
 import { mkFile, spec } from "./fixtures";
 
 // --- work item HTML ---
@@ -365,5 +376,111 @@ section("requirement dispute: one batched call, verdicts bound by id");
     "partial is now disputable at all — it accuses too",
     accused.filter((c) => c.verdict === "partial").length,
     1,
+  );
+}
+
+section("requirement gate: an answer it cannot bind fails, never passes");
+{
+  // A gateway that accepts response_format without enforcing it hands back parseable JSON in
+  // some other shape. The axis read that as "every criterion not judged": nothing unmet,
+  // exit 0, and a headline saying every criterion was implemented.
+  const calls: ChatRequest[] = [];
+  const stub = (answers: Record<string, (r: ChatRequest) => string | { error: string }>): ModelRunner => ({
+    chat: async (r) => {
+      calls.push(r);
+      const a = answers[r.schemaName ?? ""]?.(r) ?? "";
+      return typeof a === "string" ? { model: r.model, text: a } : { model: r.model, text: "", error: a.error };
+    },
+  });
+  const pr = { title: "OTP expiry", description: "", sourceBranch: "s", targetBranch: "m", createdBy: "a", status: "active" };
+  const wi = (acceptanceCriteria: string): WorkItem => ({
+    id: 7,
+    title: "OTP",
+    type: "User Story",
+    state: "Active",
+    description: "",
+    acceptanceCriteria,
+    specSource: "acceptance-criteria",
+    url: "",
+  });
+  const otp = mkFile(
+    "src/otp.ts",
+    ["export function verify(now: number, issuedAt: number) {", "  if (now - issuedAt > 5 * 60_000) return false;", "  return true;", "}"],
+    [1, 2, 3, 4],
+  );
+  const gate = (runner: ModelRunner, item = wi("- Expired codes are rejected"), extra: Partial<RequirementGateInput> = {}) =>
+    capture(() =>
+      runRequirementGate({
+        pr,
+        runner,
+        diff: async () => ({ files: [otp], fileIndex: new FileIndex([otp]) }),
+        requirements: async () => ({ items: [item], inheritedFrom: [] }),
+        ...extra,
+      }),
+    );
+
+  const bare = (await gate(stub({ requirements: () => '[{"criterionId":"7-AC1","verdict":"missing"}]' }))).value.result;
+  eq("a bare array is an error", bare.error, "response has no criteria array");
+  eq("...and judges nothing", bare.criteria.length, 0);
+
+  const { value: unlisted, lines: unlistedLog } = await gate(
+    stub({
+      requirements: () =>
+        '{"criteria":[{"criterionId":"AC1","verdict":"satisfied","note":"","quote":null,"file":null}],"extras":[]}',
+    }),
+  );
+  eq("verdicts on unlisted ids only are an error", unlisted.result.error, "response judged none of the 1 listed criteria (1 verdict on an unlisted id)");
+  check("...and the log says so", unlistedLog.some((l) => l.includes("[FAIL] requirement axis response judged none")));
+  eq(
+    "an empty criteria list is the same non-answer",
+    (await gate(stub({ requirements: () => '{"criteria":[],"extras":[]}' }))).value.result.error,
+    "response judged none of the 1 listed criteria",
+  );
+  const bareLog = (await gate(stub({ requirements: () => "[]" }))).lines;
+  check("the log line names what came back", bareLog.some((l) => l.includes("no criteria array (got a top-level array of 0)")), bareLog.join(" | "));
+
+  const partial = (
+    await gate(
+      stub({
+        requirements: () =>
+          '{"criteria":[{"criterionId":"7-AC1","verdict":"not-verifiable","note":"n","quote":null,"file":null}],"extras":[]}',
+      }),
+      wi("- Expired codes are rejected\n- Codes are six digits"),
+    )
+  ).value.result;
+  check(
+    "a partial answer is still a warning, not an error",
+    partial.error === undefined && partial.criteria.length === 2 && partial.criteria[1]!.note.startsWith("not judged"),
+    JSON.stringify(partial.criteria.map((c) => c.note)),
+  );
+
+  calls.length = 0;
+  const { value: disputed, lines } = await gate(
+    stub({
+      requirements: () =>
+        '{"criteria":[{"criterionId":"7-AC1","verdict":"missing","note":"n","quote":null,"file":null}],"extras":[]}',
+      req_dispute: () => '{"items":[]}',
+    }),
+    undefined,
+    { disputeModel: "sk" },
+  );
+  check("the dispute pass ran, on the seam's model", calls.some((c) => c.schemaName === "req_dispute" && c.model === "sk"));
+  eq("a dispute answer with no verdicts array leaves the accusation standing", disputed.result.criteria[0]?.verdict, "missing");
+  check(
+    "...and says so",
+    lines.some((l) => l.includes("dispute answer has no verdicts array (got an object with keys items)")),
+    lines.join(" | "),
+  );
+
+  const agg: AggregateResult = {
+    inline: [],
+    belowBar: [],
+    degraded: [],
+    stats: { raw: 0, afterDedupe: 0, anchored: 0, survived: 0, refuted: 0, inline: 0, byFailure: {}, excluded: 0, dismissed: 0 },
+  };
+  eq(
+    "a wrong-shape answer makes the run incomplete (exit 3), not clean",
+    exitCodeFor({ agg, req: bare, incomplete: [`requirement axis (${bare.error})`] }),
+    3,
   );
 }

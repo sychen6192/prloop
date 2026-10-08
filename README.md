@@ -33,7 +33,8 @@ Step 4  publish                     sticky summary + inline threads           0
 prior dismissals and findings already posted cost no verification tokens) · `D` = 1 when the
 requirement axis accused any criterion of being `missing`, `partial` or `misunderstood` — one
 batched call disputes all of them — else 0 · `T` = triage batches, ten tool findings each. All model calls share one concurrency pool
-(`PRR_LLM_CONCURRENCY`) and retry on transient failures.
+(`PRR_LLM_CONCURRENCY`) and retry on transient failures; every structured call also names its
+answer's top-level keys in the prompt.
 
 The requirement axis is not part of the step-2 barrier — its result is only needed at publish
 time, and the gate is non-fatal, so it must not be able to hold the pipeline. Step 3 starts as
@@ -550,7 +551,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_LLM_TEMPERATURE` | `0.2` | low on purpose: review is not a creative task. `none` omits the field, for backends that reject it; a model that refuses it with a 400 is sent none for the rest of the run anyway, after one refused call |
 | `PRR_LLM_TEMPERATURE_BY_MODEL` | — | JSON `model → number \| "none"` |
 | `PRR_LLM_API_FLAVOR` | `auto` | dialect for the reasoning translation: `auto` \| `openai` \| `anthropic` \| `qwen` \| `ollama`. `auto` infers per model from the name |
-| `PRR_LLM_STRUCTURED` | `1` | `0` = don't send `response_format`; the schema is inlined into the prompt instead |
+| `PRR_LLM_STRUCTURED` | `1` | `0` = don't send `response_format`; the schema is inlined into the prompt instead. With `1` the prompt still ends with one sentence naming the answer's top-level keys, for a gateway that accepts the field without enforcing it (`doctor --smoke` says which yours is) |
 | `PRR_RUNNER` | `openai` | `openai` \| `opencode` |
 | `PRR_OPENCODE_BIN` | `opencode` | opencode executable |
 | `PRR_OPENCODE_AGENT` | `prloop-reviewer` | agent prloop drives; whatever its name, prloop denies it every tool at run time |

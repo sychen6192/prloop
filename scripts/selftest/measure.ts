@@ -28,7 +28,8 @@ import {
   type Reference,
   type ScoreFile,
 } from "../bench";
-import { stampHashes, stampLabel } from "../../libs/stamp";
+import { promptSources, stampHashes, stampLabel } from "../../libs/stamp";
+import { PRLOOP_ROOT } from "../../config";
 import * as path from "node:path";
 import { run } from "../../libs/shell";
 import { check, eq, section } from "./harness";
@@ -255,6 +256,8 @@ section("run stamp: what produced a run, as hashes a report can group by");
     stampLabel({ commit: "0123456789abcdef", dirty: true, hashes: { prompts: "aaaaaa111111", rules: "bbbbbb222222", models: "cccccc333333", config: "dddddd444444" } }),
     "0123456+ p:aaaaaa r:bbbbbb m:cccccc c:dddddd");
   eq("a run from before the stamp says so", stampLabel(undefined), "(unstamped)");
+  // The schemas' descriptions and the envelope sentence built from them are prompt text too.
+  check("the prompts hash covers the schemas the model reads", promptSources(PRLOOP_ROOT).includes("models/schemas.ts\n"));
 }
 
 section("golden-set evaluation: which stage lost the defect, not just that one was lost");

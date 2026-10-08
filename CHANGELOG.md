@@ -415,6 +415,25 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **A gateway that accepts `response_format` without enforcing it no longer costs a finder its
+  chunk.** Behind LiteLLM, `google/gemini-37-flash` answered a finder chunk with 1389 characters
+  of parseable JSON and no `findings` array — `[FAIL] finder google/gemini-37-flash response has
+  no findings array` — and the run exited `3`: the prompt said only "Emit JSON per the schema", of
+  a schema the model was never shown. With `PRR_LLM_STRUCTURED=1`, every structured request now
+  ends with one sentence built from the stage's own schema, naming the top-level keys and their
+  items' keys and saying that even an empty list goes inside the object. It costs about 100
+  tokens, inside every budget, and is appended last so a prefix cache still hits; `0` and the
+  opencode runner still inline the whole schema. A wrong-shaped answer's log line says what came
+  back, and `doctor --smoke` says whether each finder model's endpoint enforces the schema at
+  all. The run stamp's prompts hash now covers `models/schemas.ts`, so `bench.ts` does not
+  compare runs across this change.
+- **A requirement answer the axis cannot bind is a failure, not a pass.** An answer with no
+  `criteria` array, or one whose verdicts named none of the listed criteria, resolved every
+  criterion to "not judged" and exited `0`, under a headline that could still read "All N
+  acceptance criteria … are implemented". It is now `response has no criteria array` or
+  `response judged none of the N listed criteria`: the run is incomplete (exit `3`) and `--since
+  auto` holds its resume point. A dispute answer with no `verdicts` array leaves every accusation
+  standing, as before, and now says so in the log.
 - **A Gemini model is recognised as a model family.** `modelFamily` knew no `gemini` name, so
   `google/gemini-37-flash` verified by another Gemini raised no same-family warning, and its
   clearings were not marked as the weaker check they are. Gemini is now a family of its own;

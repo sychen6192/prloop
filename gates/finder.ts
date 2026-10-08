@@ -9,7 +9,7 @@ import {
   FINDER_SEED,
 } from "../config";
 import { FINDER_CATEGORIES, SEVERITIES, severityRank, type Severity } from "../libs/taxonomy";
-import { arrayField, parseJsonObject, salvageArrayItems } from "../libs/json";
+import { arrayField, describeShape, parseJsonObject, salvageArrayItems } from "../libs/json";
 import { log } from "../libs/log";
 import { newRunSeed, seedFor } from "../libs/prng";
 import { loadRules, renderRules, ruleHeadings, selectRules, type Rule } from "../libs/rules";
@@ -309,7 +309,7 @@ async function runOne(
     // Parseable, but not the shape asked for — a top-level array, or the list under some
     // other key. That used to read as "0 findings", the same result as a clean PR, with no
     // error to say the model never answered the question. Fail closed, and say why.
-    log(`[FAIL] finder ${model} response has no findings array`);
+    log(`[FAIL] finder ${model} response has no findings array (got ${describeShape(parsed.value)})`);
     return { model, findings: [], error: "response has no findings array", rejected: 0, raw: res.text, seed, prompt };
   }
   const findings: RawFinding[] = [];

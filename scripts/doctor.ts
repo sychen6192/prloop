@@ -8,6 +8,7 @@ import {
   KNOWN_KEYS,
   LLM_BASE_URL,
   LLM_CONCURRENCY,
+  LLM_STRUCTURED_OUTPUT,
   MAX_INLINE_COMMENTS,
   ADO_API_VERSION,
   MIN_INLINE_SEVERITY,
@@ -30,7 +31,7 @@ import { proxySummary } from "../libs/proxy";
 import { configWarnings } from "../libs/configreport";
 import { PROFILES } from "../profiles";
 import { createRunner } from "../models/runner";
-import { FINDINGS_SCHEMA } from "../models/schemas";
+import { ENFORCEMENT_PROBE_SCHEMA, FINDINGS_SCHEMA, readEnforcementProbe } from "../models/schemas";
 import { parseJsonObject } from "../libs/json";
 
 let warnings = 0;
@@ -242,6 +243,30 @@ async function main() {
         warn(`${model} returned JSON without a findings array`, "common with weak models; accuracy drops when the schema is not enforced");
       } else {
         ok(`${model} structured output works`, `${parsed.value.findings.length} findings`);
+      }
+      // The call above passes on an endpoint that ignores response_format whenever the model
+      // happens to guess the shape — and a finder chunk later fails on the same endpoint with
+      // "response has no findings array". This one asks for a value only response_format
+      // carries (an enum the prompt never names), so only enforcement can answer it.
+      if (RUNNER_KIND === "openai" && LLM_STRUCTURED_OUTPUT) {
+        const probe = await runner.chat({
+          model,
+          system: "Answer the user.",
+          user: "Say hello in one word.",
+          schema: ENFORCEMENT_PROBE_SCHEMA,
+          schemaName: "probe",
+          maxTokens: 512,
+        });
+        if (probe.error) continue; // a dead endpoint was already reported above
+        if (readEnforcementProbe(probe.text) === "enforced") {
+          ok(`${model} enforces response_format`, "the schema is applied at the token layer");
+        } else {
+          warn(
+            `${model}: the endpoint accepts response_format without enforcing it`,
+            "prloop names each answer's top-level keys in the prompt, which covers the common case; " +
+              'if runs still fail with "response has no findings array", set PRR_LLM_STRUCTURED=0 to put the whole schema there',
+          );
+        }
       }
     }
   } else {

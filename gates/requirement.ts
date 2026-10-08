@@ -9,7 +9,7 @@ import { anchorFinding } from "../anchoring/locate";
 import { extractCriteria, type CriterionRef } from "../libs/criteria";
 import { normalizePath, type FileIndex } from "../libs/fileindex";
 import type { LinkedRequirements } from "../libs/host";
-import { parseJsonObject } from "../libs/json";
+import { arrayField, describeShape, parseJsonObject } from "../libs/json";
 import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
 import { parseVerdict, type Verdict } from "./skeptic";
@@ -145,6 +145,8 @@ export interface RequirementGateInput {
   runner: ModelRunner;
   /** Where the criteria come from: the host's (ReviewHost.requirements). */
   requirements: () => Promise<LinkedRequirements>;
+  /** Test seam: the dispute pass's model, in place of the first PRR_SKEPTIC_MODELS entry. */
+  disputeModel?: string;
 }
 
 export async function runRequirementGate(
@@ -248,10 +250,30 @@ export async function runRequirementGate(
     };
   }
 
-  const resolved = resolveJudgments(
-    Array.isArray(parsed.value.criteria) ? parsed.value.criteria : [],
-    refs,
-  );
+  const judgments = arrayField(parsed.value, "criteria");
+  if (!judgments) {
+    // Parseable, wrong shape. It used to resolve every criterion to "not judged" with one
+    // [WARN] and no error: nothing unmet, exit 0, and a headline saying every criterion was
+    // implemented — over an answer the axis never got.
+    log(`[FAIL] requirement axis response has no criteria array (got ${describeShape(parsed.value)})`);
+    return {
+      result: { workItems: withSpec, criteria: [], extras: [], error: "response has no criteria array" },
+      prompt,
+      raw: res.text,
+    };
+  }
+  const resolved = resolveJudgments(judgments, refs);
+  if (refs.length > 0 && resolved.unjudged === refs.length) {
+    // The same non-answer under the right key: every verdict on an id that is not listed (an
+    // item shape the gateway did not enforce), or an empty list.
+    const error =
+      `response judged none of the ${refs.length} listed criteria` +
+      (resolved.unknownIds > 0
+        ? ` (${resolved.unknownIds} verdict${resolved.unknownIds === 1 ? " on an unlisted id" : "s on unlisted ids"})`
+        : "");
+    log(`[FAIL] requirement axis ${error}`);
+    return { result: { workItems: withSpec, criteria: [], extras: [], error }, prompt, raw: res.text };
+  }
   const criteria = resolved.criteria;
   if (resolved.unknownIds > 0 || resolved.unjudged > 0) {
     log(
@@ -265,7 +287,7 @@ export async function runRequirementGate(
         `kept the harsher one (a repeated answer is not a correction)`,
     );
   }
-  const extras = (Array.isArray(parsed.value.extras) ? parsed.value.extras : [])
+  const extras = (arrayField(parsed.value, "extras") ?? [])
     .map(validateExtra)
     .filter((e): e is ExtraChange => e !== undefined)
     // Deterministic cap on top of the schema's static ceiling; the prompt asked for the
@@ -279,7 +301,7 @@ export async function runRequirementGate(
         `(${payload.omittedFiles.length} changed files were too large to show the model)`,
     );
   }
-  await disputeAccusations(input.runner, files, criteria);
+  await disputeAccusations(input.runner, files, criteria, input.disputeModel ?? SKEPTIC_MODELS[0]);
   const demoted = verifySatisfiedEvidence(criteria, fileIndex);
   if (demoted > 0) {
     log(`requirement axis: ${demoted} satisfied verdicts demoted → not-verifiable (evidence quote not found in the diff)`);
@@ -314,8 +336,12 @@ export async function runRequirementGate(
  * not-verifiable with the refuter's evidence in the note, taking the accusation out of
  * the unmet count while keeping the disagreement visible in the summary.
  */
-async function disputeAccusations(runner: ModelRunner, files: FileDiff[], criteria: CriterionCheck[]): Promise<void> {
-  const model = SKEPTIC_MODELS[0];
+async function disputeAccusations(
+  runner: ModelRunner,
+  files: FileDiff[],
+  criteria: CriterionCheck[],
+  model: string | undefined,
+): Promise<void> {
   if (!model) return; // no skeptic configured = no verification runs, same as the code axis
   const accused = criteria.filter(
     (c) => c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood",
@@ -347,11 +373,15 @@ async function disputeAccusations(runner: ModelRunner, files: FileDiff[], criter
     log(`[WARN] requirement skeptic: dispute output unparseable, ${accused.length} accusations stand unchallenged: ${parsed.error}`);
     return;
   }
-  const verdicts = resolveDisputeVerdicts(
-    Array.isArray(parsed.value.verdicts) ? parsed.value.verdicts : [],
-    accused,
-    model,
-  );
+  const items = arrayField(parsed.value, "verdicts");
+  if (!items) {
+    log(
+      `[WARN] requirement skeptic: dispute answer has no verdicts array (got ${describeShape(parsed.value)}), ` +
+        `${accused.length} accusations stand unchallenged`,
+    );
+    return;
+  }
+  const verdicts = resolveDisputeVerdicts(items, accused, model);
   const disputed = applyReqSkepticVerdicts(accused, verdicts);
   if (disputed > 0) {
     log(`requirement skeptic: ${disputed} of ${accused.length} accusations disputed → not-verifiable (model ${model})`);

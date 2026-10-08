@@ -162,6 +162,12 @@ probe flags this.
   weak models comply with formats much less reliably without schema enforcement.
 - **Model output won't parse.** The backend doesn't support `response_format`. Switch to vLLM (xgrammar
   guided decoding) or a LiteLLM proxy; or set `PRR_LLM_STRUCTURED=0` to inspect the raw output and adjust.
+- **`response has no findings array` / `response has no criteria array` / `judged none of the N listed
+  criteria`.** The answer parsed but is not the shape asked for: the gateway accepted `response_format`
+  without enforcing it (`doctor --smoke` says so per model). The log line names what came back; the
+  whole answer is in `runs/<pr>/<run>/finder-<i>-<model>-raw.txt` or `requirement-raw.txt`. Every
+  structured prompt already names the answer's keys. If one model keeps doing it, `PRR_LLM_STRUCTURED=0`
+  puts the whole schema in the prompt.
 - **`HTTP 504` (or 502/524) on model calls, usually the biggest diffs.** Not prloop's own deadline —
   that reads `timeout (900s)`. Some hop between prloop and the engine (nginx in front of vLLM, a LiteLLM
   proxy, a corporate gateway) gave up waiting: a buffered completion sends **zero bytes until the whole

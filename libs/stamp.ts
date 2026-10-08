@@ -42,8 +42,16 @@ const hash12 = (text: string) => createHash("sha1").update(text).digest("hex").s
 // the judge's own hash instead (scripts/bench.ts).
 const NOT_REVIEW_PROMPTS = new Set(["prompts/judge.ts"]);
 
-/** The files every prompt is built from, and the opencode agent's own instructions. */
-function promptSources(root: string): string {
+// Text the model reads that lives outside prompts/: the schemas' descriptions, and the
+// envelope sentence built from them (envelopeLine). Rewording one changes what a finder is
+// asked as surely as an edit to prompts/finder.ts, and bench.ts compared runs across it.
+const PROMPT_FILES = ["models/schemas.ts"];
+
+/**
+ * The files every prompt is built from, and the opencode agent's own instructions. Exported
+ * for the selftest.
+ */
+export function promptSources(root: string): string {
   const parts: string[] = [];
   for (const dir of ["prompts", "agents"]) {
     let names: string[];
@@ -56,6 +64,13 @@ function promptSources(root: string): string {
       continue;
     }
     for (const n of names) parts.push(`${dir}/${n}\n${fs.readFileSync(path.join(root, dir, n), "utf8")}`);
+  }
+  for (const f of PROMPT_FILES) {
+    try {
+      parts.push(`${f}\n${fs.readFileSync(path.join(root, f), "utf8")}`);
+    } catch {
+      // An install without the file hashes without it, like a missing prompts/ dir above.
+    }
   }
   return parts.join("\n\u0000\n");
 }
