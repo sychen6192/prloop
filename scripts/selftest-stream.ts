@@ -30,17 +30,16 @@ import {
   resolveExtraBody,
 } from "../config";
 import {
-  ENFORCEMENT_PROBE_SCHEMA,
   FINDINGS_SCHEMA,
-  JUDGE_SCHEMA,
   OPENSPEC_SCHEMA,
   REQ_DISPUTE_SCHEMA,
   REQUIREMENT_SCHEMA,
   TRIAGE_SCHEMA,
   VERDICT_SCHEMA,
   envelopeLine,
-  readEnforcementProbe,
 } from "../models/schemas";
+import { ENFORCEMENT_PROBE_SCHEMA, readEnforcementProbe } from "../models/probe";
+import { JUDGE_SCHEMA } from "../prompts/judge";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { check, eq, report, section } from "./selftest/harness";

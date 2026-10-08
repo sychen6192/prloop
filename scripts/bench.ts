@@ -44,8 +44,7 @@ import { mulberry32, shuffle } from "../libs/prng";
 import { run as exec } from "../libs/shell";
 import { stampLabel, type RunStamp } from "../libs/stamp";
 import type { ModelRunner } from "../libs/types";
-import { JUDGE_SCHEMA } from "../models/schemas";
-import { buildJudgePrompt, JUDGE_SYSTEM, type JudgeCandidate } from "../prompts/judge";
+import { buildJudgePrompt, JUDGE_SCHEMA, JUDGE_SYSTEM, type JudgeCandidate } from "../prompts/judge";
 import {
   readRun,
   STAGE_FIX,

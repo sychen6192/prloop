@@ -43,7 +43,8 @@ and closes its server in a `finally`.
   each other's output, and their comment budgets stay separate.
 - **The PR's own OpenSpec requirements never block.** They live in `RequirementResult.openspec`,
   which `unmetCriteria`, the status, the exit code and `incomplete` never read, and they are
-  judged in a call blind to the work items. Nothing under `openspec/` is ever evidence.
+  judged in a call blind to the work items. No OpenSpec document (a text file under
+  `openspec/`) is ever evidence; code under `openspec/` is code.
 - **Config is SSOT in `config.ts`** — every knob is a `PRR_*` env var read there once, by a
   reader that declares it (kind, section, description; `KNOWN_KEYS` is built from those
   declarations), and documented in `.env.example` and the README table. Add all three or none;

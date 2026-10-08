@@ -11,7 +11,7 @@ import { FileIndex, normalizePath } from "../libs/fileindex";
 import type { LinkedRequirements } from "../libs/host";
 import { arrayField, describeShape, parseJsonObject } from "../libs/json";
 import type { SkippedFile } from "../libs/context";
-import { isOpenSpecDoc, parseSpecDelta, selectSpecCriteria, specDeltaOf, type SpecSelection } from "../libs/openspec";
+import { isOpenSpecDoc, parseSpecDelta, selectSpecCriteria, specDeltaOf, type ParsedDelta, type SpecSelection } from "../libs/openspec";
 import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
 import { parseVerdict, type Verdict } from "./skeptic";
@@ -224,29 +224,58 @@ export async function runRequirementGate(input: RequirementGateInput): Promise<R
     }
     log(
       `requirement axis: ${notLinked.result.skipped ?? "work items could not be read"}; ` +
-        `judging the pull request's own OpenSpec change (${deltaPaths.length} spec deltas, advisory)`,
+        `reading the pull request's own OpenSpec change (${deltaPaths.length} spec deltas, advisory)`,
     );
   } else {
     log(`requirement axis: checking ${withSpec.length} work items (${withSpec.map((w) => `#${w.id}`).join(", ")})`);
   }
 
-  const { files, unread = [] } = await input.diff();
+  let read: RequirementDiff;
+  try {
+    read = await input.diff();
+  } catch (e) {
+    // With work items to judge, a failed read is the axis's failure, as it always was. With
+    // none, the read happened for the advisory half alone, and must not fail the run (exit 3,
+    // the resume point held) where skipping used to cost nothing.
+    if (!notLinked) throw e;
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`[WARN] OpenSpec: could not read the pull request (advisory, the status does not depend on it): ${msg}`);
+    return { result: { ...notLinked.result, openspec: { deltas: [], criteria: [], capped: 0, unread: [], error: msg } } };
+  }
+  const { files, unread = [] } = read;
   // Evidence is code, configuration and documentation. An OpenSpec document says what the
   // change is meant to do: a ticked "- [x] 1.2 …" in tasks.md anchored as evidence and closed
   // a criterion, and a 120-line design.md packed ahead of the 25-line file it described.
   const shown = files.filter((f) => !isOpenSpecDoc(f.path));
   const intentDocs = files.filter((f) => isOpenSpecDoc(f.path)).map((f) => f.path);
   const evidence = new FileIndex(shown);
-  const deltas = files.filter((f) => specDeltaOf(f.path) !== undefined).map((f) => parseSpecDelta(f));
+  // Parsed one at a time, so a delta the parser cannot cope with is named as unread rather
+  // than taking the axis down: this half is advisory all the way through.
+  const deltas: ParsedDelta[] = [];
+  const unparsed: SkippedFile[] = [];
+  for (const f of files.filter((x) => specDeltaOf(x.path) !== undefined)) {
+    try {
+      deltas.push(parseSpecDelta(f));
+    } catch (e) {
+      unparsed.push({ path: f.path, reason: `could not be parsed: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
   // A delta the intake listed and could not read is named, never silently left unjudged. One
   // with no textual change (a rename) has nothing in it this PR changed.
-  const unreadDeltas = unread.filter(
-    (s) => s.reason !== "deleted" && s.reason !== "no textual change" && specDeltaOf(s.path) !== undefined,
-  );
+  const unreadDeltas = [
+    ...unread.filter((s) => s.reason !== "deleted" && s.reason !== "no textual change" && specDeltaOf(s.path) !== undefined),
+    ...unparsed,
+  ];
   for (const d of deltas) {
-    if (d.problems.length > 0) {
-      log(`[WARN] OpenSpec ${d.path}: ${d.problems[0]}${d.problems.length > 1 ? ` (+${d.problems.length - 1} more)` : ""}`);
+    if (d.problemCount > 0) {
+      log(`[WARN] OpenSpec ${d.path}: ${d.problems[0]}${d.problemCount > 1 ? ` (+${d.problemCount - 1} more)` : ""}`);
     }
+  }
+  if (notLinked && deltas.length + unreadDeltas.length === 0) {
+    // The listing named a delta the read found nothing in (a rename with no textual change):
+    // there was never anything to judge, and the log must not say there was.
+    if (notLinked.line) log(notLinked.line);
+    return { result: notLinked.result };
   }
 
   // Two calls, concurrent and blind to each other: neither prompt carries the other's
@@ -256,15 +285,25 @@ export async function runRequirementGate(input: RequirementGateInput): Promise<R
       ? Promise.resolve<RequirementGateOutput>({ result: notLinked.result })
       : judgeWorkItems({ input, linked: linked!, withSpec, files, shown, intentDocs, evidence }),
     deltas.length + unreadDeltas.length > 0
-      ? judgeOpenSpec({
-          pr: input.pr,
-          runner: input.runner,
-          shown,
-          evidence,
-          intentDocs,
-          selection: selectSpecCriteria(deltas),
-          unread: unreadDeltas,
-        })
+      ? Promise.resolve()
+          .then(() =>
+            judgeOpenSpec({
+              pr: input.pr,
+              runner: input.runner,
+              shown,
+              evidence,
+              intentDocs,
+              selection: selectSpecCriteria(deltas),
+              unread: unreadDeltas,
+            }),
+          )
+          // Whatever goes wrong in the advisory half stays there: rejecting Promise.all would
+          // take the work items' verdicts down with it, and turn an advisory bug into exit 3.
+          .catch((e): { result: OpenSpecResult; prompt?: string; raw?: string } => {
+            const msg = e instanceof Error ? e.message : String(e);
+            log(`[WARN] OpenSpec check failed (advisory, the status does not depend on it): ${msg}`);
+            return { result: { deltas: [], criteria: [], capped: 0, unread: [], error: msg } };
+          })
       : Promise.resolve(undefined),
   ]);
   return {
@@ -459,8 +498,15 @@ async function judgeOpenSpec(args: {
     capped: selection.capped,
   };
   if (selection.refs.length === 0) {
-    log("OpenSpec (advisory): no ADDED or MODIFIED requirement this pull request changed; nothing to judge");
-    return { result: { ...base, criteria: [], skipped: "no ADDED or MODIFIED requirement this pull request changed" } };
+    // "Changed no requirement" is a claim about deltas that were read; one that could not be
+    // read changed who knows what.
+    const skipped =
+      args.unread.length > 0
+        ? `${args.unread.length} spec delta${args.unread.length === 1 ? "" : "s"} could not be read, ` +
+          "and no ADDED or MODIFIED requirement this pull request changed was found in the rest"
+        : "no ADDED or MODIFIED requirement this pull request changed";
+    log(`OpenSpec (advisory): ${skipped}; nothing to judge`);
+    return { result: { ...base, criteria: [], skipped } };
   }
   if (shown.length === 0) {
     // A proposal under review before any code exists: every requirement would be missing.

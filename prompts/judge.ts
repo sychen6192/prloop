@@ -15,6 +15,22 @@
 // bench records both and refuses to compare across them.
 import { fenceUntrusted, neutralizeLine } from "./untrusted";
 
+// Which numbered candidates describe the
+// reference comment's issue. Numbers, not quotes or text: the judge's only job is to point.
+export const JUDGE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["same_issue", "reason"],
+  properties: {
+    same_issue: {
+      type: "array",
+      items: { type: "integer" },
+      description: "The numbers of the candidates that identify the same issue as the reference; empty when none do.",
+    },
+    reason: { type: "string", description: "One sentence." },
+  },
+} as const;
+
 export const JUDGE_SYSTEM = `You compare code review comments.
 
 You are given one reference comment — an issue a reviewer confirmed in a pull request — and a

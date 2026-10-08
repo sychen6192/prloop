@@ -670,7 +670,8 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 - **Every fence neutralises every fence's closing tag.** A fence used to neutralise only its
   own, so a work item reading `</pr-description>` reached the model intact. Spec deltas go
   inside a new `<openspec-delta>` fence with the untrusted-text notice, and HTML comments
-  (prloop's marker syntax) are stripped from them when they are parsed.
+  (prloop's marker syntax) are stripped from them when they are parsed. A skeptic's refutation
+  that quotes looked-up code as it was shown, a fence tag in it defused, still counts.
 - Secrets are redacted where text leaves the process — log lines, `runs/` artifacts, error
   messages and the summary comment posted on the PR. The leak that motivated it: gateways that
   echo the presented credential inside a 401 body.

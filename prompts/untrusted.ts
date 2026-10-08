@@ -34,13 +34,20 @@ export const FENCE_TAGS = [
   "openspec-delta",
 ] as const;
 
+/**
+ * `text` as it appears inside a `tag` fence: every fence tag it carries defused. Exported so a
+ * check against what a model was shown (gates/skeptic.ts) can accept a quote of this form.
+ */
+export function neutralizeFenceTags(tag: string, text: string): string {
+  const tags = [...new Set([tag, ...FENCE_TAGS])].join("|");
+  return text.replace(new RegExp(`</?(?:${tags})\\b`, "gi"), (m) => `&lt;${m.slice(1)}`);
+}
+
 /** Wraps `text` in `<tag>…</tag>` and frames it as data rather than instructions. */
 export function fenceUntrusted(tag: string, origin: string, text: string): string {
   // A description that contains "</pr-description>" would otherwise end the fence early and
   // hand the rest of itself to the model as ordinary prompt text.
-  const tags = [...new Set([tag, ...FENCE_TAGS])].join("|");
-  const safe = text.replace(new RegExp(`</?(?:${tags})\\b`, "gi"), (m) => `&lt;${m.slice(1)}`);
-  return `${untrustedNotice(origin)}\n<${tag}>\n${safe}\n</${tag}>`;
+  return `${untrustedNotice(origin)}\n<${tag}>\n${neutralizeFenceTags(tag, text)}\n</${tag}>`;
 }
 
 /**

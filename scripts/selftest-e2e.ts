@@ -140,11 +140,12 @@ const EVIDENCE: Record<string, { file: string; quote: string }> = {
 };
 
 /** What implements each OpenSpec requirement — SPEC1-R2 is a persuaded model quoting tasks.md, always. */
-const SPEC_EVIDENCE: Record<string, { file: string; quote: string; always?: boolean }> = {
+const SPEC_EVIDENCE: Record<string, { file: string; quote: string; always?: boolean; partial?: string }> = {
   "SPEC1-R1": { file: "src/otp.ts", quote: "if (now - issuedAt > 5 * 60_000) return false;" },
   "SPEC1-R2": { file: "openspec/changes/add-otp/tasks.md", quote: "- [x] 1.2 Lock the account after five failed codes", always: true },
-  // Never in the code: missing.
-  "SPEC1-R3": { file: "src/otp.ts", quote: "auditLog.append(failure);" },
+  // Half done, on a line that anchors: exactly what would become an inline comment, were the
+  // spec's verdicts ever routed to one.
+  "SPEC1-R3": { file: "src/otp.ts", quote: "return code === expected;", partial: "a failed code is rejected but never audited" },
 };
 
 function finderAnswer(model: string, prompt: string): unknown {
@@ -196,9 +197,11 @@ function openSpecAnswer(prompt: string): unknown {
   const criteria = Object.entries(SPEC_EVIDENCE)
     .filter(([id]) => prompt.includes(`[${id}]`))
     .map(([criterionId, ev]) =>
-      ev.always || shows(prompt, ev.quote)
-        ? { criterionId, verdict: "satisfied", note: "implemented", quote: ev.quote, file: ev.file }
-        : { criterionId, verdict: "missing", note: "no change in the diff implements this", quote: null, file: null },
+      ev.partial !== undefined && shows(prompt, ev.quote)
+        ? { criterionId, verdict: "partial", note: ev.partial, quote: ev.quote, file: ev.file }
+        : ev.always || shows(prompt, ev.quote)
+          ? { criterionId, verdict: "satisfied", note: "implemented", quote: ev.quote, file: ev.file }
+          : { criterionId, verdict: "missing", note: "no change in the diff implements this", quote: null, file: null },
     );
   return { criteria };
 }
@@ -734,9 +737,9 @@ try {
     );
     eq("a work-item criterion met only by a ticked task is not met", result.req?.criteria.map((c) => c.verdict), ["satisfied", "missing"]);
     eq(
-      "the spec's requirements: one implemented, one only ticked, one missing",
+      "the spec's requirements: one implemented, one only ticked, one half done",
       result.req?.openspec?.criteria.map((c) => c.verdict),
-      ["satisfied", "not-verifiable", "missing"],
+      ["satisfied", "not-verifiable", "partial"],
     );
     eq(
       "one dispute, of the work item's accusation only",
@@ -751,7 +754,10 @@ try {
     );
     eq("...and the exit code agrees", exitCodeFor(result), 2);
     check("the summary has the spec's own table", summaryOf().includes("1/3 OpenSpec requirements look unmet") && summaryOf().includes('removed "Password-only login"'), summaryOf());
-    check("no inline comment speaks for the spec", !inlinePosts().some((r) => /Audit|SPEC1/.test(contentOf(r))));
+    check(
+      "no inline comment speaks for the spec, though its unmet requirement quotes a line that anchors",
+      result.req?.openspec?.criteria[2]?.quote === "return code === expected;" && !inlinePosts().some((r) => /Audit|SPEC1|never audited/.test(contentOf(r))),
+    );
     check("finders never see openspec/", stageCalls("findings").length > 0 && stageCalls("findings").every((c) => !userPrompt(c).includes("openspec/")));
   }
 

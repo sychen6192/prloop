@@ -517,6 +517,15 @@ try {
     );
     const forged = String(((threadPosts()[0]?.body?.["comments"] as Array<{ content?: string }> | undefined) ?? [])[0]?.content ?? "");
     check("a marker in a spec note is no marker", !forged.includes("<!-- prloop:iteration=5 -->"));
+
+    // A path is the author's text too: a backtick in it would end its code span, and a
+    // "</details>" after that would close the block it sits in.
+    setState({ threads: [] });
+    const odd = req([]);
+    odd.openspec = { ...odd.openspec!, criteria: [], skipped: "x", unread: [{ path: "openspec/changes/x/specs/y`</details>`z/spec.md", reason: "too large" }] };
+    await capture(() => publish(host, { requirement: [], code: [] }, summaryInput({ req: odd })));
+    const oddBody = String(((threadPosts()[0]?.body?.["comments"] as Array<{ content?: string }> | undefined) ?? [])[0]?.content ?? "");
+    check("a backtick in a path cannot end its code span", oddBody.includes("- `openspec/changes/x/specs/y'</details>'z/spec.md`: not read"), oddBody.slice(oddBody.indexOf("Not judged") - 20, oddBody.indexOf("Not judged") + 200));
   }
 
   section("the marker protocol: a comment anyone can type is not prloop's own state");

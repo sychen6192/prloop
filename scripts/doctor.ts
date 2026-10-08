@@ -31,7 +31,8 @@ import { proxySummary } from "../libs/proxy";
 import { configWarnings } from "../libs/configreport";
 import { PROFILES } from "../profiles";
 import { createRunner } from "../models/runner";
-import { ENFORCEMENT_PROBE_SCHEMA, FINDINGS_SCHEMA, readEnforcementProbe } from "../models/schemas";
+import { FINDINGS_SCHEMA } from "../models/schemas";
+import { ENFORCEMENT_PROBE_SCHEMA, readEnforcementProbe } from "../models/probe";
 import { parseJsonObject } from "../libs/json";
 
 let warnings = 0;
@@ -257,7 +258,15 @@ async function main() {
           schemaName: "probe",
           maxTokens: 512,
         });
-        if (probe.error) continue; // a dead endpoint was already reported above
+        if (probe.error) {
+          // The findings call above answered, so this failure is the probe's own and nothing
+          // has reported it; dropping it ended doctor on "0 warnings" over a check that never ran.
+          warn(
+            `${model}: could not check whether the endpoint enforces response_format: ${probe.error}`,
+            'rerun doctor --smoke; if it persists, runs may fail with "response has no findings array"',
+          );
+          continue;
+        }
         if (readEnforcementProbe(probe.text) === "enforced") {
           ok(`${model} enforces response_format`, "the schema is applied at the token layer");
         } else {

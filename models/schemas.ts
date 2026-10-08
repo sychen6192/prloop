@@ -11,7 +11,6 @@
 // are capped in code. The schemas describe SHAPE (types, enums, required keys); ranges
 // live in descriptions and in the validators.
 import { FINDER_CATEGORIES, SEVERITIES } from "../libs/taxonomy";
-import { parseJsonObject } from "../libs/json";
 import { CLAIM_KINDS, REQ_VERDICTS, SKEPTIC_VERDICTS, type ChatRequest } from "../libs/types";
 
 export const FINDINGS_SCHEMA = {
@@ -258,22 +257,6 @@ export const TRIAGE_SCHEMA = {
   },
 } as const;
 
-// Benchmark judge (scripts/bench.ts, prompts/judge.ts): which numbered candidates describe the
-// reference comment's issue. Numbers, not quotes or text: the judge's only job is to point.
-export const JUDGE_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["same_issue", "reason"],
-  properties: {
-    same_issue: {
-      type: "array",
-      items: { type: "integer" },
-      description: "The numbers of the candidates that identify the same issue as the reference; empty when none do.",
-    },
-    reason: { type: "string", description: "One sentence." },
-  },
-} as const;
-
 interface SchemaNode {
   type?: unknown;
   properties?: Record<string, SchemaNode>;
@@ -316,28 +299,6 @@ export function envelopeLine(schema: object): string | undefined {
 export function withEnvelope(req: ChatRequest): string {
   const line = req.schema ? envelopeLine(req.schema) : undefined;
   return line ? `${req.user}\n\n${line}` : req.user;
-}
-
-/**
- * A request only an enforcing endpoint answers right: its one allowed value is in the enum,
- * which travels in response_format alone (envelopeLine names keys, never values). doctor
- * --smoke asks it of each finder model.
- */
-export const ENFORCEMENT_PROBE_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["probe"],
-  properties: { probe: { type: "string", enum: ["prloop-enforced-7f3a"] } },
-} as const;
-
-/** What an answer to the enforcement probe says about the endpoint. */
-export function readEnforcementProbe(text: string): "enforced" | "ignored" | "unparseable" {
-  const parsed = parseJsonObject<{ probe?: unknown }>(text);
-  if (!parsed.ok) return "unparseable";
-  const v = parsed.value as unknown;
-  return typeof v === "object" && v !== null && !Array.isArray(v) && (v as { probe?: unknown }).probe === "prloop-enforced-7f3a"
-    ? "enforced"
-    : "ignored";
 }
 
 /**

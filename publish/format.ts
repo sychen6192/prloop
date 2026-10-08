@@ -279,6 +279,9 @@ function renderOpenSpecSection(o: OpenSpecResult | undefined, incremental: boole
       " their own. Advisory: they never fail the status or the build — only linked work items do._",
     "",
   ];
+  // Backticks in a change, capability or path would end its code span early, and whatever
+  // followed — a "</details>" in a directory name — would render as markup.
+  const tick = (s: string) => s.replace(/`/g, "'");
   if (o.error) lines.push(`_OpenSpec check did not complete: ${escapeCell(o.error)}. The status does not depend on it._`, "");
   else if (o.skipped) lines.push(`_${o.skipped}_`, "");
   else {
@@ -303,8 +306,6 @@ function renderOpenSpecSection(o: OpenSpecResult | undefined, incremental: boole
       );
     }
     if (incremental) lines.push("", "_Judged against the whole pull request, not only this push._");
-    // Backticks in a change or capability name would open inline code across the cell.
-    const tick = (s: string) => s.replace(/`/g, "'");
     lines.push("", "| Status | Requirement | Spec delta | Note |", "| --- | --- | --- | --- |");
     for (const c of o.criteria) {
       const loc = c.file ? ` (\`${c.file}\`)` : "";
@@ -329,16 +330,16 @@ function renderOpenSpecSection(o: OpenSpecResult | undefined, incremental: boole
         ? [`renamed ${d.renamed.map((r) => `"${plain(r.from)}" → "${plain(r.to ?? "?")}"`).join(", ")}`]
         : []),
     ];
-    if (parts.length > 0) items.push(`- \`${d.path}\`: ${parts.join("; ")} — nothing to implement`);
+    if (parts.length > 0) items.push(`- \`${tick(d.path)}\`: ${parts.join("; ")} — nothing to implement`);
   }
   for (const d of o.deltas) {
-    if (d.unchanged > 0) items.push(`- \`${d.path}\`: ${plural(d.unchanged, "requirement", "requirements")} this pull request left unchanged`);
+    if (d.unchanged > 0) items.push(`- \`${tick(d.path)}\`: ${plural(d.unchanged, "requirement", "requirements")} this pull request left unchanged`);
   }
   if (o.capped > 0) {
     items.push(`- ${plural(o.capped, "requirement", "requirements")} past the limits of one review (${OPENSPEC_LIMITS.requirements} requirements, ${OPENSPEC_LIMITS.totalChars} characters)`);
   }
-  for (const u of o.unread) items.push(`- \`${u.path}\`: not read (${u.reason})`);
-  for (const d of o.deltas) for (const p of d.problems) items.push(`- \`${d.path}\`: ${plain(p)}`);
+  for (const u of o.unread) items.push(`- \`${tick(u.path)}\`: not read (${plain(u.reason)})`);
+  for (const d of o.deltas) for (const p of d.problems) items.push(`- \`${tick(d.path)}\`: ${plain(p)}`);
   if (items.length > 0) lines.push(detailsOpen(`Not judged (${items.length})`), "", ...items, "", "</details>", "");
   return lines;
 }

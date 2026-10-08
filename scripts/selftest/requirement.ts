@@ -708,7 +708,66 @@ section("requirement gate: the pull request's own OpenSpec change, judged apart 
     })
   ).value.result;
   eq("a delta too large to read is named", g10.openspec?.unread, [{ path: delta.path, reason: "too large (not code)" }]);
-  eq("...and nothing is judged from it", g10.openspec?.skipped, "no ADDED or MODIFIED requirement this pull request changed");
+  eq(
+    "...and the skip says it was not read, not that nothing changed",
+    g10.openspec?.skipped,
+    "1 spec delta could not be read, and no ADDED or MODIFIED requirement this pull request changed was found in the rest",
+  );
+
+  // The read happens for the advisory half alone when no work item has criteria: its failure
+  // must stay advisory, where skipping used to cost nothing.
+  calls.length = 0;
+  const failedRead = await capture(() =>
+    runRequirementGate({
+      pr: gatePr,
+      runner: stub({}),
+      diff: async () => {
+        throw new Error("HTTP 503 reading blob");
+      },
+      requirements: async () => ({ items: [], inheritedFrom: [] }),
+      specDeltaPaths: async () => [delta.path],
+    }),
+  );
+  eq(
+    "a whole-PR read that fails for the spec alone is the spec's failure",
+    [failedRead.value.result.skipped, failedRead.value.result.error, failedRead.value.result.openspec?.error],
+    ["PR has no linked work item", undefined, "HTTP 503 reading blob"],
+  );
+  const withItems = await capture(() =>
+    runRequirementGate({
+      pr: gatePr,
+      runner: stub({}),
+      diff: async () => {
+        throw new Error("HTTP 503 reading blob");
+      },
+      requirements: async () => ({ items: [wi("- Expired codes are rejected")], inheritedFrom: [] }),
+    }).then(
+      () => "resolved",
+      (e: Error) => e.message,
+    ),
+  );
+  eq("...while with work items it is still the axis's, as it always was", withItems.value, "HTTP 503 reading blob");
+
+  const renamed = await run({ answers: {}, files: [otp], unread: [{ path: delta.path, reason: "no textual change" }], specDeltaPaths: async () => [delta.path] });
+  eq("a delta that was only renamed leaves today's skip", renamed.value.result, noWorkItem);
+  check("...and the log says that, not that a spec is being judged", renamed.lines.some((l) => l.includes("PR has no linked work item; skipping")));
+
+  const crashed = (
+    await run({
+      items: [wi("- Expired codes are rejected")],
+      answers: {
+        requirements: () => judged("missing"),
+        openspec: () => {
+          throw new Error("boom");
+        },
+      },
+    })
+  ).value.result;
+  eq(
+    "an OpenSpec half that throws keeps the work items' verdicts, and fails only itself",
+    [crashed.error, crashed.criteria[0]?.verdict, crashed.openspec?.error],
+    [undefined, "missing", "boom"],
+  );
 
   const r: RequirementResult = {
     workItems: [],

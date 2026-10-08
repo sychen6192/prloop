@@ -74,6 +74,8 @@ export interface ParsedDelta {
   renamed: Array<{ from: string; to?: string }>;
   // Capped at problemsPerDelta, then "and N more".
   problems: string[];
+  // How many problems there were before the cap.
+  problemCount: number;
 }
 
 const SECTION = /^(ADDED|MODIFIED|REMOVED|RENAMED)\s+Requirements$/i;
@@ -88,37 +90,54 @@ const collapse = (s: string) => s.replace(/\*\*/g, "").replace(/\s+/g, " ").trim
 const cap = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)} (truncated)` : s);
 const end = (s: string) => (/[.!?]$/.test(s) ? s : `${s}.`);
 
+// A complete comment on one line, the empty `<!-->` and `<!--->` included.
+const INLINE_COMMENT = /<!--(?:-?>|[\s\S]*?-->)/g;
+
 /**
- * The lines with every HTML comment blanked in place, a comment may span lines. Blanked, not
+ * The lines with every HTML comment blanked in place, as CommonMark reads one: a comment that
+ * starts a line runs to the first `-->`, however many lines on; one inside a line must close
+ * on it, and a lone `<!--` there is text. Inside a fenced block nothing opens. Blanked, not
  * removed, so line numbers stay aligned with changedRightLines. A comment is invisible in every
  * rendering of the file, so nothing in one is a requirement — and `<!-- prloop:… -->` is
  * prloop's own marker syntax, which must never reach a prompt or the summary from here.
+ *
+ * Reading every `<!--` as an opener blanked the rest of a spec that merely mentioned one —
+ * "SHALL replace every `<!--` in author text" — and the requirements after it vanished.
  */
-function blankComments(lines: readonly string[]): string[] {
-  let inComment = false;
-  return lines.map((raw, i) => {
+function blankComments(lines: readonly string[]): { lines: string[]; unclosedAt?: number } {
+  let openedAt: number | undefined;
+  let fence: string | undefined;
+  const out = lines.map((raw, i) => {
     // trimEnd also takes the \r that splitLines keeps on a CRLF file.
-    let rest = (i === 0 ? raw.replace(/^\uFEFF/, "") : raw).trimEnd();
-    let out = "";
-    while (rest.length > 0) {
-      if (inComment) {
-        const close = rest.indexOf("-->");
-        if (close < 0) break;
-        rest = rest.slice(close + 3);
-        inComment = false;
-        continue;
+    let line = (i === 0 ? raw.replace(/^\uFEFF/, "") : raw).trimEnd();
+    if (openedAt !== undefined) {
+      const close = line.indexOf("-->");
+      if (close < 0) return "";
+      openedAt = undefined;
+      line = line.slice(close + 3);
+    } else {
+      const marker = FENCE.exec(line);
+      if (fence !== undefined) {
+        if (isFenceClose(marker, fence, line)) fence = undefined;
+        return line.replace(INLINE_COMMENT, "");
       }
-      const open = rest.indexOf("<!--");
-      if (open < 0) {
-        out += rest;
-        break;
+      if (marker) {
+        fence = marker[1]!;
+        return line;
       }
-      out += rest.slice(0, open);
-      rest = rest.slice(open + 4);
-      inComment = true;
+      if (/^ {0,3}<!--/.test(line) && line.replace(INLINE_COMMENT, "").trimStart().startsWith("<!--")) {
+        openedAt = i + 1;
+        return "";
+      }
     }
-    return out;
+    return line.replace(INLINE_COMMENT, "");
   });
+  return { lines: out, ...(openedAt === undefined ? {} : { unclosedAt: openedAt }) };
+}
+
+/** A line that closes `fence`: the same character, at least as many, and nothing else. */
+function isFenceClose(marker: RegExpExecArray | null, fence: string, line: string): boolean {
+  return marker !== null && marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && line.trim() === marker[1];
 }
 
 interface OpenRequirement {
@@ -128,7 +147,10 @@ interface OpenRequirement {
   statement: string[];
   scenarios: SpecScenario[];
   line: number;
+  // The last line with text in it: what an added line has to fall in to touch the block.
   last: number;
+  // Through the blank lines after it, up to the next heading: where a deletion still counts.
+  extent: number;
 }
 
 /**
@@ -139,11 +161,12 @@ interface OpenRequirement {
  * defined. Pure; no model.
  */
 export function parseSpecDelta(
-  f: Pick<FileDiff, "path" | "rightLines" | "changedRightLines">,
+  f: Pick<FileDiff, "path" | "rightLines" | "changedRightLines"> & Partial<Pick<FileDiff, "hunks">>,
   limits: OpenSpecLimits = OPENSPEC_LIMITS,
 ): ParsedDelta {
   const where = specDeltaOf(f.path) ?? { change: "", capability: "" };
-  const out: ParsedDelta = { path: f.path, ...where, requirements: [], removed: [], renamed: [], problems: [] };
+  const out: ParsedDelta = { path: f.path, ...where, requirements: [], removed: [], renamed: [], problems: [], problemCount: 0 };
+  const deletedAfter = deletionPoints(f.hunks ?? []);
   const name = (s: string) => cap(collapse(s), limits.nameChars);
   let section: "ADDED" | "MODIFIED" | "REMOVED" | "RENAMED" | undefined;
   let sawSection = false;
@@ -157,8 +180,11 @@ export function parseSpecDelta(
     if (!statement && cur.scenarios.length === 0) {
       out.problems.push(`requirement "${cur.name}" (line ${cur.line}) is empty: not judged`);
     } else {
+      // Touched by a line it gained, or by one it lost: a MODIFIED requirement whose only change
+      // is a deleted scenario was reported as left unchanged, and never judged.
       let touched = false;
       for (let n = cur.line; n <= cur.last && !touched; n++) touched = f.changedRightLines.has(n);
+      for (const k of deletedAfter) if (k >= cur.line && k <= cur.extent) touched = true;
       const scenarios = cur.scenarios.map((s) => ` Scenario "${s.name}": ${end(s.steps.join("; ") || "(no steps)")}`);
       const text = collapse(`${cur.name}:${statement ? ` ${end(statement)}` : ""}${scenarios.join("")}`);
       out.requirements.push({
@@ -181,9 +207,12 @@ export function parseSpecDelta(
   // how a wrapped "- **AND** …" reads.
   const addText = (line: string, n: number) => {
     if (!cur) return;
-    cur.last = n;
+    cur.extent = n;
     const text = collapse(line.replace(BULLET, ""));
+    // A blank line is not the requirement's: one added between it and a requirement appended
+    // after it marked an unedited requirement as touched.
     if (!text) return;
+    cur.last = n;
     const scenario = cur.scenarios[cur.scenarios.length - 1];
     if (!scenario) cur.statement.push(text);
     else if (!BULLET.test(line) && /^\s/.test(line) && scenario.steps.length > 0) {
@@ -191,20 +220,26 @@ export function parseSpecDelta(
     } else scenario.steps.push(text);
   };
 
-  blankComments(f.rightLines).forEach((line, i) => {
+  const blanked = blankComments(f.rightLines);
+  const touch = (n: number) => {
+    if (!cur) return;
+    cur.last = n;
+    cur.extent = n;
+  };
+  blanked.lines.forEach((line, i) => {
     const n = i + 1;
     const marker = FENCE.exec(line);
     // Fenced lines are never structure — a "### Requirement:" in an example block is an
     // example — but they are the requirement's text.
     if (fence !== undefined) {
-      if (marker && marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && line.trim() === marker[1]) fence = undefined;
+      if (isFenceClose(marker, fence, line)) fence = undefined;
       else addText(line, n);
-      if (cur) cur.last = n;
+      touch(n);
       return;
     }
     if (marker) {
       fence = marker[1]!;
-      if (cur) cur.last = n;
+      touch(n);
       return;
     }
 
@@ -226,7 +261,7 @@ export function parseSpecDelta(
           const named = name(req[1]!);
           if (section === "ADDED" || section === "MODIFIED") {
             ordinal++;
-            cur = { op: section, ordinal, name: named || "(unnamed requirement)", statement: [], scenarios: [], line: n, last: n };
+            cur = { op: section, ordinal, name: named || "(unnamed requirement)", statement: [], scenarios: [], line: n, last: n, extent: n };
             if (!named) out.problems.push(`"### Requirement:" (line ${n}) has no name`);
           } else if (section === "REMOVED") out.removed.push(named || "(unnamed requirement)");
           else if (section === undefined) {
@@ -236,6 +271,10 @@ export function parseSpecDelta(
           }
         } else if (SCENARIO.test(title)) {
           out.problems.push(`"### Scenario:" (line ${n}) must be a #### heading: its steps were not read`);
+        } else if (section === "ADDED" || section === "MODIFIED") {
+          // "### Requirement Lockout" (no colon), or a bare "### Lockout": a requirement the
+          // author meant, which would otherwise vanish from every count.
+          out.problems.push(`"### ${name(title)}" (line ${n}) is not a "### Requirement:" heading: its block was not read`);
         }
         return;
       }
@@ -243,7 +282,7 @@ export function parseSpecDelta(
         const scenario = level === 4 ? SCENARIO.exec(title) : null;
         if (scenario) {
           cur.scenarios.push({ name: name(scenario[1]!) || "(unnamed scenario)", steps: [] });
-          cur.last = n;
+          touch(n);
         } else addText(title, n);
       }
       return;
@@ -265,10 +304,31 @@ export function parseSpecDelta(
   });
   close();
 
+  if (blanked.unclosedAt !== undefined) {
+    out.problems.push(`an HTML comment opened at line ${blanked.unclosedAt} never closes: the rest of the file was not read`);
+  }
   if (!sawSection) out.problems.unshift("no ADDED, MODIFIED, REMOVED or RENAMED Requirements section");
+  out.problemCount = out.problems.length;
   if (out.problems.length > limits.problemsPerDelta) {
     const more = out.problems.length - limits.problemsPerDelta;
     out.problems = [...out.problems.slice(0, limits.problemsPerDelta), `and ${more} more`];
+  }
+  return out;
+}
+
+/**
+ * Where lines were deleted, as the number of right-side lines before each deletion: a
+ * deletion at k sat between right lines k and k+1. From the hunks, because changedRightLines
+ * holds only what was added.
+ */
+function deletionPoints(hunks: ReadonlyArray<{ rightStart: number; body: string }>): number[] {
+  const out: number[] = [];
+  for (const h of hunks) {
+    let right = h.rightStart - 1;
+    for (const l of h.body.split("\n")) {
+      if (l.startsWith("-")) out.push(right);
+      else right++;
+    }
   }
   return out;
 }

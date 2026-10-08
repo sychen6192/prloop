@@ -5,6 +5,7 @@ import { OPENSPEC_LIMITS, parseSpecDelta, selectSpecCriteria, specDeltaOf } from
 import { OPENSPEC_SCHEMA, REQUIREMENT_SCHEMA } from "../../models/schemas";
 import { buildOpenSpecPrompt } from "../../prompts/openspec";
 import { REQUIREMENT_SYSTEM } from "../../prompts/requirement";
+import { buildHunks, diffLines } from "../../libs/diff";
 import { check, eq, section } from "./harness";
 
 const hash12 = (s: string) => createHash("sha1").update(s).digest("hex").slice(0, 12);
@@ -16,7 +17,7 @@ const parse = (lines: string[], changed: Iterable<number> = lines.map((_, i) => 
 // heading, a fenced fake heading, a multi-line comment hiding a requirement, a scenario at the
 // wrong level, REMOVED and RENAMED sections, and a stray requirement after them.
 const SAMPLE = [
-  "﻿# Delta for Auth",
+  "\uFEFF# Delta for Auth",
   "",
   "## ADDED Requirements",
   "",
@@ -102,7 +103,40 @@ section("spec delta parsing: the pipeline owns the unit");
   );
   check("...and so is a requirement outside any section", d.problems.some((p) => p.includes('"### Requirement: stray" (line 41) is outside')));
   eq("the heading's line is the pipeline's", d.requirements[0]?.line, 5);
-  eq("CRLF and a BOM parse the same", parse(SAMPLE.map((l) => `${l.replace(/^﻿/, "")}\r`)).requirements.map((r) => r.text), d.requirements.map((r) => r.text));
+  eq(
+    "a BOM before the first section still opens it",
+    parse(["\uFEFF## ADDED Requirements", "### Requirement: X", "The system SHALL x."]).requirements.length,
+    1,
+  );
+  eq("CRLF and a BOM parse the same", parse(SAMPLE.map((l) => `${l.replace(/^\uFEFF/, "")}\r`)).requirements.map((r) => r.text), d.requirements.map((r) => r.text));
+}
+
+section("HTML comments as CommonMark reads them: a mention of one is not one");
+{
+  const names = (lines: string[]) => parse(lines).requirements.map((r) => r.name);
+  const mention = parse([
+    "## ADDED Requirements",
+    "### Requirement: Defuse",
+    "The summary SHALL replace every `<!--` in author text.",
+    "",
+    "### Requirement: Second",
+    "The system SHALL second.",
+    "",
+    "## MODIFIED Requirements",
+    "### Requirement: Third",
+    "The system SHALL third.",
+  ]);
+  eq("a <!-- inside a line opens nothing", mention.requirements.map((r) => r.name), ["Defuse", "Second", "Third"]);
+  check("...and stays the requirement's text", (mention.requirements[0]?.text ?? "").includes("every `<!--` in author text"));
+  eq(
+    "...nor does one inside a fence",
+    names(["## ADDED Requirements", "### Requirement: A", "The page SHALL render a header.", "```html", "<!-- header", "```", "### Requirement: B", "The system SHALL b."]),
+    ["A", "B"],
+  );
+  eq("an empty <!--> is a whole comment", names(["## ADDED Requirements", "### Requirement: A <!-->", "The system SHALL a.", "### Requirement: B", "The system SHALL b."]), ["A", "B"]);
+  const open = parse(["## ADDED Requirements", "### Requirement: A", "The system SHALL a.", "<!-- draft", "### Requirement: B", "The system SHALL b."]);
+  eq("a comment that starts a line still hides what follows", open.requirements.map((r) => r.name), ["A"]);
+  check("...and, never closed, says so", open.problems.some((p) => p.startsWith("an HTML comment opened at line 4 never closes")), open.problems.join(" | "));
 }
 
 section("only what this pull request changed is judged");
@@ -113,6 +147,36 @@ section("only what this pull request changed is judged");
   eq("...so that is the one judged", s.refs.map((r) => r.id), ["SPEC1-R2"]);
   eq("...and the others are counted unchanged", s.deltas[0]?.unchanged, 2);
   eq("an untouched requirement keeps its ordinal for the next run", s.origins.get("SPEC1-R2")?.name, "Lockout");
+
+  // Diffed for real, as intake does: changedRightLines holds additions only.
+  const edited = (base: string[], head: string[]) => {
+    const { hunks, changedRightLines } = buildHunks(base, head, diffLines(base, head));
+    return parseSpecDelta({ path: DELTA, rightLines: head, changedRightLines, hunks });
+  };
+  const timeout = [
+    "## MODIFIED Requirements",
+    "",
+    "### Requirement: Login",
+    "The system SHALL log in.",
+    "",
+    "### Requirement: Session Timeout",
+    "The system SHALL end a session after 30 minutes idle.",
+    "",
+    "#### Scenario: Idle",
+    "- **WHEN** idle for 30 minutes",
+    "- **THEN** the session ends",
+    "",
+    "#### Scenario: Remember me",
+    "- **WHEN** remember me is set",
+    "- **THEN** the session lasts a week",
+  ];
+  eq("a deleted scenario touches its requirement, and only that one", edited(timeout, timeout.slice(0, 11)).requirements.map((r) => r.touched), [false, true]);
+  const lockout = ["## ADDED Requirements", "", "### Requirement: Lockout", "The system SHALL lock."];
+  eq(
+    "a requirement appended at the end leaves the one above it untouched",
+    edited(lockout, [...lockout, "", "### Requirement: Audit", "The system SHALL audit."]).requirements.map((r) => r.touched),
+    [false, true],
+  );
 }
 
 section("ids, order, caps");
@@ -137,6 +201,14 @@ section("ids, order, caps");
   eq("a file with no section has nothing to judge, and says why", [none.requirements.length, none.problems[0]], [0, "no ADDED, MODIFIED, REMOVED or RENAMED Requirements section"]);
   const stray = parse(["## ADDED Requirements", "## Notes", ...Array.from({ length: 7 }, (_, i) => `### Requirement: S${i}`)]);
   eq("problems are capped per delta", [stray.problems.length, stray.problems[5]], [6, "and 2 more"]);
+  eq("...and still counted in full", stray.problemCount, 7);
+  const misheaded = parse(["## ADDED Requirements", "### Requirement Lockout", "The system SHALL lock.", "### Requirement: Audit", "The system SHALL audit."]);
+  eq("a level-3 heading that is not a requirement is not read", misheaded.requirements.map((r) => r.name), ["Audit"]);
+  check(
+    "...and is named, so the requirement it was meant to be does not vanish",
+    misheaded.problems.some((p) => p.includes('"### Requirement Lockout" (line 2) is not a "### Requirement:" heading')),
+    misheaded.problems.join(" | "),
+  );
 }
 
 section("the OpenSpec prompt: the spec fenced, the framing outside it");

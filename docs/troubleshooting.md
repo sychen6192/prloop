@@ -165,8 +165,9 @@ probe flags this.
 - **`response has no findings array` / `response has no criteria array` / `judged none of the N listed
   criteria`.** The answer parsed but is not the shape asked for: the gateway accepted `response_format`
   without enforcing it (`doctor --smoke` says so per model). The log line names what came back; the
-  whole answer is in `runs/<pr>/<run>/finder-<i>-<model>-raw.txt` or `requirement-raw.txt`. Every
-  structured prompt already names the answer's keys. If one model keeps doing it, `PRR_LLM_STRUCTURED=0`
+  whole answer is in the run's directory, `runs/<org>/<project>/<repo>/pr-<id>/iter-<N>-<ts>/`:
+  `finder-<i>-<model>-raw.txt`, `requirement-raw.txt`, or `openspec-raw.txt` when the log line
+  names OpenSpec. Every structured prompt already names the answer's keys. If one model keeps doing it, `PRR_LLM_STRUCTURED=0`
   puts the whole schema in the prompt.
 - **`HTTP 504` (or 502/524) on model calls, usually the biggest diffs.** Not prloop's own deadline —
   that reads `timeout (900s)`. Some hop between prloop and the engine (nginx in front of vLLM, a LiteLLM

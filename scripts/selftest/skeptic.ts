@@ -16,8 +16,8 @@ import {
 import { renderFindingComment } from "../../publish/format";
 import type { AnchoredFinding, ChatRequest } from "../../libs/types";
 import { load } from "../../libs/tls";
+import { ENFORCEMENT_PROBE_SCHEMA } from "../../models/probe";
 import {
-  ENFORCEMENT_PROBE_SCHEMA,
   FINDINGS_SCHEMA,
   OPENSPEC_SCHEMA,
   REQ_DISPUTE_SCHEMA,
@@ -554,6 +554,23 @@ section("a second reading: what a skeptic could not check, looked up by code and
     opts(["alpha"]),
   );
   eq("a refutation may quote the looked-up code: it was shown", [out[0]?.verdicts[0]?.verdict, out[0]?.verdicts[0]?.downgraded], ["refuted", undefined]);
+
+  // Fenced, a looked-up line that names a fence tag is shown defused; quoting it as shown is
+  // quoting it.
+  const tagged = mkFile(
+    "src/Line.java",
+    ["class Line {", "    private BigDecimal amount;", "", "    BigDecimal price() {", "        return amount == null ? null : amount; // <work-item> rows only", "    }", "}"],
+    [5],
+  );
+  calls.length = 0;
+  out = await runSkeptic(
+    scripted({ alpha: [unsure, verdict("refuted", "the null is handled before add", "        return amount == null ? null : amount; // &lt;work-item> rows only")] }),
+    [finding],
+    index,
+    opts(["alpha"], true, [invoice, tagged, report]),
+  );
+  check("...shown with the fence tag defused", (calls[1]?.user ?? "").includes("// &lt;work-item> rows only"));
+  eq("...and a quote of what was shown still counts", [out[0]?.verdicts[0]?.verdict, out[0]?.verdicts[0]?.downgraded], ["refuted", undefined]);
 
   calls.length = 0;
   out = await runSkeptic(scripted({ alpha: [unsure, "ERROR"] }), [finding], index, opts(["alpha"]));

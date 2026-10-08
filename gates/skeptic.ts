@@ -23,6 +23,7 @@ import { SEVERITIES, type Severity } from "../libs/taxonomy";
 import { SKEPTIC_VERDICTS, type AnchoredFinding, type ModelRunner, type SkepticVerdictKind } from "../libs/types";
 import { VERDICT_SCHEMA } from "../models/schemas";
 import { SKEPTIC_SYSTEM, buildSkepticPrompt } from "../prompts/skeptic";
+import { neutralizeFenceTags } from "../prompts/untrusted";
 import { relatedContext, type LookupSource } from "./lookup";
 
 export interface Verdict {
@@ -357,8 +358,10 @@ export async function runSkeptic(
       if (related) {
         const widened = buildSkepticPrompt({ ...input, related: related.text });
         lookupPrompt = widened.prompt;
-        // A refutation may quote the looked-up code: it was shown.
-        const corpus = `${widened.snippet}\n${related.lines.join("\n")}`;
+        // A refutation may quote the looked-up code: it was shown — fenced, so a line naming a
+        // fence tag was shown defused, and a quote of either spelling is a quote of it.
+        const raw = related.lines.join("\n");
+        const corpus = `${widened.snippet}\n${raw}\n${neutralizeFenceTags("related-code", raw)}`;
         verdicts = await Promise.all(
           verdicts.map(async (v, i) => {
             if (!unsure.includes(i)) return v;

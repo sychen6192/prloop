@@ -34,8 +34,8 @@ Step 4  publish                     sticky summary + inline threads           0
 prior dismissals and findings already posted cost no verification tokens) · `D` = 1 when the
 requirement axis accused any criterion of being `missing`, `partial` or `misunderstood` — one
 batched call disputes all of them — else 0 · `O` = 1 when the pull request carries OpenSpec
-spec deltas whose requirements it changed, and code or configuration to judge them against (a
-call of its own, advisory), else 0 · `T` = triage batches, ten tool findings each. All model calls share one concurrency pool
+spec deltas whose requirements it changed, and any other changed file (code, configuration or
+documentation) to judge them against (a call of its own, advisory), else 0 · `T` = triage batches, ten tool findings each. All model calls share one concurrency pool
 (`PRR_LLM_CONCURRENCY`) and retry on transient failures; every structured call also names its
 answer's top-level keys in the prompt.
 
@@ -91,9 +91,9 @@ the other's output.
   and `review.html`, no inline comment, no dispute, never counted in the status or the exit
   code, and a failed call over them leaves the run complete. Removed and renamed requirements,
   and those the pull request left unchanged, are listed, not judged; at most 20 requirements a
-  run. Nothing under `openspec/` is evidence for either check: proposals, designs, task lists
-  and spec deltas are named to the requirement model but not shown, and a satisfied verdict
-  quoting one is taken back. A pull request that changes only OpenSpec documents is described,
+  run. No OpenSpec document is evidence for either check: proposals, designs, task lists and
+  spec deltas (the text files under `openspec/`) are named to the requirement model but not
+  shown, and a satisfied verdict quoting one is taken back. A pull request that changes only OpenSpec documents is described,
   not judged.
 - **Code axis** — 8 categories × 4 severities (`req-mismatch`, the ninth, belongs to the
   requirement axis), severity from an ordered decision chain (key split: is there a
