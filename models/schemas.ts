@@ -88,6 +88,33 @@ export const FINDINGS_SCHEMA = {
   },
 } as const;
 
+// One verdict on one listed criterion: the item both requirement-shaped schemas share, so
+// the work-item call and the OpenSpec call cannot drift apart in what a verdict carries.
+function criterionVerdictItem<E extends string>(example: E) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    // No free-form criterion text: the pipeline enumerated the criteria with stable
+    // ids, and the verdict binds to an id. A model that could restate the criterion
+    // could also invent one — and an invented criterion is always, correctly per the
+    // diff, "missing" (the false-accusation generator this replaced).
+    required: ["criterionId", "verdict", "note", "quote", "file"],
+    properties: {
+      criterionId: {
+        type: "string",
+        description: `The bracketed id of the criterion being judged, exactly as listed (e.g. "${example}"). Never invent an id.`,
+      },
+      verdict: { type: "string", enum: [...REQ_VERDICTS] },
+      note: { type: "string" },
+      quote: {
+        type: ["string", "null"],
+        description: "Exact source line(s) from the diff that evidence this verdict.",
+      },
+      file: { type: ["string", "null"] },
+    },
+  } as const;
+}
+
 // Requirement axis. Runs independently of the finder — it never sees code findings, and
 // the finder never sees this, so neither can be used to excuse the other (PROPOSAL §6.1).
 export const REQUIREMENT_SCHEMA = {
@@ -97,28 +124,7 @@ export const REQUIREMENT_SCHEMA = {
   properties: {
     criteria: {
       type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        // No free-form criterion text: the pipeline enumerated the criteria with stable
-        // ids, and the verdict binds to an id. A model that could restate the criterion
-        // could also invent one — and an invented criterion is always, correctly per the
-        // diff, "missing" (the false-accusation generator this replaced).
-        required: ["criterionId", "verdict", "note", "quote", "file"],
-        properties: {
-          criterionId: {
-            type: "string",
-            description: "The bracketed id of the criterion being judged, exactly as listed (e.g. \"4711-AC2\"). Never invent an id.",
-          },
-          verdict: { type: "string", enum: [...REQ_VERDICTS] },
-          note: { type: "string" },
-          quote: {
-            type: ["string", "null"],
-            description: "Exact source line(s) from the diff that evidence this verdict.",
-          },
-          file: { type: ["string", "null"] },
-        },
-      },
+      items: criterionVerdictItem("4711-AC2"),
     },
     extras: {
       type: "array",
@@ -133,6 +139,20 @@ export const REQUIREMENT_SCHEMA = {
           quote: { type: ["string", "null"] },
         },
       },
+    },
+  },
+} as const;
+
+// The PR's own OpenSpec requirements: verdicts only, no extras. Scope creep is the work items'
+// question; asked against the author's own spec, the spec would decide what counts as scope.
+export const OPENSPEC_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["criteria"],
+  properties: {
+    criteria: {
+      type: "array",
+      items: criterionVerdictItem("SPEC1-R2"),
     },
   },
 } as const;

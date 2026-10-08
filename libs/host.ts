@@ -90,6 +90,12 @@ export interface ReviewHost {
    */
   intake(compareTo: number, opts?: IntakeOptions): Promise<ReviewContext>;
   /**
+   * Every path the WHOLE pull request adds, edits or renames to (deletions left out), canonical,
+   * with nothing read. For a stage that must know whether the change touches something before it
+   * pays to read it: an incremental run's context lists one push, not the pull request.
+   */
+  changedPaths(): Promise<string[]>;
+  /**
    * Why this pull request can take no writes at all, worded for the log, or undefined when
    * it can. The host's to say, because the vocabulary of pull request states is its own.
    */

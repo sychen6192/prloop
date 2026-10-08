@@ -7,10 +7,25 @@ the public interface is the `PRR_*` settings and the CLI, and both can still cha
 
 The 0.1.0 line of development. Nothing has been tagged yet, so there is no release date to
 give: the range below is commit dates from `git log` — first commit 2026-07-29, latest
-2026-09-08.
+2026-10-08.
 
 ### Added
 
+- **A pull request's own OpenSpec spec deltas are judged, as advisory requirements.** A team
+  that writes its intent as OpenSpec had it read as changed markdown: the requirement axis
+  judged only linked work items and skipped a pull request with none. Each `### Requirement:`
+  under `## ADDED` or `## MODIFIED Requirements` in the pull request's own
+  `openspec/changes/<id>/specs/<capability>/spec.md` that the pull request changed is now
+  judged against its code, scenarios included. It is fenced as the author's text and judged in
+  a call of its own, blind to the work items, with the same verdicts and the same evidence
+  checks. On an incremental run with no work item, the deltas are found through the host's new
+  `changedPaths()` listing, so a pull request without one reads nothing extra. The results are
+  advisory: their own table in the summary and `review.html`, no inline comment, no dispute,
+  never counted toward exit `2` or the status, and a failed OpenSpec call is reported without
+  making the run incomplete. REMOVED and RENAMED requirements, requirements the pull request
+  left unchanged, and `changes/archive/` are listed or skipped, not judged; at most 20
+  requirements a run. A pull request carrying spec deltas costs one more requirement-sized
+  model call.
 - **Suggested fixes are checked before they are posted, and shown as diffs.** An inline
   code suggestion is the strongest predictor that a comment is acted on (arXiv 2607.21997),
   and a fix that does not compile is worse than none. With `PRR_WORKTREE_REPO` set, the first
@@ -652,6 +667,10 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Security
 
+- **Every fence neutralises every fence's closing tag.** A fence used to neutralise only its
+  own, so a work item reading `</pr-description>` reached the model intact. Spec deltas go
+  inside a new `<openspec-delta>` fence with the untrusted-text notice, and HTML comments
+  (prloop's marker syntax) are stripped from them when they are parsed.
 - Secrets are redacted where text leaves the process — log lines, `runs/` artifacts, error
   messages and the summary comment posted on the PR. The leak that motivated it: gateways that
   echo the presented credential inside a 401 body.

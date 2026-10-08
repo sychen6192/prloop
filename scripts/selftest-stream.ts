@@ -33,6 +33,7 @@ import {
   ENFORCEMENT_PROBE_SCHEMA,
   FINDINGS_SCHEMA,
   JUDGE_SCHEMA,
+  OPENSPEC_SCHEMA,
   REQ_DISPUTE_SCHEMA,
   REQUIREMENT_SCHEMA,
   TRIAGE_SCHEMA,
@@ -240,6 +241,7 @@ section("every schema's envelope names its keys");
     ["req_dispute", REQ_DISPUTE_SCHEMA],
     ["triage", TRIAGE_SCHEMA],
     ["judge", JUDGE_SCHEMA],
+    ["openspec", OPENSPEC_SCHEMA],
   ];
   for (const [name, schema] of schemas) {
     const line = envelopeLine(schema) ?? "";

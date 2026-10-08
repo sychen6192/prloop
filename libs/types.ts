@@ -153,6 +153,56 @@ export interface RequirementResult {
   // Set when the axis could not run (no linked work item, no criteria, model failure).
   skipped?: string;
   error?: string;
+  // The PR's own OpenSpec requirements, judged apart from the work items. unmetCriteria, the
+  // status and the exit code read `criteria` alone, so these never block. Absent when the
+  // change carries no spec delta.
+  openspec?: OpenSpecResult;
+}
+
+/** Where an OpenSpec requirement came from: the pull request's own spec delta. */
+export interface SpecOrigin {
+  // "SPEC1": the delta's key in this run, by path order.
+  delta: string;
+  path: string;
+  change: string;
+  // May hold "/" for a nested capability directory.
+  capability: string;
+  op: "ADDED" | "MODIFIED";
+  // The "### Requirement:" heading, comments stripped, at most 200 characters.
+  name: string;
+  scenarios: number;
+  // 1-based right-side line of the heading: pipeline-owned, never a model's.
+  line: number;
+}
+
+/** A judged OpenSpec requirement. workItemId is 0: no work item stands behind it. */
+export interface OpenSpecCheck extends CriterionCheck {
+  spec: SpecOrigin;
+}
+
+/** One spec delta the pull request carries, and what became of its requirements. */
+export interface OpenSpecDeltaInfo {
+  key: string;
+  path: string;
+  change: string;
+  capability: string;
+  judged: number;
+  unchanged: number;
+  removed: string[];
+  renamed: Array<{ from: string; to?: string }>;
+  problems: string[];
+}
+
+export interface OpenSpecResult {
+  deltas: OpenSpecDeltaInfo[];
+  criteria: OpenSpecCheck[];
+  // Touched requirements past the per-run limits, not judged.
+  capped: number;
+  // A delta the whole-PR intake listed but did not read.
+  unread: Array<{ path: string; reason: string }>;
+  skipped?: string;
+  // Advisory to the end: never in `incomplete`, never exit 3, never holds the watermark.
+  error?: string;
 }
 
 // --- Findings (produced by finders, consumed by aggregate/publish) ---

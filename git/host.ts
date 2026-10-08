@@ -6,7 +6,7 @@
 // publish() never asks.
 import type { ReviewHost } from "../libs/host";
 import type { WorkItem } from "../libs/types";
-import { buildLocalReviewContext, localRef, readLocalConventions } from "./intake";
+import { buildLocalReviewContext, listLocalChangedPaths, localRef, readLocalConventions } from "./intake";
 
 export interface LocalHostOptions {
   repo: string;
@@ -39,6 +39,7 @@ export function localHost(opts: LocalHostOptions): ReviewHost {
     ref: localRef(repo),
     // A branch has no iterations to compare, so compareTo is always the whole of it.
     intake: (_compareTo, o) => buildLocalReviewContext({ repo, base, head, ...(o?.text ? { text: true } : {}) }),
+    changedPaths: () => listLocalChangedPaths({ repo, base, head }),
     terminal: () => undefined,
     conventions: (commit, changedPaths) => readLocalConventions(repo, commit, changedPaths),
     requirements: async () => ({ items: criteria ? [localWorkItem(criteria)] : [], inheritedFrom: [] }),

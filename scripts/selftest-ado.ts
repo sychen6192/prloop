@@ -25,6 +25,7 @@ try {
   const { parsePrUrl } = await import("../ado/client");
   const { getIterationChanges, getPrInfo, listIterations } = await import("../ado/iterations");
   const { getLinkedRequirements } = await import("../ado/workitems");
+  const { listChangedPaths } = await import("../ado/intake");
   const { fetchRepoConventions, CONVENTION_PATHS } = await import("../ado/conventions");
 
   const ref = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4821");
@@ -104,6 +105,32 @@ try {
     const short = await getIterationChanges(ref, 2);
     eq("a short page ends the walk even when nextSkip is set", ado.matching("GET", /\/changes$/).length, 1);
     eq("...and yields what it held", short.length, 1);
+
+    // The listing the requirement axis looks for spec deltas in: the whole pull request, both
+    // pages, files only, no deletions, no blob read.
+    const withDelete = [
+      ...page2,
+      { changeTrackingId: 9005, changeType: "delete", item: { path: "/src/gone.ts" } },
+      { changeTrackingId: 9006, changeType: "add", item: { path: "/openspec/changes/x/specs/a/spec.md", objectId: "o3" } },
+    ];
+    setState({
+      iterations: [1, 2].map((id) => ({ id, sourceRefCommit: { commitId: `s${id}` }, targetRefCommit: { commitId: "t" }, commonRefCommit: { commitId: "b" } })),
+      changePages: [{ changeEntries: page1, nextSkip: TOP }, { changeEntries: withDelete }],
+    });
+    const paths = await listChangedPaths(ref);
+    eq("the change's paths come from every page, canonical", [paths.length, paths[0], paths[paths.length - 1]], [
+      TOP + 2,
+      "src/gen/f0000.ts",
+      "openspec/changes/x/specs/a/spec.md",
+    ]);
+    check("...without the deleted file or a folder", !paths.includes("src/gone.ts") && !paths.includes("src/newdir"));
+    const listedAt = ado.matching("GET", /\/changes$/);
+    check(
+      "...asked of the last iteration against the merge base",
+      listedAt.length === 2 && listedAt.every((r) => r.query["$compareTo"] === "0" && /\/iterations\/2\/changes$/.test(r.path)),
+      JSON.stringify(listedAt.map((r) => [r.path, r.query])),
+    );
+    check("...and nothing is read", ado.matching("GET", /\/blobs\//).length === 0);
   }
 
   section("Task → parent PBI: where acceptance criteria actually live");

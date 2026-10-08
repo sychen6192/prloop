@@ -77,7 +77,10 @@ async function main() {
     console.log(
       `\nReviewed ${result.ctx.files.length} files: ${inline.length} comments, ${belowBar.length} below the bar, ` +
         `${degraded.length} unanchored` +
-        (result.req && !result.req.skipped ? `; ${result.req.criteria.length} criteria judged` : ""),
+        (result.req && !result.req.skipped ? `; ${result.req.criteria.length} criteria judged` : "") +
+        (result.req?.openspec && !result.req.openspec.skipped && !result.req.openspec.error
+          ? `; ${result.req.openspec.criteria.length} OpenSpec requirements judged (advisory)`
+          : ""),
     );
     for (const f of inline) console.log(`  ${f.severity.padEnd(8)} ${f.file}:${f.anchor?.startLine}  ${f.claim}`);
     if (result.incomplete.length > 0) console.log(`Incomplete: ${result.incomplete.join("; ")}`);

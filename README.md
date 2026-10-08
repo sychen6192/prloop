@@ -20,8 +20,9 @@ outer one: re-run per PR iteration with `--since auto`.
 ```
 Step 1  fetch PR changes            ADO REST → blob bytes → Myers diff        0 model calls
 Step 2  ┌ static analysis           linters over PRR_WORKDIR                  0
-        ├ requirement axis          work items vs diff, then one batched      1 + D
-        │                           dispute of its own accusations
+        ├ requirement axis          work items vs diff, then one batched      1 + D + O
+        │                           dispute of its own accusations; the
+        │                           PR's own OpenSpec deltas, apart
         └ code axis                 N finders, same prompt, in parallel       N
 Step 3  anchor → filter → skeptic   quote → line number, then refutation      M×R + T
         → triage                    excluded/dismissed drop before the skeptic
@@ -32,7 +33,9 @@ Step 4  publish                     sticky summary + inline threads           0
 `PRR_RISK_TIERS`) · `M` = anchored findings **that survive the noise filter** (exclusions,
 prior dismissals and findings already posted cost no verification tokens) · `D` = 1 when the
 requirement axis accused any criterion of being `missing`, `partial` or `misunderstood` — one
-batched call disputes all of them — else 0 · `T` = triage batches, ten tool findings each. All model calls share one concurrency pool
+batched call disputes all of them — else 0 · `O` = 1 when the pull request carries OpenSpec
+spec deltas whose requirements it changed, and code or configuration to judge them against (a
+call of its own, advisory), else 0 · `T` = triage batches, ten tool findings each. All model calls share one concurrency pool
 (`PRR_LLM_CONCURRENCY`) and retry on transient failures; every structured call also names its
 answer's top-level keys in the prompt.
 
@@ -65,7 +68,7 @@ the other's output.
 
 - **Requirement axis** — pulls linked work items (walking one level up for acceptance
   criteria) and gives each criterion a verdict: `satisfied / missing / partial /
-  misunderstood / not-verifiable`, plus out-of-scope changes. It reports *how* it failed, not
+  misunderstood / not-this-pr / not-verifiable`, plus out-of-scope changes. It reports *how* it failed, not
   a percentage — a percentage is not actionable.
 
   It gets **its own verification**, deliberately narrower than the code axis's. The three
@@ -78,6 +81,20 @@ the other's output.
   criterion — is held to the same quote contract as a code finding: its evidence quote is
   anchored in the diff, and a quote that isn't there is demoted too. Same asymmetries as the
   code skeptic: only downward, and fails open.
+
+  **OpenSpec.** A pull request that carries OpenSpec spec deltas
+  (`openspec/changes/<id>/specs/<capability>/spec.md`, not under `changes/archive/`) has each
+  ADDED and MODIFIED `### Requirement:` it changed judged too, scenarios included. They are
+  judged in a call of their own, blind to the work items, so the author's spec cannot shade
+  the work items' verdicts, scope or out-of-scope list. The axis runs on such a pull request
+  with no linked work item as well. The results are advisory: their own table in the summary
+  and `review.html`, no inline comment, no dispute, never counted in the status or the exit
+  code, and a failed call over them leaves the run complete. Removed and renamed requirements,
+  and those the pull request left unchanged, are listed, not judged; at most 20 requirements a
+  run. Nothing under `openspec/` is evidence for either check: proposals, designs, task lists
+  and spec deltas are named to the requirement model but not shown, and a satisfied verdict
+  quoting one is taken back. A pull request that changes only OpenSpec documents is described,
+  not judged.
 - **Code axis** — 8 categories × 4 severities (`req-mismatch`, the ninth, belongs to the
   requirement axis), severity from an ordered decision chain (key split: is there a
   workaround?) rather than adjectives.
@@ -399,7 +416,8 @@ gates — with your configured models, as a dry run: there is no pull request, s
 posted, and the run directory (`review.html` included) is the review. The repository's
 convention documents are read from its own history at `<base>`, and `--criteria` gives the
 requirement axis a markdown file of acceptance criteria to judge the branch against; without
-it that axis is skipped, as it is on a PR with no linked work item. `prompt` and `anchor` need
+it the work-item check is skipped, as it is on a PR with no linked work item; a branch that
+carries OpenSpec spec deltas still has those judged. `prompt` and `anchor` need
 no model endpoint at all.
 
 ## What lands on the PR
@@ -575,7 +593,7 @@ answer to "why did editing `.env` change nothing".
 | `PRR_STATIC_TIMEOUT_MS` | `300000` | deadline for one linter invocation |
 | `PRR_TRIAGE_CONTEXT_LINES` | `12` | source lines shown to the triage model |
 | `PRR_MAX_TRIAGE_ITEMS` | `40` | a PR tripping 200 lint rules has a lint config problem, not a review problem |
-| `PRR_SKIP_REQUIREMENT` | — | `1` = skip the requirement axis |
+| `PRR_SKIP_REQUIREMENT` | — | `1` = skip the requirement axis, OpenSpec included |
 | `PRR_DISMISSAL_HINT_THRESHOLD` | `3` | dismissals in one category before the summary suggests excluding it |
 | `PRR_MAX_INLINE_REQ_COMMENTS` | `3` | requirement-axis budget, separate so code findings cannot crowd it out |
 | `PRR_POST_STATUS` | — | `1` = also post a PR status (needs a branch policy to gate merges). Three states, matching the exit code: `failed` (2) · `error` (3, the review did not fully run) · `succeeded` (0) |

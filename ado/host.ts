@@ -5,7 +5,7 @@ import type { ReviewHost } from "../libs/host";
 import type { PrRef } from "../libs/types";
 import { fetchRepoConventions } from "./conventions";
 import { selfIdentityId } from "./identity";
-import { buildReviewContext } from "./intake";
+import { buildReviewContext, listChangedPaths } from "./intake";
 import { terminalPrStatus } from "./iterations";
 import { postStatus } from "./statuses";
 import { createThread, listThreads, setThreadStatus, updateComment } from "./threads";
@@ -15,6 +15,7 @@ export function adoHost(ref: PrRef): ReviewHost {
   return {
     ref,
     intake: (compareTo, opts) => buildReviewContext(ref, compareTo, opts),
+    changedPaths: () => listChangedPaths(ref),
     terminal: (pr) => terminalPrStatus(pr.status),
     conventions: (commit, changedPaths) => fetchRepoConventions(ref, commit, changedPaths),
     requirements: () => getLinkedRequirements(ref),

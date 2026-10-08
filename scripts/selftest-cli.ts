@@ -118,6 +118,32 @@ section("exit status: the only part of a run that CI reads");
     exitCodeFor({ agg: agg([]), req: req("missing"), incomplete: [] }), 2);
   eq("...partial counts too", exitCodeFor({ agg: agg([]), req: req("partial"), incomplete: [] }), 2);
   eq("...and misunderstood", exitCodeFor({ agg: agg([]), req: req("misunderstood"), incomplete: [] }), 2);
+  // The PR's own spec is the author's text: it may inform a reviewer, never gate the build.
+  eq(
+    "an unmet OpenSpec requirement never sets the exit code",
+    exitCodeFor({
+      agg: agg([]),
+      req: {
+        ...req(),
+        openspec: {
+          deltas: [],
+          criteria: [
+            {
+              workItemId: 0,
+              criterion: "Audit",
+              verdict: "missing",
+              note: "",
+              spec: { delta: "SPEC1", path: "openspec/changes/x/specs/a/spec.md", change: "x", capability: "a", op: "ADDED", name: "Audit", scenarios: 0, line: 1 },
+            },
+          ],
+          capped: 0,
+          unread: [],
+        },
+      },
+      incomplete: [],
+    }),
+    0,
+  );
   eq("satisfied criteria do not", exitCodeFor({ agg: agg([]), req: req("satisfied"), incomplete: [] }), 0);
   // Scope, not a failure: criteria a work item asks for that this PR never owed. Counting
   // them failed the build over work nobody in this PR was asked to do.

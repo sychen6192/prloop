@@ -10,11 +10,13 @@ import { extractCriteria, type CriterionRef } from "../libs/criteria";
 import { FileIndex, normalizePath } from "../libs/fileindex";
 import type { LinkedRequirements } from "../libs/host";
 import { arrayField, describeShape, parseJsonObject } from "../libs/json";
-import { isOpenSpecDoc } from "../libs/openspec";
+import type { SkippedFile } from "../libs/context";
+import { isOpenSpecDoc, parseSpecDelta, selectSpecCriteria, specDeltaOf, type SpecSelection } from "../libs/openspec";
 import { buildDiffPayload, type DiffPayload } from "../libs/payload";
 import { log } from "../libs/log";
 import { parseVerdict, type Verdict } from "./skeptic";
-import { REQ_DISPUTE_SCHEMA } from "../models/schemas";
+import { OPENSPEC_SCHEMA, REQ_DISPUTE_SCHEMA } from "../models/schemas";
+import { OPENSPEC_SYSTEM, buildOpenSpecPrompt } from "../prompts/openspec";
 import { REQ_SKEPTIC_SYSTEM, buildReqDisputePrompt } from "../prompts/skeptic";
 import type {
   AnchoredFinding,
@@ -22,10 +24,13 @@ import type {
   ExtraChange,
   FileDiff,
   ModelRunner,
+  OpenSpecCheck,
+  OpenSpecResult,
   PrInfo,
   RawFinding,
   ReqVerdict,
   RequirementResult,
+  WorkItem,
 } from "../libs/types";
 import { REQ_VERDICTS } from "../libs/types";
 import { REQUIREMENT_SCHEMA } from "../models/schemas";
@@ -129,6 +134,9 @@ export interface RequirementDiff {
   // The WHOLE pull request's code and text. The gate sets OpenSpec documents apart and builds
   // the evidence index itself, because only it knows which files may be evidence.
   files: FileDiff[];
+  // Listed by the whole-PR intake but not read (too large, binary, noise): a spec delta among
+  // them is named in the summary instead of silently left unjudged.
+  unread?: readonly SkippedFile[];
 }
 
 export interface RequirementGateInput {
@@ -148,44 +156,139 @@ export interface RequirementGateInput {
   requirements: () => Promise<LinkedRequirements>;
   /** Test seam: the dispute pass's model, in place of the first PRR_SKEPTIC_MODELS entry. */
   disputeModel?: string;
+  /**
+   * The spec deltas (specDeltaOf) the WHOLE pull request adds or edits: a listing, nothing
+   * read. Asked only when no work item has criteria; otherwise the diff is read anyway and the
+   * deltas are found in it. Absent = no discovery.
+   */
+  specDeltaPaths?: () => Promise<string[]>;
 }
 
-export async function runRequirementGate(
-  input: RequirementGateInput,
-): Promise<{ result: RequirementResult; prompt?: string; raw?: string }> {
-  let linked;
+export interface RequirementGateOutput {
+  result: RequirementResult;
+  // The work-item call.
+  prompt?: string;
+  raw?: string;
+  // The OpenSpec call.
+  specPrompt?: string;
+  specRaw?: string;
+}
+
+export async function runRequirementGate(input: RequirementGateInput): Promise<RequirementGateOutput> {
+  let linked: LinkedRequirements | undefined;
+  let fetchError: string | undefined;
   try {
     linked = await input.requirements();
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log(`[WARN] Failed to fetch work items: ${msg}`);
-    return { result: { workItems: [], criteria: [], extras: [], error: msg } };
+    fetchError = e instanceof Error ? e.message : String(e);
+    log(`[WARN] Failed to fetch work items: ${fetchError}`);
   }
 
-  if (linked.items.length === 0) {
-    log("PR has no linked work item; skipping the requirement axis");
-    return {
+  // The three ways there is nothing to judge a work item by, each with the result the axis
+  // has always returned for it. They stay the result: a spec delta found below adds its own
+  // advisory half next to it and never stands in for it.
+  const withSpec = (linked?.items ?? []).filter((w) => w.acceptanceCriteria || w.description);
+  let notLinked: { result: RequirementResult; line?: string } | undefined;
+  if (!linked) notLinked = { result: { workItems: [], criteria: [], extras: [], error: fetchError } };
+  else if (linked.items.length === 0) {
+    notLinked = {
       result: { workItems: [], criteria: [], extras: [], skipped: "PR has no linked work item" },
+      line: "PR has no linked work item; skipping the requirement axis",
     };
-  }
-
-  const withSpec = linked.items.filter((w) => w.acceptanceCriteria || w.description);
-  if (withSpec.length === 0) {
-    log("Linked work items have no acceptance criteria or description; skipping the requirement axis");
-    return {
+  } else if (withSpec.length === 0) {
+    notLinked = {
       result: {
         workItems: linked.items,
         criteria: [],
         extras: [],
         skipped: "Linked work items have no acceptance criteria or description to check against",
       },
+      line: "Linked work items have no acceptance criteria or description; skipping the requirement axis",
     };
   }
 
-  log(`requirement axis: checking ${withSpec.length} work items (${withSpec.map((w) => `#${w.id}`).join(", ")})`);
+  if (notLinked) {
+    // Reading the whole PR costs every text file's blobs, so with no work item to judge it is
+    // read only when the change carries a spec delta, and that is asked of a listing first.
+    let deltaPaths: string[] = [];
+    if (input.specDeltaPaths) {
+      try {
+        deltaPaths = (await input.specDeltaPaths()).filter((p) => specDeltaOf(p) !== undefined);
+      } catch (e) {
+        log(`[WARN] OpenSpec: could not list the pull request's files to look for spec deltas: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (deltaPaths.length === 0) {
+      if (notLinked.line) log(notLinked.line);
+      return { result: notLinked.result };
+    }
+    log(
+      `requirement axis: ${notLinked.result.skipped ?? "work items could not be read"}; ` +
+        `judging the pull request's own OpenSpec change (${deltaPaths.length} spec deltas, advisory)`,
+    );
+  } else {
+    log(`requirement axis: checking ${withSpec.length} work items (${withSpec.map((w) => `#${w.id}`).join(", ")})`);
+  }
 
-  const { files } = await input.diff();
+  const { files, unread = [] } = await input.diff();
+  // Evidence is code, configuration and documentation. An OpenSpec document says what the
+  // change is meant to do: a ticked "- [x] 1.2 …" in tasks.md anchored as evidence and closed
+  // a criterion, and a 120-line design.md packed ahead of the 25-line file it described.
+  const shown = files.filter((f) => !isOpenSpecDoc(f.path));
+  const intentDocs = files.filter((f) => isOpenSpecDoc(f.path)).map((f) => f.path);
+  const evidence = new FileIndex(shown);
+  const deltas = files.filter((f) => specDeltaOf(f.path) !== undefined).map((f) => parseSpecDelta(f));
+  // A delta the intake listed and could not read is named, never silently left unjudged. One
+  // with no textual change (a rename) has nothing in it this PR changed.
+  const unreadDeltas = unread.filter(
+    (s) => s.reason !== "deleted" && s.reason !== "no textual change" && specDeltaOf(s.path) !== undefined,
+  );
+  for (const d of deltas) {
+    if (d.problems.length > 0) {
+      log(`[WARN] OpenSpec ${d.path}: ${d.problems[0]}${d.problems.length > 1 ? ` (+${d.problems.length - 1} more)` : ""}`);
+    }
+  }
+
+  // Two calls, concurrent and blind to each other: neither prompt carries the other's
+  // requirements, and neither result is read by the other.
+  const [wi, os] = await Promise.all([
+    notLinked
+      ? Promise.resolve<RequirementGateOutput>({ result: notLinked.result })
+      : judgeWorkItems({ input, linked: linked!, withSpec, files, shown, intentDocs, evidence }),
+    deltas.length + unreadDeltas.length > 0
+      ? judgeOpenSpec({
+          pr: input.pr,
+          runner: input.runner,
+          shown,
+          evidence,
+          intentDocs,
+          selection: selectSpecCriteria(deltas),
+          unread: unreadDeltas,
+        })
+      : Promise.resolve(undefined),
+  ]);
+  return {
+    result: { ...wi.result, ...(os ? { openspec: os.result } : {}) },
+    prompt: wi.prompt,
+    raw: wi.raw,
+    ...(os?.prompt !== undefined ? { specPrompt: os.prompt } : {}),
+    ...(os?.raw !== undefined ? { specRaw: os.raw } : {}),
+  };
+}
+
+/** The linked work items' criteria against the code: the axis as it has always run. */
+async function judgeWorkItems(args: {
+  input: RequirementGateInput;
+  linked: LinkedRequirements;
+  withSpec: WorkItem[];
+  files: FileDiff[];
+  shown: FileDiff[];
+  intentDocs: string[];
+  evidence: FileIndex;
+}): Promise<RequirementGateOutput> {
+  const { input, linked, withSpec, files, shown, intentDocs, evidence } = args;
   if (files.length === 0) {
+
     // Judged against an empty diff, every criterion comes back "missing" and the status fails
     // a PR that — deleting files, say — may well have done what was asked.
     log("requirement axis: no changed text to judge the criteria against; skipping");
@@ -193,11 +296,6 @@ export async function runRequirementGate(
       result: { workItems: withSpec, criteria: [], extras: [], skipped: "no changed text in this PR to judge the criteria against" },
     };
   }
-  // Evidence is code, configuration and documentation. An OpenSpec document says what the
-  // change is meant to do: a ticked "- [x] 1.2 …" in tasks.md anchored as evidence and closed
-  // a criterion, and a 120-line design.md packed ahead of the 25-line file it described.
-  const shown = files.filter((f) => !isOpenSpecDoc(f.path));
-  const intentDocs = files.filter((f) => isOpenSpecDoc(f.path)).map((f) => f.path);
   if (shown.length === 0) {
     // A proposal-only PR: the change is written down and not yet made. Every criterion would
     // come back missing against a plan, and accuse the author of skipping work not yet due.
@@ -211,7 +309,6 @@ export async function runRequirementGate(
       },
     };
   }
-  const evidence = new FileIndex(shown);
 
   // The unit of judgment is fixed HERE, before any model runs: same work items → same
   // criterion list → same denominator every run (see libs/criteria.ts for why).
@@ -340,6 +437,101 @@ export async function runRequirementGate(
 }
 
 /**
+ * The pull request's own OpenSpec requirements against its code, in a call of their own. The
+ * same unit discipline, evidence check and missing-demotion as the work items, and none of
+ * the parts that would let the author's spec steer anything: no extras (the spec would decide
+ * what counts as scope), no dispute (the skeptic budget is the work items'), and a failure is
+ * an advisory error, never the axis's.
+ */
+async function judgeOpenSpec(args: {
+  pr: PrInfo;
+  runner: ModelRunner;
+  shown: FileDiff[];
+  evidence: FileIndex;
+  intentDocs: string[];
+  selection: SpecSelection;
+  unread: readonly SkippedFile[];
+}): Promise<{ result: OpenSpecResult; prompt?: string; raw?: string }> {
+  const { pr, runner, shown, evidence, intentDocs, selection } = args;
+  const base = {
+    deltas: selection.deltas,
+    unread: args.unread.map((s) => ({ path: s.path, reason: s.reason })),
+    capped: selection.capped,
+  };
+  if (selection.refs.length === 0) {
+    log("OpenSpec (advisory): no ADDED or MODIFIED requirement this pull request changed; nothing to judge");
+    return { result: { ...base, criteria: [], skipped: "no ADDED or MODIFIED requirement this pull request changed" } };
+  }
+  if (shown.length === 0) {
+    // A proposal under review before any code exists: every requirement would be missing.
+    log("OpenSpec (advisory): only OpenSpec documents changed; nothing yet to judge the requirements against");
+    return {
+      result: {
+        ...base,
+        criteria: [],
+        skipped: "this pull request changes only OpenSpec documents; their requirements are judged once code implementing them is in it",
+      },
+    };
+  }
+
+  log(`OpenSpec (advisory): judging ${selection.refs.length} requirements from ${selection.blocks.length} spec deltas`);
+  const promptInput = { pr, blocks: selection.blocks, intentDocs };
+  const payload = buildDiffPayload(shown, undefined, undefined, {
+    model: REQ_MODEL,
+    fixed: `${OPENSPEC_SYSTEM}\n${JSON.stringify(OPENSPEC_SCHEMA)}\n${buildOpenSpecPrompt({ ...promptInput, payload: NO_DIFF })}`,
+  });
+  const prompt = buildOpenSpecPrompt({ ...promptInput, payload });
+  const res = await runner.chat({
+    model: REQ_MODEL,
+    system: OPENSPEC_SYSTEM,
+    user: prompt,
+    schema: OPENSPEC_SCHEMA,
+    schemaName: "openspec",
+    temperature: 0,
+  });
+  const failed = (error: string) => {
+    log(`[WARN] OpenSpec check failed (advisory, the status does not depend on it): ${error}`);
+    return { result: { ...base, criteria: [], error }, prompt, raw: res.text };
+  };
+  if (res.error) return failed(res.error);
+  const parsed = parseJsonObject<{ criteria?: unknown }>(res.text);
+  if (!parsed.ok) return failed(parsed.error);
+  const judgments = arrayField(parsed.value, "criteria");
+  if (!judgments) {
+    log(`[WARN] OpenSpec answer has no criteria array (got ${describeShape(parsed.value)})`);
+    return failed("response has no criteria array");
+  }
+  const resolved = resolveJudgments(judgments, selection.refs);
+  if (resolved.unjudged === selection.refs.length) {
+    return failed(
+      `response judged none of the ${selection.refs.length} listed criteria` +
+        (resolved.unknownIds > 0
+          ? ` (${resolved.unknownIds} verdict${resolved.unknownIds === 1 ? " on an unlisted id" : "s on unlisted ids"})`
+          : ""),
+    );
+  }
+  if (resolved.unknownIds > 0 || resolved.unjudged > 0) {
+    log(
+      `[WARN] OpenSpec: ${resolved.unknownIds} verdicts on invented ids dropped, ` +
+        `${resolved.unjudged} listed requirements left unjudged (marked not-verifiable)`,
+    );
+  }
+  // Every ref has its origin: selectSpecCriteria builds both from the same requirement.
+  const criteria: OpenSpecCheck[] = resolved.criteria.map((c) => ({ ...c, spec: selection.origins.get(c.id!)! }));
+  demoteUnseenMissing(criteria, payload.omittedFiles);
+  verifySatisfiedEvidence(criteria, evidence);
+
+  const counts = new Map<string, number>();
+  for (const c of criteria) counts.set(c.verdict, (counts.get(c.verdict) ?? 0) + 1);
+  log(
+    `OpenSpec (advisory): ${criteria.length} requirements (` +
+      [...counts.entries()].map(([k, v]) => `${k} ${v}`).join(", ") +
+      ")",
+  );
+  return { result: { ...base, criteria }, prompt, raw: res.text };
+}
+
+/**
  * Adversarial pass over the axis's accusations. This axis was the one model opinion in the
  * pipeline that published with no downstream filter, and its worst outputs accuse the
  * author: "missing", "partial" and "misunderstood" — you did not build this, you half
@@ -364,9 +556,7 @@ async function disputeAccusations(
   model: string | undefined,
 ): Promise<void> {
   if (!model) return; // no skeptic configured = no verification runs, same as the code axis
-  const accused = criteria.filter(
-    (c) => c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood",
-  );
+  const accused = criteria.filter(accuses);
   if (accused.length === 0) return;
 
   const challenges = accused.map((c, i) => ({ id: disputeId(c, i), criterion: c.criterion, verdict: c.verdict, note: c.note }));
@@ -559,9 +749,19 @@ export function verifySatisfiedEvidence(criteria: CriterionCheck[], index: FileI
  * exists to stop.
  */
 export function unmetCriteria(result: RequirementResult): CriterionCheck[] {
-  return result.criteria.filter(
-    (c) => c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood",
-  );
+  return result.criteria.filter(accuses);
+}
+
+/** The three verdicts that accuse the author. One predicate for unmetCriteria, the dispute and the summary. */
+export const accuses = (c: CriterionCheck): boolean =>
+  c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood";
+
+/**
+ * Unmet OpenSpec requirements: reported, never counted. Nothing that sets the status or the
+ * exit code calls this — the author's own spec must not be able to gate a merge.
+ */
+export function advisoryUnmet(o: OpenSpecResult | undefined): OpenSpecCheck[] {
+  return o?.criteria.filter(accuses) ?? [];
 }
 
 /**

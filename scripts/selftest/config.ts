@@ -1,6 +1,7 @@
 // Configuration, the CLI and intake edges: .env parsing, the settings SSOT, entry points,
 // ADO parser edges, runs/ retention and artifacts, and the local intake.
 import { buildLocalReviewContext } from "../../git/intake";
+import { localHost } from "../../git/host";
 import { parsePrUrl, prBase } from "../../ado/client";
 import { attachLogSink, detachLogSink, log } from "../../libs/log";
 import {
@@ -667,10 +668,12 @@ section("local intake: the second provider at the ReviewContext seam, held to th
     fs.writeFileSync(path.join(repo, "old.ts"), "export function a() {\n  return 1;\n}\n");
     const keep = (second: string, seventh: string) => ["a", second, "c", "d", "e", "f", seventh, "h", ""].join("\n");
     fs.writeFileSync(path.join(repo, "keep.ts"), keep("b", "g"));
+    fs.writeFileSync(path.join(repo, "dead.ts"), "export const gone = 1;\n");
     await g("add", "-A");
     await g("commit", "-qm", "base");
     await g("checkout", "-q", "-b", "feature");
     await g("mv", "old.ts", "new.ts");
+    await g("rm", "-q", "dead.ts");
     fs.writeFileSync(path.join(repo, "new.ts"), "export function a() {\n  return 2;\n}\n");
     fs.writeFileSync(path.join(repo, "keep.ts"), keep("B", "g"));
     await g("add", "-A");
@@ -710,6 +713,14 @@ section("local intake: the second provider at the ReviewContext seam, held to th
       () => undefined,
     );
     eq("an unreadable ref fails loudly rather than reviewing nothing", gone, undefined);
+
+    // The listing the requirement axis looks for spec deltas in, taken the way intake takes
+    // the change: against the merge base, the renamed file under its new name.
+    eq(
+      "the local host lists the branch's paths, deletions left out",
+      (await localHost({ repo, base: "main", head: "feature" }).changedPaths()).sort(),
+      ["keep.ts", "new.ts"],
+    );
 
     fs.rmSync(repo, { recursive: true, force: true });
   }

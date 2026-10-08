@@ -46,6 +46,18 @@ async function buildFileDiff(ref: PrRef, entry: ChangeEntry): Promise<FileDiff> 
   };
 }
 
+/**
+ * Every path the whole pull request adds, edits or renames to, deletions left out, canonical:
+ * the latest iteration against the merge base, listed and not read. Two GETs (more when the
+ * change list pages), no blob.
+ */
+export async function listChangedPaths(ref: PrRef): Promise<string[]> {
+  const iterations = await listIterations(ref);
+  const last = iterations[iterations.length - 1];
+  if (!last) return [];
+  return (await getIterationChanges(ref, last.id, 0)).filter((e) => e.changeType !== "delete").map((e) => normalizePath(e.path));
+}
+
 export async function buildReviewContext(ref: PrRef, compareTo = 0, opts: IntakeOptions = {}): Promise<ReviewContext> {
   const [pr, iterations] = await Promise.all([getPrInfo(ref), listIterations(ref)]);
   if (iterations.length === 0) {

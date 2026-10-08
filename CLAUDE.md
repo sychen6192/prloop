@@ -41,6 +41,9 @@ and closes its server in a `finally`.
   CLOSED (a wrong-line comment is worse than a miss). Keep them.
 - **Two axes stay blind to each other.** The requirement axis and code axis must not see
   each other's output, and their comment budgets stay separate.
+- **The PR's own OpenSpec requirements never block.** They live in `RequirementResult.openspec`,
+  which `unmetCriteria`, the status, the exit code and `incomplete` never read, and they are
+  judged in a call blind to the work items. Nothing under `openspec/` is ever evidence.
 - **Config is SSOT in `config.ts`** — every knob is a `PRR_*` env var read there once, by a
   reader that declares it (kind, section, description; `KNOWN_KEYS` is built from those
   declarations), and documented in `.env.example` and the README table. Add all three or none;
@@ -68,7 +71,7 @@ and closes its server in a `finally`.
 | `prompts/` | every prompt, one file per stage |
 | `rules/` | reviewer rules as markdown with `applyTo` globs |
 | `publish/` | comment rendering, the hidden marker protocol, dedup (fingerprint + position), lifecycle |
-| `libs/` | diff, payload budgeting, rules loading, proxy/TLS, CLI grammar, types, and the ReviewContext and ReviewHost contracts (SSOT) |
+| `libs/` | diff, payload budgeting, rules loading, OpenSpec spec deltas, proxy/TLS, CLI grammar, types, and the ReviewContext and ReviewHost contracts (SSOT) |
 | `examples/` | Azure Pipelines YAML to start from: build validation, and a scheduled sweep with `--active` |
 | `scripts/` | selftests (+ `fakes/`, and `selftest/`: one module per area plus the shared harness), doctor/probe/tlsfix diagnostics, local-review, evaluate/calibrate/replay/bench |
 

@@ -19,6 +19,7 @@ import { load } from "../../libs/tls";
 import {
   ENFORCEMENT_PROBE_SCHEMA,
   FINDINGS_SCHEMA,
+  OPENSPEC_SCHEMA,
   REQ_DISPUTE_SCHEMA,
   REQUIREMENT_SCHEMA,
   TRIAGE_SCHEMA,
@@ -119,6 +120,7 @@ section("strict-mode schema invariant");
     ["req_dispute", REQ_DISPUTE_SCHEMA],
     ["triage", TRIAGE_SCHEMA],
     ["probe", ENFORCEMENT_PROBE_SCHEMA],
+    ["openspec", OPENSPEC_SCHEMA],
   ] as const) {
     const missing = walk(schema, name);
     check(`${name} schema is strict-mode compliant`, missing.length === 0, missing.join(", "));
@@ -149,6 +151,7 @@ section("strict-mode schema invariant");
     ["req_dispute", REQ_DISPUTE_SCHEMA],
     ["triage", TRIAGE_SCHEMA],
     ["probe", ENFORCEMENT_PROBE_SCHEMA],
+    ["openspec", OPENSPEC_SCHEMA],
   ] as const) {
     const found = constraints(schema, name);
     check(`${name} schema carries no value constraints (backend dialects differ)`, found.length === 0, found.join(", "));

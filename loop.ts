@@ -26,7 +26,7 @@ import {
 import { FINDING_CATEGORIES } from "./libs/taxonomy";
 import { parsePrUrl } from "./ado/client";
 import { adoHost } from "./ado/host";
-import { unmetCriteria } from "./gates/requirement";
+import { advisoryUnmet, unmetCriteria } from "./gates/requirement";
 import { claimRunLease, releaseRunLease, runId, type LeaseHandle } from "./publish/lease";
 import { resolveLastReviewedIteration } from "./publish/lifecycle";
 import { buildResultSummary, createFatalRunDir, createSkipDir, currentRunDir, openRunDir, runsDirWarning } from "./libs/artifacts";
@@ -295,6 +295,10 @@ async function main() {
         (result.req.extras.length ? `, ${result.req.extras.length} out-of-scope changes` : ""),
     );
   }
+  const spec = result.req?.openspec;
+  if (spec?.error) log(`OpenSpec (advisory): failed (${spec.error})`);
+  else if (spec?.skipped) log(`OpenSpec (advisory): ${spec.skipped}`);
+  else if (spec) log(`OpenSpec (advisory): ${spec.criteria.length} requirements, ${advisoryUnmet(spec).length} look unmet`);
 
   const { inline, degraded, belowBar } = result.agg;
   log(`Code axis: inline comments ${inline.length} | below threshold ${belowBar.length} | unanchored ${degraded.length}`);

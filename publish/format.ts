@@ -4,7 +4,9 @@ import { MAX_INLINE_COMMENTS, MIN_INLINE_SEVERITY, excludedCategories } from "..
 import { defuseHtmlComments, findingMarkers, summaryMarkers, type SpanMark } from "./markers";
 import { UNKNOWN_FILE_TYPE, detectLanguage } from "../libs/lang";
 import { redactSecrets } from "../libs/redact";
-import type { AnchoredFinding, ReqVerdict, RequirementResult } from "../libs/types";
+import type { AnchoredFinding, OpenSpecResult, ReqVerdict, RequirementResult } from "../libs/types";
+import { accuses, advisoryUnmet } from "../gates/requirement";
+import { OPENSPEC_LIMITS } from "../libs/openspec";
 import type { AggregateResult } from "../gates/aggregate";
 import type { CategoryHint } from "../libs/learnings";
 import type { ThreadTally, WatermarkDecision } from "./lifecycle";
@@ -198,6 +200,10 @@ const REQ_LABEL: Record<ReqVerdict, string> = {
 // Deliberately not merged into the findings table: a shared ranking lets code findings
 // bury "this requirement was never implemented" (PROPOSAL §6.1).
 function renderRequirementSection(req: RequirementResult | undefined, incremental: boolean): string[] {
+  return [...renderWorkItemSection(req, incremental), ...renderOpenSpecSection(req?.openspec, incremental)];
+}
+
+function renderWorkItemSection(req: RequirementResult | undefined, incremental: boolean): string[] {
   const lines: string[] = ["### 📋 Requirement check", ""];
 
   if (!req || req.skipped) {
@@ -213,9 +219,7 @@ function renderRequirementSection(req: RequirementResult | undefined, incrementa
     return lines;
   }
 
-  const unmet = req.criteria.filter(
-    (c) => c.verdict === "missing" || c.verdict === "partial" || c.verdict === "misunderstood",
-  );
+  const unmet = req.criteria.filter(accuses);
   // Criteria the axis judged to belong to a different task or PR are not part of this PR's
   // denominator: counting them would restate "5/9 unmet" for work nobody in this PR owed,
   // which is the false accusation the verdict exists to retire. They stay in the table —
@@ -258,6 +262,84 @@ function renderRequirementSection(req: RequirementResult | undefined, incrementa
     for (const e of req.extras) lines.push(`- \`${e.file}\` — ${e.claim}`);
     lines.push("", "</details>", "");
   }
+  return lines;
+}
+
+/**
+ * The pull request's own OpenSpec requirements: a block of their own under the work items',
+ * saying in its first line that it never decides the status. Nothing for a change without a
+ * spec delta, so every other summary is byte for byte what it was.
+ */
+function renderOpenSpecSection(o: OpenSpecResult | undefined, incremental: boolean): string[] {
+  if (!o) return [];
+  const lines: string[] = [
+    "#### 📐 OpenSpec requirements in this pull request (advisory)",
+    "",
+    "_Written by this pull request's author in its OpenSpec spec deltas and judged against the code in a check of" +
+      " their own. Advisory: they never fail the status or the build — only linked work items do._",
+    "",
+  ];
+  if (o.error) lines.push(`_OpenSpec check did not complete: ${escapeCell(o.error)}. The status does not depend on it._`, "");
+  else if (o.skipped) lines.push(`_${o.skipped}_`, "");
+  else {
+    const scoped = o.criteria.filter((c) => c.verdict === "not-this-pr").length;
+    const inScope = o.criteria.length - scoped;
+    const unmet = advisoryUnmet(o).length;
+    const satisfied = o.criteria.filter((c) => c.verdict === "satisfied").length;
+    lines.push(
+      unmet > 0
+        ? `⚠️ **${unmet}/${inScope} OpenSpec requirements look unmet.**`
+        : inScope === 0
+          ? `↗️ **None of the ${o.criteria.length} OpenSpec requirements judged is in this pull request's scope.**`
+          : satisfied === inScope
+            ? `✅ **All ${inScope} OpenSpec requirements are implemented, with evidence in the code.**`
+            : `**No OpenSpec requirement looks unmet; ${satisfied} of ${inScope} are verified implemented, the rest could not be verified from the code.**`,
+    );
+    if (scoped > 0) {
+      lines.push(
+        "",
+        `_${scoped} further ${scoped === 1 ? "requirement belongs" : "requirements belong"} to another pull request of the` +
+          ` same change and ${scoped === 1 ? "was" : "were"} not counted._`,
+      );
+    }
+    if (incremental) lines.push("", "_Judged against the whole pull request, not only this push._");
+    // Backticks in a change or capability name would open inline code across the cell.
+    const tick = (s: string) => s.replace(/`/g, "'");
+    lines.push("", "| Status | Requirement | Spec delta | Note |", "| --- | --- | --- | --- |");
+    for (const c of o.criteria) {
+      const loc = c.file ? ` (\`${c.file}\`)` : "";
+      lines.push(
+        `| ${REQ_LABEL[c.verdict]} | ${escapeCell(`${c.spec.op}: ${c.spec.name}`)} | ` +
+          `${escapeCell(`${tick(c.spec.change)} · ${tick(c.spec.capability)}`)} | ${escapeCell(c.note)}${loc} |`,
+      );
+    }
+    lines.push("");
+  }
+
+  // What was seen and not judged, so a table of three does not read as the whole change.
+  const items: string[] = [];
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  // Requirement names are the author's text, inside a <details> this function opened: a name
+  // reading "</details>" must not close it.
+  const plain = (s: string) => s.replace(/</g, "&lt;");
+  for (const d of o.deltas) {
+    const parts = [
+      ...(d.removed.length > 0 ? [`removed ${d.removed.map((r) => `"${plain(r)}"`).join(", ")}`] : []),
+      ...(d.renamed.length > 0
+        ? [`renamed ${d.renamed.map((r) => `"${plain(r.from)}" → "${plain(r.to ?? "?")}"`).join(", ")}`]
+        : []),
+    ];
+    if (parts.length > 0) items.push(`- \`${d.path}\`: ${parts.join("; ")} — nothing to implement`);
+  }
+  for (const d of o.deltas) {
+    if (d.unchanged > 0) items.push(`- \`${d.path}\`: ${plural(d.unchanged, "requirement", "requirements")} this pull request left unchanged`);
+  }
+  if (o.capped > 0) {
+    items.push(`- ${plural(o.capped, "requirement", "requirements")} past the limits of one review (${OPENSPEC_LIMITS.requirements} requirements, ${OPENSPEC_LIMITS.totalChars} characters)`);
+  }
+  for (const u of o.unread) items.push(`- \`${u.path}\`: not read (${u.reason})`);
+  for (const d of o.deltas) for (const p of d.problems) items.push(`- \`${d.path}\`: ${plain(p)}`);
+  if (items.length > 0) lines.push(detailsOpen(`Not judged (${items.length})`), "", ...items, "", "</details>", "");
   return lines;
 }
 

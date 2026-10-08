@@ -18,6 +18,7 @@ const AREAS = {
   skeptic: () => import("./selftest/skeptic"),
   aggregate: () => import("./selftest/aggregate"),
   requirement: () => import("./selftest/requirement"),
+  openspec: () => import("./selftest/openspec"),
   static: () => import("./selftest/static"),
   rules: () => import("./selftest/rules"),
   publish: () => import("./selftest/publish"),

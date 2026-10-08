@@ -19,6 +19,8 @@ export interface MemoryPr {
   /** Who prloop writes as; undefined is a host that cannot say. */
   selfId?: string;
   requirements: LinkedRequirements;
+  /** The whole change's paths; by default every path in ctx, deletions left out. */
+  changedPaths?: string[];
   conventions: ConventionDoc[];
   statuses: Array<{ state: StatusState; description: string; iterationId?: number }>;
   /** Every write, in order: "create 1", "update 1/1", "status 1 fixed", "status succeeded". */
@@ -53,6 +55,11 @@ export function memoryHost(pr: Partial<MemoryPr> & { ctx: ReviewContext }): { ho
   const host: ReviewHost = {
     ref: state.ctx.ref,
     intake: async () => state.ctx,
+    changedPaths: async () =>
+      state.changedPaths ?? [
+        ...[...state.ctx.files, ...state.ctx.textFiles].map((f) => f.path),
+        ...state.ctx.skipped.filter((s) => s.reason !== "deleted").map((s) => s.path),
+      ],
     terminal: () => undefined,
     conventions: async () => state.conventions,
     requirements: async () => state.requirements,

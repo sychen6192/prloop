@@ -133,6 +133,18 @@ const EVIDENCE: Record<string, { file: string; quote: string }> = {
   "4713-AC1": { file: "docs/retry.md", quote: "A failed charge is retried three times before the order is cancelled." },
   // The one work item a local review's --criteria file becomes.
   "1-AC1": { file: "src/pay.ts", quote: "export function splitEvenly(totalCents: number, parts: number): number {" },
+  "4715-AC1": { file: "src/otp.ts", quote: "export function verifyOtp(code: string, expected: string, issuedAt: number, now: number): boolean {" },
+  // Met only by a ticked task: a model shown tasks.md calls it satisfied, and nothing in the
+  // code does it.
+  "4715-AC2": { file: "openspec/changes/add-otp/tasks.md", quote: "- [x] 1.2 Lock the account after five failed codes" },
+};
+
+/** What implements each OpenSpec requirement — SPEC1-R2 is a persuaded model quoting tasks.md, always. */
+const SPEC_EVIDENCE: Record<string, { file: string; quote: string; always?: boolean }> = {
+  "SPEC1-R1": { file: "src/otp.ts", quote: "if (now - issuedAt > 5 * 60_000) return false;" },
+  "SPEC1-R2": { file: "openspec/changes/add-otp/tasks.md", quote: "- [x] 1.2 Lock the account after five failed codes", always: true },
+  // Never in the code: missing.
+  "SPEC1-R3": { file: "src/otp.ts", quote: "auditLog.append(failure);" },
 };
 
 function finderAnswer(model: string, prompt: string): unknown {
@@ -180,6 +192,17 @@ function requirementAnswer(prompt: string): unknown {
   return { criteria, extras: [] };
 }
 
+function openSpecAnswer(prompt: string): unknown {
+  const criteria = Object.entries(SPEC_EVIDENCE)
+    .filter(([id]) => prompt.includes(`[${id}]`))
+    .map(([criterionId, ev]) =>
+      ev.always || shows(prompt, ev.quote)
+        ? { criterionId, verdict: "satisfied", note: "implemented", quote: ev.quote, file: ev.file }
+        : { criterionId, verdict: "missing", note: "no change in the diff implements this", quote: null, file: null },
+    );
+  return { criteria };
+}
+
 function disputeAnswer(prompt: string): unknown {
   const verdicts = Object.entries(EVIDENCE)
     .filter(([id]) => prompt.includes(`[${id}]`))
@@ -222,6 +245,8 @@ function reviewer(call: RecordedCall): Responder {
       return json(skepticAnswer(prompt));
     case "requirements":
       return json(requirementAnswer(prompt));
+    case "openspec":
+      return json(openSpecAnswer(prompt));
     case "req_dispute":
       return json(disputeAnswer(prompt));
     case "judge":
@@ -393,6 +418,7 @@ try {
       [true, "claim-check", "`MAX_RETRIES` is used at src/pay.ts:4"],
     );
     eq("the requirement axis is asked once, with no accusation to dispute", [stageCalls("requirements").length, stageCalls("req_dispute").length], [1, 0]);
+    eq("a pull request with no OpenSpec change makes no OpenSpec call", stageCalls("openspec").length, 0);
     // response_format alone did not reach a gateway that accepts it without enforcing it; the
     // prompt names the shape too.
     const structured = [...stageCalls("findings"), ...stageCalls("requirements"), ...stageCalls("verdict")];
@@ -532,15 +558,15 @@ try {
     }
   }
 
-  /** Points the fake at another pull request: one push, these files, this work item. */
-  const nextPr = (title: string, files: Record<string, { blob: string; text: string }>, workItem: Record<string, unknown>) => {
+  /** Points the fake at another pull request: one push, these files, this work item (or none). */
+  const nextPr = (title: string, files: Record<string, { blob: string; text: string }>, workItem?: Record<string, unknown>) => {
     ado.state.pr = { ...ado.state.pr, title, description: "" };
     ado.state.iterations = [iteration(1)];
     const entries = Object.entries(files).map(([file, f], i) => entry(`/${file}`, f.blob, 10 + i));
     ado.state.changesFor = () => [{ changeEntries: entries }];
     ado.state.blobs = Object.fromEntries(Object.values(files).map((f) => [f.blob, f.text]));
-    ado.state.workItemRefs = [Number(workItem["id"])];
-    ado.state.workItems = { [Number(workItem["id"])]: workItem };
+    ado.state.workItemRefs = workItem ? [Number(workItem["id"])] : [];
+    ado.state.workItems = workItem ? { [Number(workItem["id"])]: workItem } : {};
     ado.state.threads = [];
     ado.reset();
     models.reset();
@@ -630,6 +656,123 @@ try {
     eq("the status passes", status?.["state"], "succeeded");
     check("...without claiming it reviewed anything", !String(status?.["description"] ?? "").includes("Reviewed 0 files"), String(status?.["description"]));
     eq("...and the exit code agrees", exitCodeFor(result), 0);
+  }
+
+  // A pull request that carries its own OpenSpec change: the code, the spec delta, the task
+  // list and the proposal, as `openspec` writes them.
+  const OTP = [
+    "export function verifyOtp(code: string, expected: string, issuedAt: number, now: number): boolean {",
+    "  if (now - issuedAt > 5 * 60_000) return false;",
+    "  return code === expected;",
+    "}",
+    "",
+  ].join("\n");
+  const OTP_V1 = ["export function verifyOtp(code: string, expected: string): boolean {", "  return code === expected;", "}", ""].join("\n");
+  const SPEC_DELTA = [
+    "## ADDED Requirements",
+    "",
+    "### Requirement: Code expiry",
+    "The system SHALL reject a one-time code older than five minutes.",
+    "",
+    "#### Scenario: Expired code",
+    "- **WHEN** a code issued six minutes ago is entered",
+    "- **THEN** verification fails",
+    "",
+    "### Requirement: Lockout",
+    "The system SHALL lock the account after five failed codes.",
+    "",
+    "### Requirement: Audit",
+    "The system SHALL record every failed code in the audit log.",
+    "",
+    "## REMOVED Requirements",
+    "",
+    "### Requirement: Password-only login",
+    "**Reason**: replaced by one-time codes",
+    "",
+  ].join("\n");
+  const TASKS = ["## 1. Tasks", "- [x] 1.1 Reject expired codes", "- [x] 1.2 Lock the account after five failed codes", "- [x] 1.3 Audit failed codes", ""].join("\n");
+  const PROPOSAL = [
+    "# Change: one-time codes at login",
+    "",
+    "## Why",
+    "Passwords alone are phished.",
+    "",
+    "## What Changes",
+    "- Require a one-time code after the password",
+    "- Lock the account after repeated failures",
+    "",
+    "## Impact",
+    "- Affected specs: auth",
+    "",
+  ].join("\n");
+  const otpFiles = {
+    "src/otp.ts": { blob: "f1f1f1", text: OTP },
+    "openspec/changes/add-otp/specs/auth/spec.md": { blob: "f2f2f2", text: SPEC_DELTA },
+    "openspec/changes/add-otp/tasks.md": { blob: "f3f3f3", text: TASKS },
+    "openspec/changes/add-otp/proposal.md": { blob: "f4f4f4", text: PROPOSAL },
+  };
+
+  section("a pull request that carries its own OpenSpec change: judged apart, advisory, never on a document's word");
+  {
+    nextPr("Auth: one-time codes", otpFiles, story(4715, ["Users verify a one-time code at login", "Lock the account after five failed codes"]));
+    const otpRef = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4825");
+    const { value: result } = await capture(() => runReview({ host: adoHost(otpRef), runner, compareTo: 0 }));
+
+    eq("one work-item call and one OpenSpec call", [stageCalls("requirements").length, stageCalls("openspec").length], [1, 1]);
+    const reqPrompt = userPrompt(stageCalls("requirements")[0] ?? ({ body: {} } as RecordedCall));
+    const spPrompt = userPrompt(stageCalls("openspec")[0] ?? ({ body: {} } as RecordedCall));
+    check(
+      "the work-item model is not shown the task list, only told it exists",
+      !shows(reqPrompt, "- [x] 1.2 Lock the account after five failed codes") &&
+        reqPrompt.includes("openspec/changes/add-otp/tasks.md") &&
+        !reqPrompt.includes("[SPEC1-"),
+      reqPrompt.slice(reqPrompt.indexOf("## The actual code change"), reqPrompt.indexOf("## The actual code change") + 500),
+    );
+    check(
+      "the OpenSpec model sees the spec fenced, and no work item",
+      spPrompt.includes("<openspec-delta>") && spPrompt.includes("[SPEC1-R3]") && !spPrompt.includes("[4715-AC") && !spPrompt.includes("Password-only login"),
+    );
+    eq("a work-item criterion met only by a ticked task is not met", result.req?.criteria.map((c) => c.verdict), ["satisfied", "missing"]);
+    eq(
+      "the spec's requirements: one implemented, one only ticked, one missing",
+      result.req?.openspec?.criteria.map((c) => c.verdict),
+      ["satisfied", "not-verifiable", "missing"],
+    );
+    eq(
+      "one dispute, of the work item's accusation only",
+      [stageCalls("req_dispute").length, userPrompt(stageCalls("req_dispute")[0] ?? ({ body: {} } as RecordedCall)).includes("[SPEC1-")],
+      [1, false],
+    );
+    const status = ado.matching("POST", /\/statuses$/)[0]?.body;
+    check(
+      "the status fails over the work item, and only the work item",
+      status?.["state"] === "failed" && String(status?.["description"] ?? "").includes("1 unmet acceptance criteria"),
+      JSON.stringify(status),
+    );
+    eq("...and the exit code agrees", exitCodeFor(result), 2);
+    check("the summary has the spec's own table", summaryOf().includes("1/3 OpenSpec requirements look unmet") && summaryOf().includes('removed "Password-only login"'), summaryOf());
+    check("no inline comment speaks for the spec", !inlinePosts().some((r) => /Audit|SPEC1/.test(contentOf(r))));
+    check("finders never see openspec/", stageCalls("findings").length > 0 && stageCalls("findings").every((c) => !userPrompt(c).includes("openspec/")));
+  }
+
+  section("no work item, and the latest push touches only code: the spec is still judged against the whole pull request");
+  {
+    nextPr("Auth: one-time codes, push 2", otpFiles);
+    ado.state.iterations = [iteration(1), iteration(2)];
+    const all = Object.entries(otpFiles).map(([file, f], i) => entry(`/${file}`, f.blob, 10 + i));
+    ado.state.changesFor = (_it, cmp) => (cmp === 1 ? [{ changeEntries: [entry("/src/otp.ts", "f1f1f1", 10, "f5f5f5")] }] : [{ changeEntries: all }]);
+    ado.state.blobs = { ...ado.state.blobs, f5f5f5: OTP_V1 };
+    const ref4826 = parsePrUrl("https://dev.azure.com/contoso/Shop/_git/shop-api/pullrequest/4826");
+    const { value: result } = await capture(() => runReview({ host: adoHost(ref4826), runner, compareTo: 1 }));
+
+    eq("one OpenSpec call, no work-item call", [stageCalls("openspec").length, stageCalls("requirements").length], [1, 0]);
+    check(
+      "the summary says both",
+      summaryOf().includes("PR has no linked work item") && summaryOf().includes("OpenSpec requirements in this pull request (advisory)"),
+      summaryOf(),
+    );
+    eq("an unmet spec requirement leaves the status green", ado.matching("POST", /\/statuses$/)[0]?.body?.["state"], "succeeded");
+    eq("...and the exit code at 0", exitCodeFor(result), 0);
   }
 
   section("an interrupted run gives the pull request back, instead of holding it for an hour");

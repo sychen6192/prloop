@@ -18,7 +18,7 @@ No test needs ADO credentials or a model endpoint; everything is offline. Severa
 they fail for different reasons:
 
 - `scripts/selftest.ts` — anchoring and the pipeline's pure halves, one module per area under
-  `scripts/selftest/` (anchoring, finder, skeptic, aggregate, requirement, static, rules,
+  `scripts/selftest/` (anchoring, finder, skeptic, aggregate, requirement, openspec, static, rules,
   publish, models, security, config, measure). Name areas to run a subset:
   `npx tsx scripts/selftest.ts anchoring`. If you touched `libs/diff.ts` or
   `anchoring/locate.ts`, a failure in `anchoring` is a comment landing on the wrong line in

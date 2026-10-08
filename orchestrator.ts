@@ -22,6 +22,7 @@ import { describeTier, runTier } from "./libs/tier";
 import type { ReviewContext } from "./libs/context";
 import type { ConventionDoc } from "./libs/conventions";
 import { FileIndex } from "./libs/fileindex";
+import { specDeltaOf } from "./libs/openspec";
 import type { ReviewHost } from "./libs/host";
 import { renderConventions } from "./libs/rules";
 import { anchorAndDedupe, finalize, markEarlierPushes, mergeToolFindings, type AggregateResult } from "./gates/aggregate";
@@ -312,7 +313,20 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
           pr: ctx.pr,
           diff: async () => {
             const whole = await wholePr();
-            return { files: [...whole.files, ...(whole.textFiles ?? [])] };
+            return { files: [...whole.files, ...(whole.textFiles ?? [])], unread: whole.skipped };
+          },
+          specDeltaPaths: async () => {
+            // Free on a full run and always on a local branch: the context already lists every
+            // path of the change, read or skipped. An incremental run lists one push, and a push
+            // that touched only code would drop the OpenSpec table from the sticky summary; ask
+            // the host for the whole change's paths then — a listing, no blob read.
+            const listed =
+              ctx.compareTo === 0
+                ? [...ctx.files, ...ctx.textFiles]
+                    .map((f) => f.path)
+                    .concat(ctx.skipped.filter((s) => s.reason !== "deleted").map((s) => s.path))
+                : await host.changedPaths();
+            return listed.filter((p) => specDeltaOf(p) !== undefined);
           },
           runner: opts.runner,
           requirements: () => host.requirements(),
@@ -609,6 +623,8 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   const req = reqOut.result;
   if (reqOut.prompt) run.save("requirement-prompt.md", reqOut.prompt);
   if (reqOut.raw) run.save("requirement-raw.txt", reqOut.raw);
+  if (reqOut.specPrompt) run.save("openspec-prompt.md", reqOut.specPrompt);
+  if (reqOut.specRaw) run.save("openspec-raw.txt", reqOut.specRaw);
   run.saveJson("requirement.json", req);
 
   // Anchored against THIS push, although the verdicts were reached on the whole PR: an inline
@@ -654,6 +670,8 @@ export async function runReview(opts: ReviewRunOptions): Promise<ReviewRunResult
   if (outputs.length > 0 && finderErrors.length === outputs.length) {
     unreviewed.push(`all ${outputs.length} finders failed`);
   }
+  // req.openspec.error is deliberately absent here and from `incomplete`: the OpenSpec check is
+  // advisory, and a failed one must not hold the watermark or exit 3.
   if (req.error) unreviewed.push(`requirement axis (${req.error})`);
 
   // Assembled BEFORE publishing, because the branch-policy status is decided in there and a

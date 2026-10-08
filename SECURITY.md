@@ -72,12 +72,14 @@ no source, no quote — and neither is ever read into a model prompt.
   the markers alone and says so, once, in the run log.
 - **Text prloop did not write is fenced before it reaches a model.** The PR description, the
   reviewed repository's own convention documents, the linked work items (title, description
-  and every acceptance criterion) and the static-analysis reports each go into their prompt
+  and every acceptance criterion), the pull request's own OpenSpec spec deltas and the
+  static-analysis reports each go into their prompt
   inside a named tag, preceded by one sentence saying they are reference material and that
   instructions addressed to a reviewer inside them are to be ignored (`prompts/untrusted.ts`).
-  A closing tag carried by the text is neutralised, so it cannot end its own fence early, and
-  prloop's own reading instructions stay outside the fence rather than being disclaimed along
-  with the ticket. Single-line fields — the PR title, branch names, the author's display name,
+  A closing tag carried by the text, of any prloop fence and not only its own, is neutralised,
+  so it cannot end a fence early, and prloop's own reading instructions stay outside the fence
+  rather than being disclaimed along with the ticket. HTML comments are stripped from a spec
+  delta when it is parsed, and OpenSpec text never reaches the dispute prompt. Single-line fields — the PR title, branch names, the author's display name,
   a work item's type — are collapsed to one line and capped, because a newline in one of them
   forges a section of the prompt. None of this is a guarantee against a determined injection;
   it makes the boundary explicit, which is what a model can act on.

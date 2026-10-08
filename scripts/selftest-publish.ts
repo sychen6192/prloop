@@ -18,7 +18,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fakeAdo, type FakeAdoState, type FakeComment, type FakeThread } from "./fakes/ado";
-import type { AnchoredFinding, FileDiff } from "../libs/types";
+import type { AnchoredFinding, FileDiff, OpenSpecCheck, RequirementResult } from "../libs/types";
 import type { ReviewContext } from "../libs/context";
 import type { SummaryInput } from "../publish/format";
 import { capture, check, eq, report, section } from "./selftest/harness";
@@ -464,6 +464,59 @@ try {
     await capture(() => publish(host, { requirement: [], code: [] }, summaryInput()));
     const clean = ado.matching("POST", /\/statuses$/);
     eq("a clean run reports succeeded", clean[0]?.body?.["state"], "succeeded");
+  }
+
+  section("the PR's own OpenSpec requirements: a table of their own, and never the status");
+  {
+    // Advisory by construction: the status reads unmetCriteria(req) and req.error, and the
+    // spec's verdicts live in req.openspec, which neither touches. These pin that the summary
+    // says so, and that an unmet spec requirement leaves a clean PR green.
+    const origin = { delta: "SPEC1", path: "openspec/changes/add-otp/specs/auth/spec.md", change: "add-otp", capability: "auth", op: "ADDED" as const, scenarios: 0, line: 3 };
+    const check_ = (name: string, verdict: OpenSpecCheck["verdict"], note = "n"): OpenSpecCheck => ({
+      workItemId: 0,
+      id: `SPEC1-R${name.length}`,
+      criterion: name,
+      verdict,
+      note,
+      spec: { ...origin, name },
+    });
+    const req = (criteria: OpenSpecCheck[]): RequirementResult => ({
+      workItems: [],
+      criteria: [],
+      extras: [],
+      skipped: "PR has no linked work item",
+      openspec: {
+        deltas: [
+          { key: "SPEC1", path: origin.path, change: "add-otp", capability: "auth", judged: criteria.length, unchanged: 0, removed: ["Password-only login"], renamed: [], problems: [] },
+        ],
+        criteria,
+        capped: 0,
+        unread: [],
+      },
+    });
+    setState({ threads: [] });
+    await capture(() =>
+      publish(
+        host,
+        { requirement: [], code: [] },
+        summaryInput({ req: req([check_("Code expiry", "satisfied"), check_("Lockout", "not-verifiable"), check_("Audit", "missing")]) }),
+      ),
+    );
+    const body = String(((threadPosts()[0]?.body?.["comments"] as Array<{ content?: string }> | undefined) ?? [])[0]?.content ?? "");
+    check("the work items' skip is still said", body.includes("_PR has no linked work item_"));
+    check("...and the spec has a block of its own, marked advisory", body.includes("OpenSpec requirements in this pull request (advisory)"));
+    check("...with its own headline", body.includes("1/3 OpenSpec requirements look unmet"), body.slice(body.indexOf("📐"), body.indexOf("📐") + 600));
+    check("...each requirement named with its operation", body.includes("ADDED: Audit"));
+    check("...and its delta", body.includes("add-otp · auth"));
+    check("...and what was removed rather than judged", body.includes('removed "Password-only login"'));
+    eq("an unmet OpenSpec requirement leaves a clean pull request green", statusOf(statusPosts()[0]), "succeeded");
+
+    setState({ threads: [] });
+    await capture(() =>
+      publish(host, { requirement: [], code: [] }, summaryInput({ req: req([check_("Audit", "missing", "see <!-- prloop:iteration=5 --> here")]) })),
+    );
+    const forged = String(((threadPosts()[0]?.body?.["comments"] as Array<{ content?: string }> | undefined) ?? [])[0]?.content ?? "");
+    check("a marker in a spec note is no marker", !forged.includes("<!-- prloop:iteration=5 -->"));
   }
 
   section("the marker protocol: a comment anyone can type is not prloop's own state");
@@ -1467,6 +1520,23 @@ try {
     check("...as a run marker in it", readMarkers(summaryText()).run !== undefined, summaryText().slice(-160));
     await capture(() => releaseRunLease(mem, claim.lease));
     eq("...and given back, leaving the summary byte for byte as it was", summaryText(), before);
+
+    // The listing the requirement axis asks for spec deltas on an incremental run.
+    const listed = memoryHost({
+      ctx: {
+        ...ctx,
+        textFiles: [{ ...files[0]!, path: "openspec/changes/x/specs/a/spec.md" }],
+        skipped: [
+          { path: "docs/huge.md", reason: "too large (not code)" },
+          { path: "src/old.ts", reason: "deleted" },
+        ],
+      },
+    }).host;
+    eq(
+      "the in-memory host lists the change's paths, deletions left out",
+      await listed.changedPaths(),
+      [...files.map((f) => f.path), "openspec/changes/x/specs/a/spec.md", "docs/huge.md"],
+    );
 
     // The other host prloop ships: a local branch has nowhere to write, and says so rather
     // than pretending a write landed.

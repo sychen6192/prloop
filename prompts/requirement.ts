@@ -8,6 +8,17 @@ import type { CriterionRef } from "../libs/criteria";
 import type { FileDiff, PrInfo, WorkItem } from "../libs/types";
 import { neutralizeLine, renderPrDescription, renderWorkItem } from "./untrusted";
 
+// The six verdicts, as the work-item call and the OpenSpec call (prompts/openspec.ts) both
+// state them: one table, so the two cannot come to mean different things by "partial".
+export const REQ_VERDICT_TABLE = `| verdict | when to use it |
+| --- | --- |
+| satisfied | it is done, and you can point at concrete evidence in the diff |
+| missing | there is no corresponding change at all |
+| partial | partly done, with a specific, nameable gap |
+| misunderstood | there is a corresponding change, but it goes the wrong way — solves the wrong problem, or satisfies it in a way that does not match the requirement |
+| not-this-pr | the criterion is real, nothing in this diff addresses it, AND nothing in the diff suggests it was meant to: it belongs to a different task or PR |
+| not-verifiable | cannot be judged from the code change alone (needs configuration, data, or the state of an external system) |`;
+
 export const REQUIREMENT_SYSTEM = `You are checking whether a Pull Request actually delivers the requirements it is linked to.
 
 You handle exactly one question: was the requirement met? Whether the code is well written or
@@ -19,14 +30,7 @@ The acceptance criteria arrive as a numbered list with a bracketed id each, spli
 pipeline — the list is fixed. Take each one at a time and check it against the diff.
 Decide *how it fails* — not "what percentage is done". Six verdicts:
 
-| verdict | when to use it |
-| --- | --- |
-| satisfied | it is done, and you can point at concrete evidence in the diff |
-| missing | there is no corresponding change at all |
-| partial | partly done, with a specific, nameable gap |
-| misunderstood | there is a corresponding change, but it goes the wrong way — solves the wrong problem, or satisfies it in a way that does not match the requirement |
-| not-this-pr | the criterion is real, nothing in this diff addresses it, AND nothing in the diff suggests it was meant to: it belongs to a different task or PR |
-| not-verifiable | cannot be judged from the code change alone (needs configuration, data, or the state of an external system) |
+${REQ_VERDICT_TABLE}
 
 **missing vs not-this-pr.** A work item's criteria are normally delivered over several PRs,
 and a parent's criteria are shared out over its child tasks — so "nothing here implements

@@ -46,11 +46,19 @@ _Avoid_: state, payload, snapshot
 
 **ReviewHost**:
 The service a pull request lives on, as the pipeline sees it: where the change, the
-repository's conventions and the acceptance criteria come from, and where threads and the
+repository's conventions and the acceptance criteria come from, which paths the whole change
+touches, and where threads and the
 merge-gate status go. The contract is `libs/host.ts`; `ado/host.ts` answers it for a pull
 request, `git/host.ts` for a local branch (no threads, every write refused). Nothing in the
 pipeline reaches Azure DevOps any other way.
 _Avoid_: backend, platform, client
+
+**OpenSpec requirement**:
+A requirement that the pull request's own OpenSpec spec delta
+(`openspec/changes/<id>/specs/<capability>/spec.md`) adds or modifies. It is judged against
+the code in a call apart from the work items and reported as advisory: it never fails the
+status or the exit code. OpenSpec documents state intent and are never evidence.
+_Avoid_: spec criterion, AC (an acceptance criterion is a work item's)
 
 **FileIndex**:
 The one resolver from a foreign path string — model-quoted or tool-reported — to a FileDiff

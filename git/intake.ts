@@ -101,7 +101,12 @@ export interface LocalIntakeOptions {
   text?: boolean;
 }
 
-export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise<ReviewContext> {
+/** What `base...head` changes, against the merge base: the one listing intake and changedPaths share. */
+async function listBranchChanges(opts: {
+  repo: string;
+  base: string;
+  head: string;
+}): Promise<{ mergeBase: string; entries: Array<{ status: string; path: string; originalPath?: string }> }> {
   // Everything is taken against the merge base, which is what a pull request's diff shows —
   // the file list AND the left side of each file. The list was three-dot while the left side
   // was read at the base branch's tip, so once that branch moved on after the fork, every
@@ -124,6 +129,17 @@ export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise
       return { status, path, ...(originalPath === undefined ? {} : { originalPath }) };
     })
     .filter((e) => e.path);
+  return { mergeBase, entries };
+}
+
+/** Every path the branch adds, edits or renames to, deletions left out, with nothing read. */
+export async function listLocalChangedPaths(opts: { repo: string; base: string; head: string }): Promise<string[]> {
+  const { entries } = await listBranchChanges(opts);
+  return entries.filter((e) => mapStatus(e.status) !== "delete").map((e) => e.path);
+}
+
+export async function buildLocalReviewContext(opts: LocalIntakeOptions): Promise<ReviewContext> {
+  const { mergeBase, entries } = await listBranchChanges(opts);
 
   const skipped: SkippedFile[] = [];
   const files: FileDiff[] = [];

@@ -22,7 +22,7 @@
 import { detectLanguage } from "../libs/lang";
 import type { AggregateResult } from "../gates/aggregate";
 import type { ReviewContext } from "../libs/context";
-import type { AnchoredFinding, FileDiff, Hunk, ReqVerdict, RequirementResult } from "../libs/types";
+import type { AnchoredFinding, FileDiff, Hunk, OpenSpecResult, ReqVerdict, RequirementResult } from "../libs/types";
 
 const SEVERITY_ORDER = ["critical", "high", "medium", "low"] as const;
 
@@ -179,6 +179,10 @@ function renderFile(file: FileDiff, findings: AnchoredFinding[], axisOf: (f: Anc
 }
 
 function renderRequirements(req: RequirementResult | undefined): string {
+  return renderWorkItemTable(req) + renderOpenSpecTable(req?.openspec);
+}
+
+function renderWorkItemTable(req: RequirementResult | undefined): string {
   if (!req || req.criteria.length === 0) {
     return `<p class="empty">${esc(req?.skipped ?? req?.error ?? "no acceptance criteria to check against")}</p>`;
   }
@@ -188,6 +192,23 @@ function renderRequirements(req: RequirementResult | undefined): string {
       `<td>${esc(c.criterion)}</td><td>${esc(c.note)}${c.file ? ` <code>${esc(c.file)}</code>` : ""}</td></tr>`,
   );
   return `<table class="req"><tr><th>verdict</th><th>criterion</th><th>note</th></tr>${rows.join("\n")}</table>`;
+}
+
+// Its own heading and its own table, as in the summary: advisory, and never mistaken for the
+// work items' verdict.
+function renderOpenSpecTable(o: OpenSpecResult | undefined): string {
+  if (!o) return "";
+  const head = "<h3>OpenSpec requirements (advisory)</h3>";
+  if (o.error || o.skipped || o.criteria.length === 0) {
+    return `${head}<p class="empty">${esc(o.error ? `did not complete: ${o.error}` : (o.skipped ?? "nothing judged"))}</p>`;
+  }
+  const rows = o.criteria.map(
+    (c) =>
+      `<tr><td class="verdict v-${esc(c.verdict)}">${esc(REQ_LABEL[c.verdict])}</td>` +
+      `<td>${esc(`${c.spec.op}: ${c.spec.name}`)}</td><td>${esc(`${c.spec.change} · ${c.spec.capability}`)}</td>` +
+      `<td>${esc(c.note)}${c.file ? ` <code>${esc(c.file)}</code>` : ""}</td></tr>`,
+  );
+  return `${head}<table class="req"><tr><th>verdict</th><th>requirement</th><th>spec delta</th><th>note</th></tr>${rows.join("\n")}</table>`;
 }
 
 export interface ReviewHtmlInput {

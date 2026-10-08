@@ -10,6 +10,8 @@ import { isOpenSpecDoc } from "../../libs/openspec";
 import { validateFinding } from "../../gates/finder";
 import {
   OPENSPEC_NOT_EVIDENCE_NOTE,
+  accuses,
+  advisoryUnmet,
   applyReqSkepticVerdicts,
   resolveDisputeVerdicts,
   demoteUnseenMissing,
@@ -579,4 +581,139 @@ section("OpenSpec documents: named to the model, never shown, never evidence");
     openSpecDocList(Array.from({ length: 12 }, (_, i) => `openspec/changes/c${i}/tasks.md`)).endsWith("openspec/changes/c9/tasks.md, and 2 more"),
     true,
   );
+}
+
+section("requirement gate: the pull request's own OpenSpec change, judged apart and never blocking");
+{
+  const delta = mkFile(
+    "openspec/changes/add-otp/specs/auth/spec.md",
+    [
+      "## ADDED Requirements",
+      "",
+      "### Requirement: Code expiry",
+      "The system SHALL reject a one-time code older than five minutes.",
+      "",
+      "#### Scenario: Expired code",
+      "- **WHEN** a code issued six minutes ago is entered",
+      "- **THEN** verification fails",
+      "",
+      "### Requirement: Lockout",
+      "The system SHALL lock the account after five failed codes.",
+      "",
+      "### Requirement: Audit",
+      "The system SHALL record every failed code in the audit log.",
+      "",
+      "## REMOVED Requirements",
+      "",
+      "### Requirement: Password-only login",
+      "**Reason**: replaced by one-time codes",
+    ],
+    Array.from({ length: 19 }, (_, i) => i + 1),
+  );
+  const tasks = mkFile("openspec/changes/add-otp/tasks.md", ["- [x] 1.1 Reject expired codes"], [1]);
+  const spec = (verdict: string, id = "SPEC1-R1", quote: string | null = null, file: string | null = null) =>
+    JSON.stringify({ criteria: [{ criterionId: id, verdict, note: "n", quote, file }] });
+  let diffCalls = 0;
+  const run = (o: {
+    items?: WorkItem[];
+    files?: FileDiff[];
+    unread?: Array<{ path: string; reason: string }>;
+    specDeltaPaths?: () => Promise<string[]>;
+    answers: Record<string, (r: ChatRequest) => string | { error: string }>;
+  }) => {
+    calls.length = 0;
+    diffCalls = 0;
+    return capture(() =>
+      runRequirementGate({
+        pr: gatePr,
+        runner: stub(o.answers),
+        diff: async () => {
+          diffCalls++;
+          return { files: o.files ?? [otp, delta], unread: o.unread ?? [] };
+        },
+        requirements: async () => ({ items: o.items ?? [], inheritedFrom: [] }),
+        ...(o.specDeltaPaths ? { specDeltaPaths: o.specDeltaPaths } : {}),
+      }),
+    );
+  };
+  const noWorkItem = { workItems: [], criteria: [], extras: [], skipped: "PR has no linked work item" };
+
+  const g1 = await run({ answers: {} });
+  eq("no work item and no discovery: today's skip", g1.value.result, noWorkItem);
+  eq("...and the diff is never read", diffCalls, 0);
+  const g2 = await run({ answers: {}, specDeltaPaths: async () => ["src/otp.ts"] });
+  eq("no spec delta in the listing: the same skip, nothing read", [g2.value.result, diffCalls], [noWorkItem, 0]);
+
+  const g3 = (await run({ answers: { openspec: () => spec("missing") }, specDeltaPaths: async () => [delta.path] })).value;
+  eq("no work item, a spec delta: one OpenSpec call and no work-item call", calls.map((c) => c.schemaName), ["openspec"]);
+  eq("...the work-item result is still today's skip", g3.result.skipped, "PR has no linked work item");
+  eq("...the spec is judged", [g3.result.openspec?.criteria[0]?.verdict, g3.result.openspec?.criteria[0]?.spec.capability], ["missing", "auth"]);
+  eq("...and an unmet spec requirement is never unmet for the status", [unmetCriteria(g3.result).length, advisoryUnmet(g3.result.openspec).length], [0, 1]);
+  check("...its prompt is saved apart", g3.specPrompt?.includes("[SPEC1-R1] (ADDED) Code expiry:") === true && g3.prompt === undefined);
+
+  await run({
+    items: [wi("- Expired codes are rejected")],
+    answers: { requirements: () => judged("satisfied", "if (now - issuedAt > 5 * 60_000) return false;", "src/otp.ts"), openspec: () => spec("satisfied") },
+  });
+  const reqCall = calls.find((c) => c.schemaName === "requirements")?.user ?? "";
+  const specCall = calls.find((c) => c.schemaName === "openspec")?.user ?? "";
+  eq("a work item and a spec delta: two calls", calls.map((c) => c.schemaName).sort(), ["openspec", "requirements"]);
+  check("the work-item call never sees the spec", !reqCall.includes("[SPEC1-") && !reqCall.includes("Code expiry"));
+  check("...and the OpenSpec call never sees the work item", !specCall.includes("[7-AC") && !specCall.includes("Expired codes are rejected"));
+  check("...it sees the spec, fenced", specCall.includes("<openspec-delta>") && specCall.includes("[SPEC1-R1] (ADDED) Code expiry:"));
+  check("...and not the REMOVED requirement, which has nothing to judge", !specCall.includes("Password-only login"));
+
+  const g5 = (
+    await run({
+      items: [wi("- Expired codes are rejected")],
+      answers: { requirements: () => judged("missing"), openspec: () => ({ error: "timeout" }) },
+    })
+  ).value.result;
+  eq("a failed OpenSpec call is not the axis's failure", [g5.error, g5.openspec?.error, g5.criteria[0]?.verdict], [undefined, "timeout", "missing"]);
+
+  const g6 = (await run({ answers: { openspec: () => "[]" }, specDeltaPaths: async () => [delta.path] })).value.result;
+  eq("a wrong-shape OpenSpec answer is its own error", [g6.openspec?.error, g6.error], ["response has no criteria array", undefined]);
+
+  const g7 = (
+    await run({
+      answers: { openspec: () => spec("satisfied", "SPEC1-R1", "The system SHALL reject a one-time code older than five minutes.", delta.path) },
+      specDeltaPaths: async () => [delta.path],
+    })
+  ).value.result;
+  eq("a spec requirement is never satisfied by quoting itself", g7.openspec?.criteria[0]?.verdict, "not-verifiable");
+  check("...and says why", (g7.openspec?.criteria[0]?.note ?? "").startsWith(OPENSPEC_NOT_EVIDENCE_NOTE));
+
+  const g8 = (await run({ answers: {}, files: [delta, tasks], specDeltaPaths: async () => [delta.path] })).value.result;
+  check(
+    "a proposal with no code yet is described, not judged",
+    (g8.openspec?.skipped ?? "").startsWith("this pull request changes only OpenSpec documents") && calls.length === 0 && g8.openspec?.deltas.length === 1,
+    JSON.stringify(g8.openspec),
+  );
+
+  const g9 = await run({
+    answers: {},
+    specDeltaPaths: async () => {
+      throw new Error("HTTP 503");
+    },
+  });
+  eq("a listing that fails costs nothing but a warning", [g9.value.result, diffCalls], [noWorkItem, 0]);
+  check("...which says so", g9.lines.some((l) => l.includes("[WARN] OpenSpec: could not list")));
+
+  const g10 = (
+    await run({
+      items: [wi("- Expired codes are rejected")],
+      files: [otp],
+      unread: [{ path: delta.path, reason: "too large (not code)" }],
+      answers: { requirements: () => judged("satisfied", "if (now - issuedAt > 5 * 60_000) return false;", "src/otp.ts") },
+    })
+  ).value.result;
+  eq("a delta too large to read is named", g10.openspec?.unread, [{ path: delta.path, reason: "too large (not code)" }]);
+  eq("...and nothing is judged from it", g10.openspec?.skipped, "no ADDED or MODIFIED requirement this pull request changed");
+
+  const r: RequirementResult = {
+    workItems: [],
+    criteria: (["satisfied", "missing", "partial", "misunderstood", "not-this-pr", "not-verifiable"] as const).map((verdict) => ({ workItemId: 1, criterion: verdict, verdict, note: "" })),
+    extras: [],
+  };
+  eq("accuses is the unmet predicate", unmetCriteria(r).length, r.criteria.filter(accuses).length);
 }
