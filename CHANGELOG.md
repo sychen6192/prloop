@@ -415,6 +415,10 @@ give: the range below is commit dates from `git log` — first commit 2026-07-29
 
 ### Fixed
 
+- **A Gemini model is recognised as a model family.** `modelFamily` knew no `gemini` name, so
+  `google/gemini-37-flash` verified by another Gemini raised no same-family warning, and its
+  clearings were not marked as the weaker check they are. Gemini is now a family of its own;
+  Gemma, an open-weights line trained apart from it, stays one too.
 - **A model that refuses the temperature no longer loses its calls.** Reasoning models behind
   Azure OpenAI answer prloop's default `0.2` with 400 "Unsupported value: 'temperature' does
   not support 0.2 with this model", and a 4xx is never retried, so every call to such a model

@@ -372,6 +372,17 @@ section("model families: same-family verification is weak verification");
   eq("an unknown name has no family", modelFamily("acme-reviewer-v2"), "");
   check("two unknown names are not called the same family", !same("acme-reviewer-v2", "internal-model-7"));
   check("gpt is matched last, so gpt-4o is gpt", same("openai/gpt-4o-mini", "gpt-4.1"));
+  // A Gemini model had no family at all, so a Gemini skeptic over a Gemini finder said nothing.
+  eq("a Gemini model has a family", modelFamily("google/gemini-37-flash"), "gemini");
+  check(
+    "gateway spellings of Gemini are one family",
+    same("google/gemini-37-flash", "vertex_ai/gemini-2.5-pro") && same("openrouter/google/gemini-2.5-flash", "gemini-1.5-pro"),
+  );
+  check("Gemini is not Gemma", !same("gemini-2.5-pro", "gemma-3-27b"));
+  check(
+    "...nor any of a mixed fleet's other models",
+    !same("google/gemini-37-flash", "claude-sonnet-5") && !same("google/gemini-37-flash", "gpt-56-sol"),
+  );
 
   const file = mkFile("/src/c.ts", ["let n = 0;", "n += step;", "export { n };"], [2]);
   const finding: AnchoredFinding = {
@@ -399,6 +410,17 @@ section("model families: same-family verification is weak verification");
   eq("...the clearing still counts", survivor.skepticVerdicts, 1);
   eq("...and the finding still publishes", finalize(EMPTY_CANDIDATES, [survivor]).inline.length, 1);
   check("...but the comment says the check was weaker", renderFindingComment(survivor).includes("same model family"));
+
+  const geminiLines: string[] = [];
+  attachLogSink((l) => geminiLines.push(l));
+  await runSkeptic(
+    { chat: async (req: ChatRequest) => ({ model: req.model, text: '{"verdict":"holds","reason":"","confidence":0.7}' }) },
+    [finding],
+    new FileIndex([file]),
+    { models: ["gemini-2.5-pro"], rounds: 1, finders: ["google/gemini-37-flash"] },
+  );
+  detachLogSink();
+  check("a Gemini skeptic over a Gemini finder is warned about", geminiLines.some((l) => l.includes("every skeptic shares a model family")));
 }
 
 section("a second reading: what a skeptic could not check, looked up by code and asked once more");

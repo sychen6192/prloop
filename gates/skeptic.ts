@@ -173,6 +173,10 @@ export function modelFamily(name: string): string {
     ["claude", ["claude"]],
     ["deepseek", ["deepseek"]],
     ["gemma", ["gemma"]],
+    // Its own family, not Gemma's: Gemma is an open-weights line trained apart from it, and a
+    // Gemma finder checked by a hosted Gemini is a real cross-check, not one model twice.
+    // Never "google" as a needle: gateways put that prefix in front of other labs' models.
+    ["gemini", ["gemini"]],
     ["mistral", ["mistral", "devstral", "codestral", "mixtral"]],
     ["glm", ["glm"]],
     ["granite", ["granite"]],
